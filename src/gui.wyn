@@ -1,24 +1,23 @@
 // gui — Cross-platform desktop GUI for Wyn
-// Wraps SDL2. Requires: brew install sdl2 (macOS) / apt install libsdl2-dev (Linux)
+// Wraps SDL2. Requires: brew install sdl2 / apt install libsdl2-dev
 //
 // Usage:
-//   var win = Gui.window("My App", 800, 600)
-//   while Gui.running(win) {
-//       Gui.clear(win, 255, 255, 255)
-//       Gui.rect(win, 10, 10, 200, 50, 0, 120, 255)
-//       Gui.text(win, 20, 20, "Hello GUI!", 0, 0, 0)
-//       Gui.present(win)
+//   var win = Gui_window("My App", 800, 600)
+//   while Gui_running(win) {
+//       Gui_clear(win, 30, 30, 30)
+//       Gui_rect(win, 10, 10, 200, 50, 0, 120, 255)
+//       Gui_present(win)
 //   }
-//   Gui.close(win)
+//   Gui_close(win)
 
-// TODO: Implement via C bindings to SDL2
-// Window management, event loop, drawing primitives, text rendering
-// Target: desktop apps on macOS, Linux, Windows
-
-fn main() -> int {
-    println("gui package — Cross-platform desktop GUI for Wyn")
-    println("Wraps SDL2 for window management, drawing, events")
-    println("Platforms: macOS, Linux, Windows")
-    println("Install SDL2: brew install sdl2 (macOS) / apt install libsdl2-dev (Linux)")
-    return 0
-}
+// SDL2 scancodes for Gui_key_down()
+var SCANCODE_A = 4
+var SCANCODE_D = 7
+var SCANCODE_S = 22
+var SCANCODE_W = 26
+var SCANCODE_SPACE = 44
+var SCANCODE_ESCAPE = 41
+var SCANCODE_UP = 82
+var SCANCODE_DOWN = 81
+var SCANCODE_LEFT = 80
+var SCANCODE_RIGHT = 79
