@@ -1,0 +1,7 @@
+[project]
+name = "gui"
+version = "0.1.0"
+description = "Cross-platform desktop GUI for Wyn (wraps SDL2)"
+
+[build]
+requires = ["sdl2"]  # brew install sdl2 / apt install libsdl2-dev
