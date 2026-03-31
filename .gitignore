@@ -1,0 +1,3 @@
+*.wyn.c
+tests/test_*
+!tests/test_*.wyn
