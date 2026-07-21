@@ -1,4 +1,4 @@
-// gui — Cross-platform desktop GUI for Wyn
+// gui - Cross-platform desktop GUI for Wyn
 // Wraps SDL2. Requires: brew install sdl2 / apt install libsdl2-dev
 //
 // Usage:

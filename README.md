@@ -1,4 +1,4 @@
-# gui — Official Wyn Package
+# gui - Official Wyn Package
 
 Cross-platform desktop GUI for Wyn. Wraps [SDL2](https://www.libsdl.org).
 

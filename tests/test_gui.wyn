@@ -1,4 +1,4 @@
-// gui package tests — headless (no window)
+// gui package tests - headless (no window)
 
 var SCANCODE_W = 26
 var SCANCODE_SPACE = 44

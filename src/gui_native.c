@@ -1,4 +1,4 @@
-// gui_native.c — C glue between Wyn and SDL2
+// gui_native.c - C glue between Wyn and SDL2
 // Compile: cc -c gui_native.c $(pkg-config --cflags sdl2) -o gui_native.o
 // Link: $(pkg-config --libs sdl2)
 
