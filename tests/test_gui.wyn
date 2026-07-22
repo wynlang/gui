@@ -40,14 +40,14 @@ test "button hit test" {
     var btn_h = 40
     var mx = 120
     var my = 210
-    assert(mx >= btn_x && mx < btn_x + btn_w && my >= btn_y && my < btn_y + btn_h)
+    assert(mx >= btn_x and mx < btn_x + btn_w and my >= btn_y and my < btn_y + btn_h)
 }
 
 test "button miss test" {
     var mx2 = 50
     var btn_x = 100
     var btn_w = 150
-    assert(!(mx2 >= btn_x && mx2 < btn_x + btn_w))
+    assert(not (mx2 >= btn_x and mx2 < btn_x + btn_w))
 }
 
 test "grid cell width" {
