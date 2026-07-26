@@ -16,24 +16,32 @@ wyn pkg install github.com/wynlang/gui
 ## Usage
 
 ```wyn
-var win = Gui_window("My App", 800, 600)
+import gui
 
-while Gui_running(win) {
-    Gui_clear(win, 30, 30, 30)
+var win = gui.Gui_window("My App", 800, 600)
+var player_y = 300
+
+while gui.Gui_running(win) == 1 {
+    gui.Gui_clear(win, 30, 30, 30)
 
     // Draw shapes
-    Gui_rect(win, 10, 10, 200, 100, 0, 120, 255)
-    Gui_rect_outline(win, 10, 120, 200, 100, 255, 255, 255)
-    Gui_line(win, 0, 0, 800, 600, 255, 0, 0)
+    gui.Gui_rect(win, 10, 10, 200, 100, 0, 120, 255)
+    gui.Gui_rect_outline(win, 10, 120, 200, 100, 255, 255, 255)
+    gui.Gui_line(win, 0, 0, 800, 600, 255, 0, 0)
 
-    // Input
-    if Gui_key_down(SCANCODE_W) { player_y -= 5 }
-    if Gui_mouse_pressed() { handle_click(Gui_mouse_x(), Gui_mouse_y()) }
+    // Input (26 = W key, see Scancodes below)
+    if gui.Gui_key_down(26) == 1 {
+        player_y = player_y - 5
+    }
+    if gui.Gui_mouse_pressed() == 1 {
+        print("click at " + gui.Gui_mouse_x().to_string() + "," + gui.Gui_mouse_y().to_string())
+    }
 
-    Gui_present(win)
+    gui.Gui_present(win)
+    gui.Gui_delay(16)
 }
 
-Gui_close(win)
+gui.Gui_close(win)
 ```
 
 ## API

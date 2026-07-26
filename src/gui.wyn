@@ -10,6 +10,22 @@
 //   }
 //   Gui_close(win)
 
+// ---- Native bindings (implemented in src/gui_native.c, SDL2) ---------------
+
+extern fn Gui_window(title: string, width: int, height: int) -> int;
+extern fn Gui_running(win: int) -> int;
+extern fn Gui_clear(win: int, r: int, g: int, b: int);
+extern fn Gui_rect(win: int, x: int, y: int, w: int, h: int, r: int, g: int, b: int);
+extern fn Gui_rect_outline(win: int, x: int, y: int, w: int, h: int, r: int, g: int, b: int);
+extern fn Gui_line(win: int, x1: int, y1: int, x2: int, y2: int, r: int, g: int, b: int);
+extern fn Gui_present(win: int);
+extern fn Gui_mouse_x() -> int;
+extern fn Gui_mouse_y() -> int;
+extern fn Gui_mouse_pressed() -> int;
+extern fn Gui_key_down(scancode: int) -> int;
+extern fn Gui_delay(ms: int);
+extern fn Gui_close(win: int);
+
 // SDL2 scancodes for Gui_key_down()
 var SCANCODE_A = 4
 var SCANCODE_D = 7
