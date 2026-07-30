@@ -1,0 +1,347 @@
+// form - THE FORM IS A JSON DOCUMENT.
+//
+// This is the keystone of the whole design, and it is worth being explicit about
+// why, because the obvious alternative (a binary or bespoke text format, or no
+// format at all - just generated code) looks simpler and is strictly worse.
+//
+// An AI assistant edits the SAME FILE the designer edits. "Add a login form"
+// becomes: read Form1.json, append two entry widgets and a button, write it
+// back. There is no AI inside the tool, no plugin API, no scripting language to
+// embed, and no second representation to keep in step. The designer is one
+// editor of a document format; a coding assistant is another; a `git diff` is a
+// third. That only works if the document is (a) text, (b) a format every tool
+// already parses, and (c) THE source of truth rather than a cache of it.
+//
+// The generated .wyn code is therefore DOWNSTREAM of the JSON, never upstream.
+// Nothing ever parses generated code back into a form.
+//
+// WHAT IS AND IS NOT IN THE DOCUMENT
+//
+// In: id, kind, x/y/w/h, label, text, checked, enabled, handler name, anchors.
+// Out: the on_click FUNCTION POINTER. It cannot be serialised and cannot be
+// reconstructed (Wyn has no eval), so the document stores the handler's NAME and
+// the generated Form1.designer.wyn re-binds a real pointer at compile time. A
+// loaded form has correct names and noop pointers - which is exactly right for a
+// designer, whose job is to edit names.
+//
+// WHY THE WRITER IS HAND-ROLLED
+//
+// Wyn's Json module can READ everything needed (parse, get, get_int,
+// get_object, get_array, array_len, array_get, node_str) but can only WRITE flat
+// objects: Json::new + set_string/set_int/stringify, with no way to nest an
+// object or build an array. A form is an array of objects, so the writer emits
+// text directly. The reader uses the real parser, so a hand-edited or
+// AI-generated file is validated by the same code path as one we wrote.
+
+import widgets
+
+// ---- JSON string escaping -------------------------------------------------
+//
+// Correct escaping is the difference between a format an assistant can safely
+// write into and a format that corrupts on the first apostrophe. A label
+// containing a quote, a backslash, or a newline (a textarea's contents are FULL
+// of newlines) must survive the round trip.
+//
+// Handled: " \ newline tab carriage-return. Control characters below 0x20 other
+// than those are dropped rather than emitted raw, because emitting them produces
+// a file that is not JSON and that every other tool will reject.
+fn esc(s: string) -> string {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        var c = s.char_at(i)
+        if c == "\"" { out = out + "\\\"" }
+        else {
+            if c == "\\" { out = out + "\\\\" }
+            else {
+                if c == "\n" { out = out + "\\n" }
+                else {
+                    if c == "\t" { out = out + "\\t" }
+                    else {
+                        if c == "\r" { out = out + "\\r" }
+                        else { out = out + c }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn qs(s: string) -> string {
+    return "\"" + esc(s) + "\""
+}
+
+// ---- JSON string UNescaping -----------------------------------------------
+//
+// Wyn's Json::get returns the RAW string body, escapes and all: a stored
+// "line1\nline2" comes back as the 12 characters l,i,n,e,1,\,n,... rather than
+// as two lines. Verified, minimised and reported; until it is fixed a reader
+// that does not undo the escapes cannot round-trip anything containing a
+// newline - which is every textarea and every multi-word label with a quote in
+// it. So this is not belt-and-braces, it is the load half of the round trip.
+fn unesc(s: string) -> string {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        var c = s.char_at(i)
+        if c == "\\" {
+            if i + 1 < s.len() {
+                var n = s.char_at(i + 1)
+                if n == "n" { out = out + "\n" }
+                else {
+                    if n == "t" { out = out + "\t" }
+                    else {
+                        if n == "r" { out = out + "\r" }
+                        else {
+                            // \" and \\ and anything else: the character itself.
+                            out = out + n
+                        }
+                    }
+                }
+                i = i + 2
+            } else {
+                // Trailing lone backslash: keep it rather than losing a byte.
+                out = out + c
+                i = i + 1
+            }
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ---- save -----------------------------------------------------------------
+
+// The document, as JSON text.
+//
+// Pretty-printed with one widget per line-group rather than minified, because
+// the point of this format is that a HUMAN and an ASSISTANT edit it. A minified
+// form produces a one-line `git diff` for every change, which destroys the
+// reviewability that made JSON the right choice.
+pub fn Form_to_json(ui: Ui) -> string {
+    var n = widgets.Ui_count(ui)
+    var s = "{\n"
+    s = s + "  \"form\": " + qs(widgets.Ui_name(ui)) + ",\n"
+    s = s + "  \"width\": " + widgets.Ui_design_w(ui).to_string() + ",\n"
+    s = s + "  \"height\": " + widgets.Ui_design_h(ui).to_string() + ",\n"
+    s = s + "  \"widgets\": ["
+    var i = 0
+    while i < n {
+        if i > 0 { s = s + "," }
+        s = s + "\n    {"
+        s = s + "\"id\": " + widgets.Ui_id_at(ui, i).to_string()
+        // The kind is written as a NAME, not the KIND_* integer. A saved file
+        // then survives someone renumbering the constants, and reads as
+        // "button" to whoever - or whatever - opens it.
+        s = s + ", \"kind\": " + qs(widgets.Ui_kind_name(widgets.Ui_kind_at(ui, i)))
+        s = s + ", \"x\": " + widgets.Ui_x_at(ui, i).to_string()
+        s = s + ", \"y\": " + widgets.Ui_y_at(ui, i).to_string()
+        s = s + ", \"w\": " + widgets.Ui_w_at(ui, i).to_string()
+        s = s + ", \"h\": " + widgets.Ui_h_at(ui, i).to_string()
+        s = s + ",\n     \"label\": " + qs(widgets.Ui_label_at(ui, i))
+        s = s + ", \"text\": " + qs(widgets.Ui_text_at(ui, i))
+        s = s + ", \"checked\": " + widgets.Ui_checked_at(ui, i).to_string()
+        s = s + ", \"enabled\": " + widgets.Ui_enabled_at(ui, i).to_string()
+        s = s + ",\n     \"handler\": " + qs(widgets.Ui_handler_name_at(ui, i))
+        // Anchors as a nested object: they belong together, and a future
+        // "anchor" concept (margins, aspect) extends the object instead of
+        // adding four more top-level keys.
+        s = s + ", \"anchor\": {"
+        s = s + "\"left\": " + widgets.Ui_anchor_left_at(ui, i).to_string()
+        s = s + ", \"right\": " + widgets.Ui_anchor_right_at(ui, i).to_string()
+        s = s + ", \"top\": " + widgets.Ui_anchor_top_at(ui, i).to_string()
+        s = s + ", \"bottom\": " + widgets.Ui_anchor_bottom_at(ui, i).to_string()
+        s = s + "}}"
+        i = i + 1
+    }
+    if n > 0 { s = s + "\n  " }
+    s = s + "]\n}\n"
+    return s
+}
+
+pub fn Form_save(ui: Ui, path: string) -> int {
+    File::write(path, Form_to_json(ui))
+    if File::exists(path) == 1 { return 1 }
+    return 0
+}
+
+// ---- load -----------------------------------------------------------------
+
+// Read one int field, with a default for when the key is absent.
+//
+// Json::has first, because Json::get_int returns 0 for a missing key and 0 is a
+// legitimate value for every one of these fields. Without the has() check an
+// OLD document (no "enabled" key) would load every control disabled - the exact
+// silent-migration failure that anchors-from-the-start is meant to avoid.
+fn int_or(node: int, key: string, dflt: int) -> int {
+    if Json::has(node, key) == 0 { return dflt }
+    return Json::get_int(node, key)
+}
+
+fn str_or(node: int, key: string, dflt: string) -> string {
+    if Json::has(node, key) == 0 { return dflt }
+    return unesc(Json::get(node, key))
+}
+
+// Parse JSON text into a Ui bound to (win, font).
+//
+// win/font are parameters rather than stored in the document: they are a runtime
+// resource, not part of the design. -1/-1 gives a document with no window, which
+// is a legitimate value here - every accessor is total - and is how the round
+// trip is tested with no display at all.
+pub fn Form_from_json(text: string, win: int, font: int) -> Ui {
+    var ui = widgets.Ui_new(win, font)
+    var doc = Json::parse(text)
+    ui = widgets.Ui_set_name(ui, str_or(doc, "form", "Form1"))
+    ui = widgets.Ui_set_design_size(ui,
+        int_or(doc, "width", 780), int_or(doc, "height", 520))
+
+    var arr = Json::get_array(doc, "widgets")
+    var n = Json::array_len(arr)
+    var i = 0
+    while i < n {
+        var wn = Json::array_get(arr, i)
+        var kind = widgets.Ui_kind_from_name(str_or(wn, "kind", "?"))
+        // An unknown kind is SKIPPED, not defaulted to a button. A document from
+        // a newer version of this format will contain kinds this build has never
+        // heard of, and silently turning them into buttons produces a form that
+        // looks like it loaded and is wrong. Dropping them at least leaves the
+        // count visibly short.
+        if kind != -1 {
+            var an = Json::get_object(wn, "anchor")
+            // Defaults match make_widget's: left+top pinned = classic absolute
+            // placement, so a document written before anchors existed loads
+            // behaving exactly as it did.
+            var al = 1
+            var ar = 0
+            var at = 1
+            var ab = 0
+            if Json::has(wn, "anchor") == 1 {
+                al = int_or(an, "left", 1)
+                ar = int_or(an, "right", 0)
+                at = int_or(an, "top", 1)
+                ab = int_or(an, "bottom", 0)
+            }
+            ui = widgets.Ui_add_raw(ui,
+                int_or(wn, "id", i + 1),
+                kind,
+                int_or(wn, "x", 0), int_or(wn, "y", 0),
+                int_or(wn, "w", 0), int_or(wn, "h", 0),
+                str_or(wn, "label", ""),
+                str_or(wn, "text", ""),
+                int_or(wn, "checked", 0),
+                int_or(wn, "enabled", 1),
+                str_or(wn, "handler", ""),
+                al, ar, at, ab)
+        }
+        i = i + 1
+    }
+    return ui
+}
+
+pub fn Form_load(path: string, win: int, font: int) -> Ui {
+    if File::exists(path) == 0 {
+        // An empty document, not a trap. "Open the form I have not created yet"
+        // is the first thing anyone does.
+        return widgets.Ui_new(win, font)
+    }
+    return Form_from_json(File::read(path), win, font)
+}
+
+// ---- round-trip verification ---------------------------------------------
+//
+// Field-by-field equality of two Uis, as a report string. Not a boolean:
+// "documents differ" is useless when the difference is one anchor flag on widget
+// 7, and a designer that silently loses a field on save is the single worst
+// failure this format can have. So the comparison names the field, the widget
+// and both values.
+//
+// Returns "" when identical.
+pub fn Form_diff(a: Ui, b: Ui) -> string {
+    var out = ""
+    if widgets.Ui_name(a) != widgets.Ui_name(b) {
+        out = out + "form name: " + widgets.Ui_name(a) + " != "
+            + widgets.Ui_name(b) + "\n"
+    }
+    if widgets.Ui_design_w(a) != widgets.Ui_design_w(b) {
+        out = out + "width: " + widgets.Ui_design_w(a).to_string() + " != "
+            + widgets.Ui_design_w(b).to_string() + "\n"
+    }
+    if widgets.Ui_design_h(a) != widgets.Ui_design_h(b) {
+        out = out + "height: " + widgets.Ui_design_h(a).to_string() + " != "
+            + widgets.Ui_design_h(b).to_string() + "\n"
+    }
+    if widgets.Ui_count(a) != widgets.Ui_count(b) {
+        out = out + "widget count: " + widgets.Ui_count(a).to_string() + " != "
+            + widgets.Ui_count(b).to_string() + "\n"
+        // Comparing fields past this point would index out of one of them, and
+        // every subsequent line would be noise about the same one bug.
+        return out
+    }
+    var i = 0
+    while i < widgets.Ui_count(a) {
+        var p = "widget[" + i.to_string() + "] "
+        if widgets.Ui_id_at(a, i) != widgets.Ui_id_at(b, i) {
+            out = out + p + "id: " + widgets.Ui_id_at(a, i).to_string() + " != "
+                + widgets.Ui_id_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_kind_at(a, i) != widgets.Ui_kind_at(b, i) {
+            out = out + p + "kind: " + widgets.Ui_kind_name(widgets.Ui_kind_at(a, i))
+                + " != " + widgets.Ui_kind_name(widgets.Ui_kind_at(b, i)) + "\n"
+        }
+        if widgets.Ui_x_at(a, i) != widgets.Ui_x_at(b, i) {
+            out = out + p + "x: " + widgets.Ui_x_at(a, i).to_string() + " != "
+                + widgets.Ui_x_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_y_at(a, i) != widgets.Ui_y_at(b, i) {
+            out = out + p + "y: " + widgets.Ui_y_at(a, i).to_string() + " != "
+                + widgets.Ui_y_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_w_at(a, i) != widgets.Ui_w_at(b, i) {
+            out = out + p + "w: " + widgets.Ui_w_at(a, i).to_string() + " != "
+                + widgets.Ui_w_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_h_at(a, i) != widgets.Ui_h_at(b, i) {
+            out = out + p + "h: " + widgets.Ui_h_at(a, i).to_string() + " != "
+                + widgets.Ui_h_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_label_at(a, i) != widgets.Ui_label_at(b, i) {
+            out = out + p + "label: [" + widgets.Ui_label_at(a, i) + "] != ["
+                + widgets.Ui_label_at(b, i) + "]\n"
+        }
+        if widgets.Ui_text_at(a, i) != widgets.Ui_text_at(b, i) {
+            out = out + p + "text: [" + widgets.Ui_text_at(a, i) + "] != ["
+                + widgets.Ui_text_at(b, i) + "]\n"
+        }
+        if widgets.Ui_checked_at(a, i) != widgets.Ui_checked_at(b, i) {
+            out = out + p + "checked: " + widgets.Ui_checked_at(a, i).to_string()
+                + " != " + widgets.Ui_checked_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_enabled_at(a, i) != widgets.Ui_enabled_at(b, i) {
+            out = out + p + "enabled: " + widgets.Ui_enabled_at(a, i).to_string()
+                + " != " + widgets.Ui_enabled_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_handler_name_at(a, i) != widgets.Ui_handler_name_at(b, i) {
+            out = out + p + "handler: [" + widgets.Ui_handler_name_at(a, i)
+                + "] != [" + widgets.Ui_handler_name_at(b, i) + "]\n"
+        }
+        if widgets.Ui_anchor_left_at(a, i) != widgets.Ui_anchor_left_at(b, i) {
+            out = out + p + "anchor.left differs\n"
+        }
+        if widgets.Ui_anchor_right_at(a, i) != widgets.Ui_anchor_right_at(b, i) {
+            out = out + p + "anchor.right differs\n"
+        }
+        if widgets.Ui_anchor_top_at(a, i) != widgets.Ui_anchor_top_at(b, i) {
+            out = out + p + "anchor.top differs\n"
+        }
+        if widgets.Ui_anchor_bottom_at(a, i) != widgets.Ui_anchor_bottom_at(b, i) {
+            out = out + p + "anchor.bottom differs\n"
+        }
+        i = i + 1
+    }
+    return out
+}

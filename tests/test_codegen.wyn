@@ -1,0 +1,243 @@
+// test_codegen - TWO-FILE GENERATION, and the one assertion that matters:
+// the generated code COMPILES.
+//
+//   WYN_ROOT=/path/to/wyn  wyn run tests/test_codegen.wyn
+//
+// Run from the repo ROOT, not from tests/: the test shells out to `wyn build`
+// on the files it generates, and those files `import widgets`, which resolves
+// via ./src/widgets.wyn relative to the CURRENT DIRECTORY.
+//
+// WHY THIS TEST EXISTS AND WHY IT SHELLS OUT
+//
+// A generator whose output does not compile is the defining failure of this
+// feature - it is worse than no generator, because the user only finds out after
+// they have designed the form. So the assertion cannot be "the string contains
+// Ui_button"; it has to be a compiler run on the actual emitted files.
+//
+// AND IT MUST BE `build`, NOT `check`. Verified today: `wyn check` on a file
+// calling a function that does not exist (`widgets.Ui_no_such_fn(1)`) prints
+// "no errors" and exits 0, as does a file whose `import` cannot be resolved at
+// all. `wyn build` catches both (exit 1) because the C compiler does. `check`
+// is therefore not a gate for generated code, and using it here would have made
+// this test pass on output that does not compile - the exact failure the test is
+// for. Reported; the workaround is one word.
+//
+// The two rules under test are asymmetric on purpose:
+//   Form1.designer.wyn  is clobbered. Asserted by writing a marker into it and
+//                       watching the marker disappear.
+//   Form1.wyn           is never rewritten. Asserted by editing a handler BODY
+//                       and requiring the edit to survive a regeneration that
+//                       also adds a new control.
+
+import widgets
+import codegen
+
+var fails = 0
+
+fn check(label: string, got: string, want: string) {
+    if got == want {
+        print("  ok   ${label} = ${got}")
+    } else {
+        print("  FAIL ${label}: got [${got}] want [${want}]")
+        fails = fails + 1
+    }
+}
+
+fn check_int(label: string, got: int, want: int) {
+    check(label, got.to_string(), want.to_string())
+}
+
+fn noop(id: int) {}
+
+// The scratch project. Inside the repo, so `import widgets` resolves for the
+// files we generate there, and `wyn build` runs with cwd = repo root.
+//
+// NB: named PROJ, not DIR. `var DIR = "..."` emits a C global named DIR, which
+// collides with the `DIR` typedef libc pulls in via <dirent.h>: "redefinition of
+// 'DIR' as different kind of symbol", plus one bogus "unexpected type name"
+// error per USE. Same for FILE. Verified, minimised (`var DIR = "x"` + a print)
+// and reported - the compiler is not name-mangling globals against the C
+// namespace it emits into.
+var PROJ = "scratch/gen"
+
+fn dpath() -> string { return PROJ + "/Form1.designer.wyn" }
+fn cpath() -> string { return PROJ + "/Form1.wyn" }
+
+// One of every kind, including the two that take handlers and the two whose
+// captions are NOT legal identifiers.
+fn build_form() -> Ui {
+    var ui = widgets.Ui_new(-1, -1)
+    ui = widgets.Ui_set_name(ui, "Form1")
+    ui = widgets.Ui_set_design_size(ui, 640, 480)
+
+    ui = widgets.Ui_label(ui, "Username", 16, 16)
+    ui = widgets.Ui_entry(ui, "", 16, 40, 200, 26)
+
+    // A caption with a space and punctuation: "Sign in!" must not become
+    // `fn on_sign in!(id: int)`.
+    ui = widgets.Ui_button(ui, "Sign in!", 16, 80, 96, 28, noop)
+    var ok = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_anchor(ui, ok, 0, 1, 0, 1)
+
+    // An explicit handler NAME from the document, which must be used verbatim.
+    ui = widgets.Ui_checkbox(ui, "Remember me", 16, 120, 1, noop)
+    ui = widgets.Ui_set_handler_name(ui, widgets.Ui_last_id(ui), "on_remember")
+
+    // Disabled: not a constructor argument, so it needs a follow-up call or the
+    // generated form comes up clickable.
+    ui = widgets.Ui_button(ui, "Cancel", 130, 80, 96, 28, noop)
+    ui = widgets.Ui_set_enabled(ui, widgets.Ui_last_id(ui), 0)
+
+    // A textarea whose contents are CODE: quotes, braces and newlines, all of
+    // which have to survive being re-emitted as a Wyn string literal.
+    ui = widgets.Ui_textarea(ui,
+        "fn f(x: int) -> int {\n    return x * 2\n}", 16, 170, 300, 120)
+    ui = widgets.Ui_panel(ui, 340, 170, 120, 120)
+    return ui
+}
+
+// Shell out to the compiler. Both files are built, because the designer file
+// imports the code file and a missing/duplicate handler shows up only then.
+fn build_ok(path: string) -> int {
+    var wyn = Env::get("WYN_ROOT") + "/wyn"
+    var rc = System::exec_code(wyn + " build " + path + " > /dev/null 2>&1")
+    if rc == 0 { return 1 }
+    return 0
+}
+
+fn main() {
+    print("=== two-file generation ===")
+
+    File::create_dir_all(PROJ)
+
+    // ---- the gate's own negative control --------------------------------
+    // build_ok is the only assertion in this file that can catch a broken
+    // generator, so a build_ok that always returned 1 would make every check
+    // below vacuous. Prove it can say NO before trusting it to say yes.
+    print("-- the gate itself --")
+    File::write(PROJ + "/notok.wyn",
+        "import widgets\nfn main() { var u = widgets.Ui_no_such_fn(1) }\n")
+    check_int("build_ok says NO to a call that does not exist",
+        build_ok(PROJ + "/notok.wyn"), 0)
+    File::write(PROJ + "/notok.wyn", "fn main() { print(\"ok\") }\n")
+    check_int("build_ok says YES to a file that compiles",
+        build_ok(PROJ + "/notok.wyn"), 1)
+    File::delete(PROJ + "/notok.wyn")
+
+    File::create_dir_all(PROJ)
+    // A stale pair from a previous run would make "the body survived" pass
+    // vacuously, so start from nothing.
+    File::delete(dpath())
+    File::delete(cpath())
+
+    var ui = build_form()
+
+    // ---- first generation: both files appear -----------------------------
+    var added = codegen.Form_generate(ui, PROJ)
+    check_int("stubs appended on a fresh project", added, 3)
+    check_int("Form1.designer.wyn exists", File::exists(dpath()), 1)
+    check_int("Form1.wyn exists", File::exists(cpath()), 1)
+
+    var d1 = File::read(dpath())
+    var c1 = File::read(cpath())
+
+    print("-- the designer file is machine-owned --")
+    check_int("carries a DO NOT EDIT header",
+        d1.index_of("GENERATED. DO NOT EDIT.") >= 0 ? 1 : 0, 1)
+    // "Sign in!" has to go two ways at once, and both must be right:
+    //   as an IDENTIFIER the space and the bang are illegal, so it is sanitised;
+    //   as the button's CAPTION it is the user's text, so it survives verbatim.
+    // A generator that sanitises both shows the user "Sign in" on the button.
+    check_int("illegal caption chars are sanitised in the identifier",
+        d1.index_of("fn h_on_sign_in_") >= 0 ? 1 : 0, 1)
+    check_int("but the caption itself keeps its punctuation",
+        d1.index_of("Ui_button(ui, \"Sign in!\"") >= 0 ? 1 : 0, 1)
+    check_int("the document's own handler name is used verbatim",
+        d1.index_of("Form1.on_remember(id)") >= 0 ? 1 : 0, 1)
+    check_int("disabled control gets its follow-up call",
+        d1.index_of("Ui_set_enabled(ui, widgets.Ui_last_id(ui), 0)") >= 0 ? 1 : 0, 1)
+    check_int("non-default anchor is emitted",
+        d1.index_of("Ui_set_anchor(ui, widgets.Ui_last_id(ui), 0, 1, 0, 1)") >= 0 ? 1 : 0, 1)
+    // Only ONE anchor line: the other six widgets are on the default and must
+    // not each carry a no-op call.
+    check_int("default anchors are NOT emitted", count_of(d1, "Ui_set_anchor"), 1)
+
+    print("-- THE assertion: the generated pair compiles --")
+    check_int("wyn build Form1.designer.wyn", build_ok(dpath()), 1)
+
+    // ---- second generation: idempotent, and the body survives ------------
+    print("-- regenerating does not touch Form1.wyn --")
+    var again = codegen.Form_generate(ui, PROJ)
+    check_int("no stubs appended the second time", again, 0)
+    check("Form1.wyn is byte-identical", File::read(cpath()), c1)
+
+    print("-- a hand-written BODY survives regeneration --")
+    // What a user would actually do: replace the stub's print with real code.
+    var edited = c1 + "\n// hand-written, must survive\n"
+        + "pub fn helper(n: int) -> int {\n    return n + 41\n}\n"
+    File::write(cpath(), edited)
+    // ...and change the form at the same time, which is when a naive generator
+    // rewrites the file.
+    ui = widgets.Ui_button(ui, "Help", 240, 80, 96, 28, noop)
+    var n2 = codegen.Form_generate(ui, PROJ)
+    check_int("exactly one stub for the new control", n2, 1)
+    var c2 = File::read(cpath())
+    check_int("the hand-written helper is still there",
+        c2.index_of("return n + 41") >= 0 ? 1 : 0, 1)
+    check_int("the old stub bodies are still there",
+        c2.index_of("pub fn on_remember(id: int)") >= 0 ? 1 : 0, 1)
+    check_int("the new stub was APPENDED after it",
+        c2.index_of("pub fn on_help_") > c2.index_of("return n + 41") ? 1 : 0, 1)
+    check_int("still compiles after the append", build_ok(dpath()), 1)
+
+    print("-- the designer file IS clobbered (the other half of the rule) --")
+    File::write(dpath(), "// a human edited this by mistake\n")
+    codegen.Form_generate(ui, PROJ)
+    var d3 = File::read(dpath())
+    check_int("the stray edit is gone",
+        d3.index_of("a human edited this") < 0 ? 1 : 0, 1)
+    check_int("and it is a whole file again",
+        d3.index_of("fn main()") >= 0 ? 1 : 0, 1)
+
+    print("-- a handler the user REMOVED comes back as a stub --")
+    // Deleting a body and regenerating must restore a compilable stub, or the
+    // project is stuck broken with no way back from the designer.
+    File::write(cpath(), "// emptied\n")
+    var n3 = codegen.Form_generate(ui, PROJ)
+    check_int("all four handlers re-stubbed", n3, 4)
+    check_int("compiles again from an emptied code file", build_ok(dpath()), 1)
+
+    print("-- a handler that is NOT pub is left alone, not duplicated --")
+    // has_handler matches "fn <name>(", so a body whose `pub` was dropped is
+    // found and NOT re-added. Duplicating it would be a compile error whose fix
+    // means deleting code.
+    File::write(cpath(), "// user dropped the pub\nfn on_remember(id: int) {}\n")
+    var n4 = codegen.Form_generate(ui, PROJ)
+    var c4 = File::read(cpath())
+    check_int("on_remember was not re-added", count_of(c4, "fn on_remember("), 1)
+    check_int("the other three were", n4, 3)
+
+    print("")
+    if fails == 0 {
+        print("=== ALL CODEGEN TESTS PASSED ===")
+    } else {
+        print("=== ${fails} CODEGEN TEST(S) FAILED ===")
+    }
+}
+
+// How many times `needle` occurs in `hay`. Used for the "exactly one" claims,
+// which are the interesting ones: "contains" cannot tell a correct emission
+// from a duplicated one.
+fn count_of(hay: string, needle: string) -> int {
+    var n = 0
+    var i = 0
+    while i + needle.len() <= hay.len() {
+        if hay.substring(i, i + needle.len()) == needle {
+            n = n + 1
+            i = i + needle.len()
+        } else {
+            i = i + 1
+        }
+    }
+    return n
+}

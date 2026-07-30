@@ -1,0 +1,309 @@
+// wizard - THREE FORMS IN ONE WINDOW, over one shared state.
+//
+//   ./csrc/build.sh                                   # the native backend
+//   WYN_ROOT=/path/to/wyn  wyn run examples/wizard.wyn
+//   SDL_VIDEODRIVER=dummy  ...  examples/wizard.wyn --selftest   # headless
+//
+// The thing to look at is not the widgets, it is that there is ONE window and
+// three named forms, and that "Next" on page 1 makes page 3 show what was typed
+// on page 1 - with no event bus, no subscription and no callback capturing
+// anything. Page 3 reads a shared slot that page 1 wrote. That is the whole
+// mechanism, and it is the only one that works in Wyn: a closure cannot capture
+// a mutable reference to surrounding state, so a subscriber callback would have
+// nothing to write to.
+//
+// WHY THE HANDLERS SET A FLAG INSTEAD OF SWITCHING THE VIEW
+//
+// A handler receives an int id and returns void. It cannot reach the Views value
+// (that would be capturing a mutable reference), so it CANNOT call Views_show
+// itself. What it can do is set a module-level "what was asked for" flag, which
+// the frame loop reads and acts on. The loop owns the app; the handler reports
+// an intent. Every multi-view Wyn program has this shape, so it is worth seeing
+// once explicitly rather than discovering it.
+
+import gui
+import widgets
+import views
+
+// ---- what the handlers ask the loop to do ---------------------------------
+//
+// A pending REQUEST, not the answer. "" means nothing was asked.
+var g_goto = ""
+var g_quit = 0
+
+fn on_next(id: int) { g_goto = "next" }
+fn on_back(id: int) { g_goto = "back" }
+fn on_finish(id: int) { g_goto = "Summary" }
+fn on_quit(id: int) { g_quit = 1 }
+fn on_toggle(id: int) { }
+
+// ---- ids, so the loop can read the controls it needs ----------------------
+//
+// Module-level because a handler cannot be told about them and the loop needs
+// them on every frame. Set once, while building.
+var id_name = 0
+var id_email = 0
+var id_news = 0
+var id_greet = 0
+var id_detail = 0
+
+// ---- the three forms ------------------------------------------------------
+
+fn page_who(win: int, font: int) -> Ui {
+    var u = widgets.Ui_new(win, font)
+    u = widgets.Ui_set_name(u, "Who")
+    u = widgets.Ui_set_design_size(u, 520, 360)
+    u = widgets.Ui_label(u, "Step 1 of 3 - who are you?", 24, 20)
+    u = widgets.Ui_panel(u, 20, 50, 480, 110)
+    u = widgets.Ui_label(u, "Name:", 36, 72)
+    u = widgets.Ui_entry(u, "", 110, 66, 240, 28)
+    id_name = widgets.Ui_last_id(u)
+    u = widgets.Ui_label(u, "Email:", 36, 112)
+    u = widgets.Ui_entry(u, "", 110, 106, 240, 28)
+    id_email = widgets.Ui_last_id(u)
+    u = widgets.Ui_button(u, "Next", 380, 300, 100, 32, on_next)
+    // Bottom-right anchored, so a window resize keeps it in the corner instead
+    // of leaving it stranded mid-form.
+    u = widgets.Ui_set_anchor(u, widgets.Ui_last_id(u), 0, 1, 0, 1)
+    u = widgets.Ui_label(u, "Esc quits.", 24, 330)
+    return u
+}
+
+fn page_prefs(win: int, font: int) -> Ui {
+    var u = widgets.Ui_new(win, font)
+    u = widgets.Ui_set_name(u, "Prefs")
+    u = widgets.Ui_set_design_size(u, 520, 360)
+    u = widgets.Ui_label(u, "Step 2 of 3 - preferences", 24, 20)
+    u = widgets.Ui_checkbox(u, "Send me the newsletter", 36, 70, 1, on_toggle)
+    id_news = widgets.Ui_last_id(u)
+    u = widgets.Ui_button(u, "Back", 20, 300, 100, 32, on_back)
+    u = widgets.Ui_button(u, "Finish", 380, 300, 100, 32, on_finish)
+    u = widgets.Ui_set_anchor(u, widgets.Ui_last_id(u), 0, 1, 0, 1)
+    return u
+}
+
+fn page_summary(win: int, font: int) -> Ui {
+    var u = widgets.Ui_new(win, font)
+    u = widgets.Ui_set_name(u, "Summary")
+    u = widgets.Ui_set_design_size(u, 520, 360)
+    u = widgets.Ui_label(u, "Step 3 of 3 - all set", 24, 20)
+    // These two labels are written by the LOOP from shared state, which is the
+    // cross-form data path this example exists to show.
+    u = widgets.Ui_label(u, "(nothing entered yet)", 36, 70)
+    id_greet = widgets.Ui_last_id(u)
+    u = widgets.Ui_label(u, "", 36, 100)
+    id_detail = widgets.Ui_last_id(u)
+    u = widgets.Ui_button(u, "Back", 20, 300, 100, 32, on_back)
+    u = widgets.Ui_button(u, "Quit", 380, 300, 100, 32, on_quit)
+    u = widgets.Ui_set_anchor(u, widgets.Ui_last_id(u), 0, 1, 0, 1)
+    return u
+}
+
+fn build(win: int, font: int) -> Views {
+    var app = views.Views_new(win, font)
+    app = views.Views_add(app, page_who(win, font))
+    app = views.Views_add(app, page_prefs(win, font))
+    app = views.Views_add(app, page_summary(win, font))
+    return app
+}
+
+// ---- the one place that acts on a handler's request -----------------------
+//
+// Pull the current page's values into the shared slots, then honour whatever the
+// handler asked for. Pulling FIRST matters: "Next" has to carry the text that
+// was typed before it was clicked.
+fn apply(app: Views) -> Views {
+    var a = app
+
+    // Whatever page we are on, harvest what it knows. Views_pull_text is total,
+    // so pulling from a control that is not on this page is a no-op rather than
+    // a special case here.
+    a = views.Views_pull_text(a, "Who", id_name, "name")
+    a = views.Views_pull_text(a, "Who", id_email, "email")
+    a = views.Views_pull_checked(a, "Prefs", id_news, "news")
+
+    // Keep the summary in step with the slots on every frame, so it is correct
+    // whichever way the user arrived at it.
+    var nm = views.Views_get_str(a, "name", "")
+    if nm.len() == 0 { nm = "(no name)" }
+    a = views.Views_push_label(a, "Summary", id_greet, "Welcome, " + nm)
+    var em = views.Views_get_str(a, "email", "(none)")
+    var news = "no"
+    if views.Views_get_int(a, "news", 0) == 1 { news = "yes" }
+    a = views.Views_push_label(a, "Summary", id_detail,
+        "email: " + em + "   newsletter: " + news)
+
+    if g_quit == 1 {
+        g_quit = 0
+        return views.Views_quit(a)
+    }
+    if g_goto.len() == 0 { return a }
+    var want = g_goto
+    g_goto = ""
+    if want == "back" { return views.Views_back(a) }
+    if want == "next" {
+        // "Next" is relative, so it is resolved here against the current page
+        // rather than being three different handlers.
+        var here = views.Views_current_name(a)
+        if here == "Who" { return views.Views_show(a, "Prefs") }
+        if here == "Prefs" { return views.Views_show(a, "Summary") }
+        return a
+    }
+    return views.Views_show(a, want)
+}
+
+// ---- headless self-test ---------------------------------------------------
+//
+// Drives the SAME apply() the interactive loop drives, with synthetic input
+// through the real event queue - so what passes here is the code the user's
+// fingers reach, not a test-only path.
+fn selftest(win: int, font: int) -> int {
+    var fails = 0
+    var app = build(win, font)
+
+    print("-- start on page 1 --")
+    if views.Views_current_name(app) != "Who" {
+        print("  FAIL expected Who, got " + views.Views_current_name(app))
+        fails = fails + 1
+    } else { print("  ok   showing Who") }
+
+    print("-- type a name into page 1's entry, through real events --")
+    gui.Win_push_mouse_move(win, 200, 80)
+    gui.Win_push_mouse_down(win, 200, 80, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, 200, 80, gui.MOUSE_LEFT)
+    app = views.Views_events(app)
+    gui.Win_push_text(win, "Ada")
+    app = views.Views_events(app)
+    var typed = views.Views_view_text(app, "Who", id_name)
+    if typed != "Ada" {
+        print("  FAIL entry holds [" + typed + "], expected [Ada]")
+        fails = fails + 1
+    } else { print("  ok   entry holds Ada") }
+
+    print("-- click Next (a real click on the real button) --")
+    gui.Win_push_mouse_move(win, 430, 316)
+    gui.Win_push_mouse_down(win, 430, 316, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, 430, 316, gui.MOUSE_LEFT)
+    app = views.Views_events(app)
+    app = apply(app)
+    if views.Views_current_name(app) != "Prefs" {
+        print("  FAIL expected Prefs, got " + views.Views_current_name(app))
+        fails = fails + 1
+    } else { print("  ok   advanced to Prefs") }
+
+    print("-- THE POINT: page 3 shows what page 1 collected --")
+    g_goto = "Summary"
+    app = apply(app)
+    var greet = views.Views_view_label(app, "Summary", id_greet)
+    if greet != "Welcome, Ada" {
+        print("  FAIL summary greeting is [" + greet + "]")
+        fails = fails + 1
+    } else { print("  ok   summary reads: " + greet) }
+    var detail = views.Views_view_label(app, "Summary", id_detail)
+    print("  ok   summary detail: " + detail)
+
+    print("-- Back unwinds, and page 1 still has its text --")
+    g_goto = "back"
+    app = apply(app)
+    if views.Views_current_name(app) != "Prefs" {
+        print("  FAIL back went to " + views.Views_current_name(app))
+        fails = fails + 1
+    } else { print("  ok   back to Prefs") }
+    g_goto = "back"
+    app = apply(app)
+    if views.Views_current_name(app) != "Who" {
+        print("  FAIL back went to " + views.Views_current_name(app))
+        fails = fails + 1
+    } else { print("  ok   back to Who") }
+    // Retained state, which is the entire argument for retained widgets over
+    // immediate mode: two view switches later, the text is still there.
+    var still = views.Views_view_text(app, "Who", id_name)
+    if still != "Ada" {
+        print("  FAIL text lost across two switches: [" + still + "]")
+        fails = fails + 1
+    } else { print("  ok   the typed text survived both switches") }
+
+    print("-- a resize re-anchors every page, including the hidden ones --")
+    app = views.Views_relayout(app, 520, 360, 720, 360)
+    var w = views.Views_view(app, "Summary")
+    if widgets.Ui_design_w(w) != 720 {
+        print("  FAIL hidden page's design width is "
+            + widgets.Ui_design_w(w).to_string())
+        fails = fails + 1
+    } else { print("  ok   the hidden Summary page was relaid out too") }
+
+    print("-- Quit --")
+    g_quit = 1
+    app = apply(app)
+    if views.Views_running(app) != 0 {
+        print("  FAIL still running")
+        fails = fails + 1
+    } else { print("  ok   stopped") }
+
+    return fails
+}
+
+fn main() {
+    if gui.Win_available() == 0 {
+        print("no display available - skipping")
+        return
+    }
+    var win = gui.Win_window("Wyn wizard - three forms, one window", 520, 360)
+    if win < 0 {
+        print("could not open a window")
+        return
+    }
+    var font = gui.Win_font_default(15)
+    if font < 0 {
+        print("no font found")
+        gui.Win_close(win)
+        return
+    }
+
+    // --selftest, from argv OR from the environment.
+    //
+    // Both, because `wyn run` does not forward argv to the program (verified:
+    // args.len() is 1 under `wyn run`), so a flag-only check makes the headless
+    // path reachable from a built binary and nowhere else. designer.wyn does the
+    // same for the same reason.
+    //
+    // NB: `Args::has("--selftest")` compiles and silently returns false. It is
+    // not the argv of this process; System::args() is. A wrong-but-compiling
+    // spelling that fails by running the INTERACTIVE loop is a nasty one - the
+    // symptom is a headless test that hangs, not an error.
+    var argv = System::args()
+    var want_selftest = 0
+    var ai = 1
+    while ai < argv.len() {
+        if argv[ai] == "--selftest" { want_selftest = 1 }
+        ai = ai + 1
+    }
+    if Env::get("WYN_WIZARD_SELFTEST").len() > 0 { want_selftest = 1 }
+
+    if want_selftest == 1 {
+        print("=== wizard selftest ===")
+        var fails = selftest(win, font)
+        if fails == 0 {
+            print("=== ALL WIZARD SELFTESTS PASSED ===")
+        } else {
+            print("=== ${fails} WIZARD SELFTEST(S) FAILED ===")
+        }
+        gui.Win_font_free(font)
+        gui.Win_close(win)
+        return
+    }
+
+    var app = build(win, font)
+    while views.Views_running(app) == 1 {
+        app = views.Views_frame(app)
+        app = apply(app)
+    }
+
+    // The forms are DATA, so reading the result out afterwards is just a query.
+    var nm = views.Views_get_str(app, "name", "(none)")
+    var em = views.Views_get_str(app, "email", "(none)")
+    print("collected: name=${nm} email=${em}")
+
+    gui.Win_font_free(font)
+    gui.Win_close(win)
+}

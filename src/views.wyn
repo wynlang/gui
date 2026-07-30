@@ -1,0 +1,442 @@
+// views - MULTIPLE FORMS IN ONE WINDOW, switched by name, over one shared state.
+//
+// The owner's choice, and the reason for it: ONE WINDOW, SWAP VIEWS, SHARED
+// STATE. Not an event bus, and not one OS window per form.
+//
+// WHY NOT AN EVENT BUS
+//
+// A bus is the obvious answer for "form A changed something form B shows", and
+// it is the wrong one here for a reason specific to Wyn: a Wyn closure cannot
+// capture a mutable reference to the surrounding state (verified), so a
+// subscriber callback has no way to write to the thing it would need to update.
+// Every handler already receives a widget ID and acts through module-level state
+// or a return value. With one shared state struct that IS the mechanism - form B
+// reads the same field form A wrote, on the next frame, with no subscription, no
+// ordering question, and no way to leak a stale subscriber. A bus would add a
+// second data path that cannot actually carry the data.
+//
+// WHY NOT ONE WINDOW PER FORM
+//
+// A designer emits ONE program. Multi-window means a window manager, per-window
+// event routing and a lifetime question per form; view-swapping means an int.
+// The forms already share a window's `win`/`font` handles, so switching is
+// picking which Ui gets Ui_frame() this iteration.
+//
+// THE SHAPE
+//
+//     var app = views.Views_new(win, font)
+//     app = views.Views_add(app, login_form)      // named by its own Ui name
+//     app = views.Views_add(app, main_form)
+//     app = views.Views_show(app, "Login")
+//     while views.Views_running(app) == 1 {
+//         app = views.Views_frame(app)            // frames the CURRENT view only
+//     }
+//
+// STRUCTS PASS BY VALUE, so every mutator takes a Views and RETURNS it, exactly
+// as the Ui_* functions do. This is not a style choice: a function that mutates
+// `self` mutates a copy and silently does nothing, so the returning form is the
+// only one that works. Follow it.
+//
+// WHY THE STRUCT IS `Views` AND NOT `App`
+//
+// It was App, which is the natural name, and it does not work: `App` is one of
+// Wyn's reserved built-in namespaces (checker.c's namespace table lists it
+// alongside File, Json and Http). A user struct called App is accepted by the
+// parser and then MISTYPED everywhere it is used - the errors land on unrelated
+// lines and name unrelated types ("Cannot compare int with string" on a
+// string/string comparison; "Return type mismatch. Expected int, got App" from a
+// function that returns int). Minimised to six lines and reported. Renaming the
+// struct fixes it completely, so the workaround is free; the trap is that the
+// diagnostics point everywhere except at the name.
+
+import widgets
+
+// One app: a stack of named views, which one is showing, and the state they
+// share.
+//
+// The shared state is a fixed set of typed slots rather than a HashMap of
+// strings, because a form that reads state wants `Views_get_int(app, "user_id")`
+// to be a compile-time-known int, and because the slots are what a generated
+// Form1.designer.wyn can declare. Three parallel arrays of key/value is a
+// deliberately boring representation: it is O(n) on a handful of keys, it
+// serialises trivially, and it cannot get out of step with itself the way a
+// struct-per-form would.
+pub struct Views {
+    win: int,
+    font: int,
+    views: [Ui],
+    current: int,          // index into views, or -1 when nothing is shown
+
+    // ---- the shared state ----
+    //
+    // Keys are strings so a form can be authored (or AI-generated) against a
+    // name rather than a field offset, which is the same reason the form model
+    // is JSON. Values are split by type rather than stringly-typed, so
+    // Views_get_int does not have to parse and cannot fail at runtime.
+    si_keys: [string],
+    si_vals: [int],
+    ss_keys: [string],
+    ss_vals: [string],
+
+    // History of view names, for Views_back. A wizard ("Next", "Next", "Back")
+    // is the first thing anyone builds out of multiple views, and reconstructing
+    // "where was I" from the current index is impossible once a jump is
+    // involved.
+    history: [string]
+}
+
+pub fn Views_new(win: int, font: int) -> Views {
+    return Views {
+        win: win, font: font,
+        views: [], current: -1,
+        si_keys: [], si_vals: [],
+        ss_keys: [], ss_vals: [],
+        history: []
+    }
+}
+
+// ---- views ----------------------------------------------------------------
+
+// Add a view. Its NAME comes from the Ui itself (Ui_set_name / the JSON
+// document's "form" key), so a form is not named twice and cannot disagree with
+// its own file name.
+//
+// The first view added becomes current, because a Views with views and nothing
+// showing renders a blank window, and "I added a form and got a blank window" is
+// not a state worth being able to reach by accident.
+pub fn Views_add(app: Views, ui: Ui) -> Views {
+    var a = app
+    // Re-bind the view to THIS app's window and font. A form loaded from JSON
+    // has win = -1 (a document has no window), and a form built for another
+    // window would draw into the wrong one. Doing it here means a caller cannot
+    // forget.
+    var v = widgets.Ui_bind(ui, a.win, a.font)
+    a.views.push(v)
+    if a.current == -1 { a.current = 0 }
+    return a
+}
+
+pub fn Views_count(app: Views) -> int {
+    return app.views.len()
+}
+
+// The index of the view called `name`, or -1.
+pub fn Views_index_of(app: Views, name: string) -> int {
+    var i = 0
+    while i < app.views.len() {
+        if widgets.Ui_name(app.views[i]) == name { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+pub fn Views_name_at(app: Views, i: int) -> string {
+    if i < 0 { return "" }
+    if i >= app.views.len() { return "" }
+    return widgets.Ui_name(app.views[i])
+}
+
+pub fn Views_current(app: Views) -> int {
+    return app.current
+}
+
+pub fn Views_current_name(app: Views) -> string {
+    return Views_name_at(app, app.current)
+}
+
+// Show the view called `name`.
+//
+// An UNKNOWN name is a no-op, not a switch to nothing and not a crash: the name
+// typically comes from a handler, a JSON document or an assistant, and blanking
+// the window on a typo is the worst of the three possible responses. The caller
+// can check with Views_index_of when it wants to know.
+pub fn Views_show(app: Views, name: string) -> Views {
+    var a = app
+    var idx = Views_index_of(a, name)
+    if idx < 0 { return a }
+    if idx == a.current { return a }
+    // Push the view we are LEAVING, so Views_back returns to it.
+    if a.current >= 0 {
+        a.history.push(widgets.Ui_name(a.views[a.current]))
+    }
+    a.current = idx
+    return a
+}
+
+// Go back to the previously shown view. A no-op with an empty history.
+pub fn Views_back(app: Views) -> Views {
+    var a = app
+    if a.history.len() == 0 { return a }
+    var last = a.history[a.history.len() - 1]
+    a.history.pop()
+    var idx = Views_index_of(a, last)
+    if idx >= 0 { a.current = idx }
+    return a
+}
+
+pub fn Views_history_depth(app: Views) -> int {
+    return app.history.len()
+}
+
+// ---- shared state ---------------------------------------------------------
+
+// Read an int slot, or `dflt` when it was never set.
+//
+// A default rather than a 0: 0 is a legitimate value for a counter and for an
+// id, so "absent" and "zero" have to be distinguishable or the first form to
+// read before another form writes gets a plausible wrong answer.
+pub fn Views_get_int(app: Views, key: string, dflt: int) -> int {
+    var i = 0
+    while i < app.si_keys.len() {
+        if app.si_keys[i] == key { return app.si_vals[i] }
+        i = i + 1
+    }
+    return dflt
+}
+
+pub fn Views_has_int(app: Views, key: string) -> int {
+    var i = 0
+    while i < app.si_keys.len() {
+        if app.si_keys[i] == key { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+pub fn Views_set_int(app: Views, key: string, v: int) -> Views {
+    var a = app
+    var i = 0
+    while i < a.si_keys.len() {
+        if a.si_keys[i] == key {
+            a.si_vals[i] = v
+            return a
+        }
+        i = i + 1
+    }
+    a.si_keys.push(key)
+    a.si_vals.push(v)
+    return a
+}
+
+pub fn Views_get_str(app: Views, key: string, dflt: string) -> string {
+    var i = 0
+    while i < app.ss_keys.len() {
+        if app.ss_keys[i] == key { return app.ss_vals[i] }
+        i = i + 1
+    }
+    return dflt
+}
+
+pub fn Views_has_str(app: Views, key: string) -> int {
+    var i = 0
+    while i < app.ss_keys.len() {
+        if app.ss_keys[i] == key { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+pub fn Views_set_str(app: Views, key: string, v: string) -> Views {
+    var a = app
+    var i = 0
+    while i < a.ss_keys.len() {
+        if a.ss_keys[i] == key {
+            a.ss_vals[i] = v
+            return a
+        }
+        i = i + 1
+    }
+    a.ss_keys.push(key)
+    a.ss_vals.push(v)
+    return a
+}
+
+// ---- pulling a value out of one view into the shared state ----------------
+//
+// The concrete mechanism behind "form A changed something form B shows": form A
+// has an entry, and its value has to reach form B. Without this, a caller writes
+// the same six lines (find the view, find the widget, read the text, set the
+// slot) at every call site and gets the "widget not on this view" case wrong.
+//
+// Returns the Views unchanged when the view or the widget does not exist, because
+// a form is edited by a designer and a control the code refers to can genuinely
+// be deleted between runs.
+pub fn Views_pull_text(app: Views, view: string, id: int, key: string) -> Views {
+    var a = app
+    var vi = Views_index_of(a, view)
+    if vi < 0 { return a }
+    if widgets.Ui_exists(a.views[vi], id) == 0 { return a }
+    return Views_set_str(a, key, widgets.Ui_text(a.views[vi], id))
+}
+
+pub fn Views_pull_checked(app: Views, view: string, id: int, key: string) -> Views {
+    var a = app
+    var vi = Views_index_of(a, view)
+    if vi < 0 { return a }
+    if widgets.Ui_exists(a.views[vi], id) == 0 { return a }
+    return Views_set_int(a, key, widgets.Ui_checked(a.views[vi], id))
+}
+
+// ...and the other direction: push a shared value into a control's label, which
+// is how form B DISPLAYS what form A set.
+pub fn Views_push_label(app: Views, view: string, id: int, s: string) -> Views {
+    var a = app
+    var vi = Views_index_of(a, view)
+    if vi < 0 { return a }
+    if widgets.Ui_exists(a.views[vi], id) == 0 { return a }
+    // Read out, mutate, write back: the array element is a COPY, so mutating
+    // `a.views[vi]` in place would update a temporary and silently do nothing.
+    var v = a.views[vi]
+    v = widgets.Ui_set_label(v, id, s)
+    a.views[vi] = v
+    return a
+}
+
+// ---- the loop -------------------------------------------------------------
+
+// Is the app still running?
+//
+// Quitting is per-VIEW state (Ui_running goes to 0 when the window closes or ESC
+// is pressed with nothing focused), and the CURRENT view is the one receiving
+// those events, so it is the one that decides. A background view that was closed
+// earlier must not keep the app up, and must not bring it down either.
+pub fn Views_running(app: Views) -> int {
+    if app.current < 0 { return 0 }
+    return widgets.Ui_running(app.views[app.current])
+}
+
+pub fn Views_quit(app: Views) -> Views {
+    var a = app
+    if a.current < 0 { return a }
+    var v = a.views[a.current]
+    v = widgets.Ui_stop(v)
+    a.views[a.current] = v
+    return a
+}
+
+// One frame of the CURRENT view only.
+//
+// Only the current view is framed - not all of them - because framing a hidden
+// view would deliver the same click to two forms and draw both into the window.
+// Its state is preserved across a switch (that is the point of retained widgets:
+// leaving a form and coming back finds the text you typed still there).
+pub fn Views_frame(app: Views) -> Views {
+    var a = app
+    if a.current < 0 { return a }
+    var v = a.views[a.current]
+    v = widgets.Ui_frame(v)
+    a.views[a.current] = v
+    return a
+}
+
+// Pump events for the current view WITHOUT drawing. The headless path: a test
+// drives synthetic input through the real event queue and asserts on state, with
+// no renderer and no display.
+pub fn Views_events(app: Views) -> Views {
+    var a = app
+    if a.current < 0 { return a }
+    var v = a.views[a.current]
+    v = widgets.Ui_events(v)
+    a.views[a.current] = v
+    return a
+}
+
+// ---- reading a view -------------------------------------------------------
+//
+// A caller needs to read a control on a view it is not currently showing (that
+// is most of the point of shared state), so these take a view NAME rather than
+// operating on the current one. All are total: an unknown view or id gives the
+// empty/zero answer rather than trapping, because a designer can delete a
+// control between runs.
+
+pub fn Views_view_text(app: Views, view: string, id: int) -> string {
+    var vi = Views_index_of(app, view)
+    if vi < 0 { return "" }
+    return widgets.Ui_text(app.views[vi], id)
+}
+
+pub fn Views_view_checked(app: Views, view: string, id: int) -> int {
+    var vi = Views_index_of(app, view)
+    if vi < 0 { return 0 }
+    return widgets.Ui_checked(app.views[vi], id)
+}
+
+pub fn Views_view_label(app: Views, view: string, id: int) -> string {
+    var vi = Views_index_of(app, view)
+    if vi < 0 { return "" }
+    return widgets.Ui_label_of(app.views[vi], id)
+}
+
+pub fn Views_view_count(app: Views, view: string) -> int {
+    var vi = Views_index_of(app, view)
+    if vi < 0 { return 0 }
+    return widgets.Ui_count(app.views[vi])
+}
+
+// The whole Ui of one view, by name.
+//
+// The escape hatch, and it is a real one rather than a leak: `app.views` cannot
+// be indexed from outside this module (indexing an array field of an imported
+// struct loses the element type), so without this a caller cannot reach the 90+
+// Ui_* accessors at all, and every one of them would have to be mirrored here as
+// Views_view_<something>. Four of them already are, for the common cases; this
+// covers the rest.
+//
+// A COPY, because structs pass by value - mutating what you get back does not
+// touch the app. Use Views_set_view_text / Views_push_label to write, or
+// Views_replace to swap a whole view.
+//
+// An unknown name yields an empty unbound Ui rather than trapping, for the same
+// reason every other accessor here is total.
+pub fn Views_view(app: Views, view: string) -> Ui {
+    var vi = Views_index_of(app, view)
+    if vi < 0 { return widgets.Ui_new(0 - 1, 0 - 1) }
+    return app.views[vi]
+}
+
+// Swap a whole view in place, keeping its position in the stack (and therefore
+// the history and `current` index valid).
+//
+// The write half of Views_view: read a view out, drive it through any Ui_*
+// functions, put it back. Also how a designer replaces a form it has just
+// reloaded from JSON without disturbing which view is showing.
+//
+// Rebinds win/font, so a form that came from Form_load (win = -1) is usable
+// immediately - the same guarantee Views_add gives.
+pub fn Views_replace(app: Views, view: string, ui: Ui) -> Views {
+    var a = app
+    var vi = Views_index_of(a, view)
+    if vi < 0 { return a }
+    a.views[vi] = widgets.Ui_bind(ui, a.win, a.font)
+    return a
+}
+
+// Set text on a view by name, so a handler can prefill a form it is about to
+// show.
+pub fn Views_set_view_text(app: Views, view: string, id: int, s: string) -> Views {
+    var a = app
+    var vi = Views_index_of(a, view)
+    if vi < 0 { return a }
+    var v = a.views[vi]
+    v = widgets.Ui_set_text(v, id, s)
+    a.views[vi] = v
+    return a
+}
+
+// Resize every view at once.
+//
+// A window resize is an app-level event but anchoring is per-view, and a hidden
+// view must be relaid out TOO: otherwise switching to it after a resize shows a
+// form laid out for the old size. That is the bug this function exists to
+// prevent, and the reason it does not just relayout the current one.
+pub fn Views_relayout(app: Views, old_w: int, old_h: int, new_w: int, new_h: int) -> Views {
+    var a = app
+    var i = 0
+    while i < a.views.len() {
+        var v = a.views[i]
+        v = widgets.Ui_relayout(v, old_w, old_h, new_w, new_h)
+        a.views[i] = v
+        i = i + 1
+    }
+    return a
+}

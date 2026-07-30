@@ -53,6 +53,7 @@ var KIND_BUTTON = 1
 var KIND_CHECKBOX = 2
 var KIND_ENTRY = 3
 var KIND_PANEL = 4
+var KIND_TEXTAREA = 5
 
 // A single control. One flat struct for every kind rather than a variant per
 // kind: a designer's property inspector wants a uniform field set to read and
@@ -65,13 +66,58 @@ pub struct Widget {
     checked: int,          // CHECKBOX: 0 or 1
     text: string,          // ENTRY: current contents
     enabled: int,          // 0 = greyed out and unclickable
-    on_click: fn(int) -> void
+    on_click: fn(int) -> void,
+
+    // ---- persisted document fields, added for the JSON form model ----
+    //
+    // The name of the handler this control calls, as it appears in Form1.wyn.
+    // The `on_click` FUNCTION POINTER cannot be serialised and cannot be
+    // reconstructed by a loader (Wyn has no eval), so the document stores the
+    // NAME and the generated Form1.designer.wyn re-binds the pointer at compile
+    // time. Loading a form therefore yields a widget whose on_click is noop and
+    // whose handler_name is "on_ok" - which is exactly what a designer needs:
+    // it edits names, the generator turns names into calls.
+    handler_name: string,
+
+    // ANCHORS. Desktop forms use absolute x/y/w/h; anchors decide what happens
+    // when the CONTAINER resizes, and they are the same mechanism a phone
+    // layout needs. Stored from the start because migrating saved documents
+    // later is the expensive part, not adding the field.
+    //
+    // 0 = free, 1 = pinned. left+right both pinned => the width stretches;
+    // only right pinned => the control slides right. Same for top/bottom.
+    // The DEFAULT is left+top pinned, which reproduces classic absolute
+    // positioning exactly, so an existing form behaves identically.
+    anchor_left: int, anchor_right: int,
+    anchor_top: int, anchor_bottom: int,
+
+    // ---- TEXTAREA state ----
+    //
+    // A separate [string] rather than embedding newlines in `text`: every edit
+    // operation (caret up/down, insert, backspace across a line join, scrolling)
+    // is a line-indexed operation, and re-splitting a single string on every
+    // keystroke turns an O(1) insert into an O(n) rebuild of the whole buffer.
+    // `text` still carries the flattened contents for ENTRY and for the
+    // serialiser, and Ui_textarea_text() flattens on demand.
+    lines: [string],
+    caret_line: int,       // 0-based line the caret is on
+    caret_col: int,        // 0-based column, 0 .. len(line)
+    scroll_line: int       // first visible line (vertical scrolling)
 }
 
 // The toolkit state.
 pub struct Ui {
     win: int,
     font: int,
+    // Document identity. `name` is the form's name ("Form1"), which the JSON
+    // document carries and the two-file generator turns into the file names
+    // Form1.wyn / Form1.designer.wyn. design_w/design_h are the size the
+    // coordinates were authored AT - Ui_relayout needs an origin size, and
+    // taking it from the live window would make a form re-anchor differently
+    // depending on how the window happened to open.
+    name: string,
+    design_w: int,
+    design_h: int,
     widgets: [Widget],
     next_id: int,
     hot: int,              // id under the pointer, or -1
@@ -89,10 +135,107 @@ pub struct Ui {
 
 fn noop_handler(id: int) { }
 
+// ---- line-buffer helpers -------------------------------------------------
+//
+// Split on "\n" and guarantee at least one line. An empty buffer is ONE empty
+// line, not zero lines: with zero lines there is nowhere to put the caret, and
+// every edit operation would need a "buffer is empty" special case. This is the
+// invariant the whole editor rests on - lines.len() >= 1, always.
+fn split_lines(s: string) -> [string] {
+    var out: [string] = []
+    var parts = s.split("\n")
+    var i = 0
+    while i < parts.len() {
+        out.push(parts[i])
+        i = i + 1
+    }
+    if out.len() == 0 { out.push("") }
+    return out
+}
+
+// COMPILER BUG WORKAROUND, and the reason these two take (ui, i) rather than the
+// [string] they actually operate on.
+//
+// A function DEFINED IN A MODULE that takes an ARRAY PARAMETER is emitted with
+// that parameter typed `long long`, while its body calls array_len/array_get_str
+// which expect a `WynArray` struct - so the C compile fails with "passing
+// 'long long' to parameter of incompatible type 'WynArray'". The identical
+// function in a non-module file compiles and runs. Array RETURNS from a module
+// function are fine; only parameters are affected. Minimised and reported.
+//
+// Threading (ui, i) is not a workaround for the bug so much as sidestepping it
+// entirely: a struct parameter carrying an array FIELD works, and the array
+// these need always lives at ui.widgets[i].lines anyway.
+
+fn join_lines_at(ui: Ui, i: int) -> string {
+    var out = ""
+    var k = 0
+    while k < ui.widgets[i].lines.len() {
+        if k > 0 { out = out + "\n" }
+        out = out + line_copy(ui, i, k)
+        k = k + 1
+    }
+    return out
+}
+
+// Insert `s` into widget i's line buffer at index `at`.
+//
+// SECOND COMPILER BUG, independent of the first. `[string].insert(i, v)` inserts
+// an EMPTY STRING at i instead of v - the value is dropped. `[int].insert` is
+// correct, so this is specific to the string-element path. Rebuilding by hand is
+// O(n) per insert, which for a code pane (hundreds of lines) is irrelevant, and
+// it is CORRECT, which the builtin is not.
+//
+//   a: [string] = []   a.push("X")   a.push("Y")   a.insert(1, "MID")
+//   => ["X", "", "Y"]                              want ["X", "MID", "Y"]
+// Read widget i's line n as a FRESH string.
+//
+// THIRD COMPILER BUG, and the nastiest, because it silently destroys data.
+//
+//     var line = u.widgets[i].lines[cl]     // inside a module fn returning Ui
+//
+// emits `const char* line = array_get_str(...)` - a BORROWED pointer into the
+// array - and then a scope-exit `wyn_rc_release(line)`. The release frees the
+// string the array is still holding, so the buffer reads back EMPTY from that
+// point on. Every caret movement or edit would wipe the line it touched.
+// Minimised and reported.
+//
+// Concatenating with "" forces a fresh allocation that the caller genuinely
+// owns, so the matching release is correct. Every read of a line into a local
+// goes through here for that reason - a direct index is a latent data loss.
+fn line_copy(ui: Ui, i: int, n: int) -> string {
+    if n < 0 { return "" }
+    if n >= ui.widgets[i].lines.len() { return "" }
+    return "" + ui.widgets[i].lines[n]
+}
+
+fn insert_line_at(ui: Ui, i: int, at: int, s: string) -> Ui {
+    var u = ui
+    var out: [string] = []
+    // `"" + s`, not `s`: pushing a PARAMETER string stores the caller's pointer
+    // without retaining it, and the caller's scope-exit release then frees the
+    // string this array holds. Observed as a lost line ("hel|" where "hel|lo"
+    // was wanted) and, once the freed slot was reused, as a DUPLICATED one
+    // ("abc|dd" for one keystroke). Same family as the line_copy bug above; the
+    // concatenation forces an allocation this array genuinely owns.
+    var k = 0
+    while k < u.widgets[i].lines.len() {
+        if k == at { out.push("" + s) }
+        out.push(line_copy(u, i, k))
+        k = k + 1
+    }
+    if at >= u.widgets[i].lines.len() { out.push("" + s) }
+    u.widgets[i].lines = out
+    return u
+}
+
 pub fn Ui_new(win: int, font: int) -> Ui {
     return Ui {
         win: win,
         font: font,
+        name: "Form1",
+        design_w: 780,
+        design_h: 520,
         widgets: [],
         next_id: 1,
         hot: -1,
@@ -112,12 +255,35 @@ pub fn Ui_new(win: int, font: int) -> Ui {
 // Each returns the Ui; the new widget's id is `ui.next_id - 1` afterwards, or
 // read it back with Ui_last_id().
 
+// The one place a Widget literal is written.
+//
+// Every constructor below funnels through this, so adding a field to Widget is
+// a one-line change instead of six - and, more importantly, a new field cannot
+// be forgotten in one constructor and set in the others, which is the failure
+// that makes a serialiser produce documents that load back subtly different.
+fn make_widget(id: int, kind: int, x: int, y: int, w: int, h: int,
+               label: string, checked: int, text: string,
+               handler: fn(int) -> void) -> Widget {
+    var ls: [string] = []
+    ls.push(text)
+    return Widget {
+        id: id, kind: kind, x: x, y: y, w: w, h: h,
+        label: label, checked: checked, text: text, enabled: 1,
+        on_click: handler,
+        handler_name: "",
+        // Classic absolute positioning: pinned to the top-left, free on the
+        // right and bottom. A form saved before anchors existed behaves the
+        // same when it loads with these defaults.
+        anchor_left: 1, anchor_right: 0,
+        anchor_top: 1, anchor_bottom: 0,
+        lines: ls, caret_line: 0, caret_col: 0, scroll_line: 0
+    }
+}
+
 pub fn Ui_label(ui: Ui, text: string, x: int, y: int) -> Ui {
     var u = ui
-    u.widgets.push(Widget {
-        id: u.next_id, kind: KIND_LABEL, x: x, y: y, w: 0, h: 0,
-        label: text, checked: 0, text: "", enabled: 1, on_click: noop_handler
-    })
+    u.widgets.push(make_widget(u.next_id, KIND_LABEL, x, y, 0, 0,
+                               text, 0, "", noop_handler))
     u.next_id = u.next_id + 1
     return u
 }
@@ -125,10 +291,8 @@ pub fn Ui_label(ui: Ui, text: string, x: int, y: int) -> Ui {
 pub fn Ui_button(ui: Ui, text: string, x: int, y: int, w: int, h: int,
                  handler: fn(int) -> void) -> Ui {
     var u = ui
-    u.widgets.push(Widget {
-        id: u.next_id, kind: KIND_BUTTON, x: x, y: y, w: w, h: h,
-        label: text, checked: 0, text: "", enabled: 1, on_click: handler
-    })
+    u.widgets.push(make_widget(u.next_id, KIND_BUTTON, x, y, w, h,
+                               text, 0, "", handler))
     u.next_id = u.next_id + 1
     return u
 }
@@ -136,30 +300,40 @@ pub fn Ui_button(ui: Ui, text: string, x: int, y: int, w: int, h: int,
 pub fn Ui_checkbox(ui: Ui, text: string, x: int, y: int, checked: int,
                    handler: fn(int) -> void) -> Ui {
     var u = ui
-    u.widgets.push(Widget {
-        id: u.next_id, kind: KIND_CHECKBOX, x: x, y: y, w: 18, h: 18,
-        label: text, checked: checked, text: "", enabled: 1, on_click: handler
-    })
+    u.widgets.push(make_widget(u.next_id, KIND_CHECKBOX, x, y, 18, 18,
+                               text, checked, "", handler))
     u.next_id = u.next_id + 1
     return u
 }
 
 pub fn Ui_entry(ui: Ui, initial: string, x: int, y: int, w: int, h: int) -> Ui {
     var u = ui
-    u.widgets.push(Widget {
-        id: u.next_id, kind: KIND_ENTRY, x: x, y: y, w: w, h: h,
-        label: "", checked: 0, text: initial, enabled: 1, on_click: noop_handler
-    })
+    u.widgets.push(make_widget(u.next_id, KIND_ENTRY, x, y, w, h,
+                               "", 0, initial, noop_handler))
     u.next_id = u.next_id + 1
     return u
 }
 
 pub fn Ui_panel(ui: Ui, x: int, y: int, w: int, h: int) -> Ui {
     var u = ui
-    u.widgets.push(Widget {
-        id: u.next_id, kind: KIND_PANEL, x: x, y: y, w: w, h: h,
-        label: "", checked: 0, text: "", enabled: 1, on_click: noop_handler
-    })
+    u.widgets.push(make_widget(u.next_id, KIND_PANEL, x, y, w, h,
+                               "", 0, "", noop_handler))
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// A multi-line text editor. `initial` may contain newlines; they become lines.
+//
+// This is the prerequisite for editing handler bodies in-app: double-clicking a
+// widget opens a code pane, and a code pane is a textarea. It is deliberately a
+// SINGLE-CURSOR editor with no selection - a working single cursor is usable,
+// and a selection model layered on a caret that is not yet right is not.
+pub fn Ui_textarea(ui: Ui, initial: string, x: int, y: int, w: int, h: int) -> Ui {
+    var u = ui
+    var wd = make_widget(u.next_id, KIND_TEXTAREA, x, y, w, h,
+                         "", 0, initial, noop_handler)
+    wd.lines = split_lines(initial)
+    u.widgets.push(wd)
     u.next_id = u.next_id + 1
     return u
 }
@@ -167,6 +341,69 @@ pub fn Ui_panel(ui: Ui, x: int, y: int, w: int, h: int) -> Ui {
 // Id of the most recently added widget.
 pub fn Ui_last_id(ui: Ui) -> int {
     return ui.next_id - 1
+}
+
+// ---- document identity ----
+
+pub fn Ui_name(ui: Ui) -> string {
+    return ui.name
+}
+
+pub fn Ui_set_name(ui: Ui, s: string) -> Ui {
+    var u = ui
+    u.name = s
+    return u
+}
+
+pub fn Ui_design_w(ui: Ui) -> int {
+    return ui.design_w
+}
+
+pub fn Ui_design_h(ui: Ui) -> int {
+    return ui.design_h
+}
+
+pub fn Ui_set_design_size(ui: Ui, w: int, h: int) -> Ui {
+    var u = ui
+    u.design_w = w
+    u.design_h = h
+    return u
+}
+
+// ---- the loader's constructor --------------------------------------------
+//
+// Add a widget with an EXPLICIT id and every persisted field at once.
+//
+// This exists for exactly one caller: the JSON loader. It must not be the normal
+// way to build a form - the Ui_button/Ui_entry constructors assign ids and are
+// what a human or a generator writes. But a round trip is only a round trip if
+// the ids come back UNCHANGED: reassigning them would renumber every handler
+// name and break every reference the document makes to a widget.
+//
+// on_click is deliberately not a parameter. A function pointer cannot be
+// deserialised, so a loaded widget carries the handler NAME and a noop pointer;
+// the generated Form1.designer.wyn is what turns the name back into a call.
+// Pretending otherwise - accepting a handler here - would suggest load/save can
+// preserve behaviour, which it cannot and must not appear to.
+pub fn Ui_add_raw(ui: Ui, id: int, kind: int, x: int, y: int, w: int, h: int,
+                  label: string, text: string, checked: int, enabled: int,
+                  handler_name: string,
+                  al: int, ar: int, at: int, ab: int) -> Ui {
+    var u = ui
+    var wd = make_widget(id, kind, x, y, w, h, label, checked, text, noop_handler)
+    wd.enabled = enabled
+    wd.handler_name = handler_name
+    wd.anchor_left = al
+    wd.anchor_right = ar
+    wd.anchor_top = at
+    wd.anchor_bottom = ab
+    if kind == KIND_TEXTAREA { wd.lines = split_lines(text) }
+    u.widgets.push(wd)
+    // next_id must clear every id in the document, or the next widget the user
+    // places collides with a loaded one and two controls share an id - after
+    // which every id-keyed operation silently hits the wrong one.
+    if id >= u.next_id { u.next_id = id + 1 }
+    return u
 }
 
 // ---- queries -------------------------------------------------------------
@@ -219,6 +456,35 @@ pub fn Ui_set_enabled(ui: Ui, id: int, on: int) -> Ui {
 
 pub fn Ui_running(ui: Ui) -> int {
     return ui.running
+}
+
+// Stop this form's loop, from code rather than from an ESC keypress.
+//
+// A "Quit" button's handler cannot do this itself - a Wyn closure cannot capture
+// a mutable reference to the Ui - so the frame loop's owner does it after seeing
+// the handler set a flag. Hence a function rather than a public field.
+pub fn Ui_stop(ui: Ui) -> Ui {
+    var u = ui
+    u.running = 0
+    return u
+}
+
+// Re-point a form at a window and font.
+//
+// A form loaded from JSON has win = -1 and font = -1: a DOCUMENT has no window,
+// which is what makes the model testable with no display at all. Something has
+// to attach it to real handles before it can draw, and that something must not
+// be the loader (which would need a window to load a file) or the caller (which
+// would forget). `views.App_add` calls this, so adding a loaded form to a running
+// app is one line and cannot be half-done.
+//
+// Also the multi-view requirement: several forms share ONE window, so their
+// handles have to be assignable after construction rather than fixed at Ui_new.
+pub fn Ui_bind(ui: Ui, win: int, font: int) -> Ui {
+    var u = ui
+    u.win = win
+    u.font = font
+    return u
 }
 
 // ---- accessors for code OUTSIDE this module -------------------------------
@@ -312,7 +578,469 @@ pub fn Ui_kind_name(kind: int) -> string {
     if kind == KIND_CHECKBOX { return "checkbox" }
     if kind == KIND_ENTRY { return "entry" }
     if kind == KIND_PANEL { return "panel" }
+    if kind == KIND_TEXTAREA { return "textarea" }
     return "unknown"
+}
+
+// Kind for a name. The inverse of Ui_kind_name, and the JSON loader's only way
+// to turn a document back into widgets - the file stores "button", not 1, so a
+// hand-edited or AI-generated form is readable and a renumbering of the KIND_*
+// constants cannot silently reinterpret every saved file.
+pub fn Ui_kind_from_name(name: string) -> int {
+    if name == "label" { return KIND_LABEL }
+    if name == "button" { return KIND_BUTTON }
+    if name == "checkbox" { return KIND_CHECKBOX }
+    if name == "entry" { return KIND_ENTRY }
+    if name == "panel" { return KIND_PANEL }
+    if name == "textarea" { return KIND_TEXTAREA }
+    return -1
+}
+
+pub fn Ui_handler_name_at(ui: Ui, i: int) -> string {
+    if in_range(ui, i) == 0 { return "" }
+    return ui.widgets[i].handler_name
+}
+
+// ---- anchors -------------------------------------------------------------
+
+pub fn Ui_anchor_left_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].anchor_left
+}
+
+pub fn Ui_anchor_right_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].anchor_right
+}
+
+pub fn Ui_anchor_top_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].anchor_top
+}
+
+pub fn Ui_anchor_bottom_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].anchor_bottom
+}
+
+pub fn Ui_set_anchor(ui: Ui, id: int, l: int, r: int, t: int, b: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].anchor_left = l
+    u.widgets[i].anchor_right = r
+    u.widgets[i].anchor_top = t
+    u.widgets[i].anchor_bottom = b
+    return u
+}
+
+pub fn Ui_set_handler_name(ui: Ui, id: int, s: string) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].handler_name = s
+    return u
+}
+
+// Re-lay-out every widget for a container that went from old_w x old_h to
+// new_w x new_h.
+//
+// The four anchor flags give the four classic behaviours, and the reason to
+// implement this rather than only STORE the flags is that a stored flag nobody
+// honours is indistinguishable from a bug:
+//
+//   left only  (default) : x, w unchanged        - classic absolute placement
+//   right only           : slides right by dw    - a button pinned to the corner
+//   left + right         : w stretches by dw     - a field that fills the form
+//   neither              : x scales proportionally - centred content
+//
+// Applied to a COPY of every widget's geometry, computed from the OLD size, so
+// two consecutive resizes give the same result as one resize to the final size
+// (no accumulated rounding drift from re-reading already-moved coordinates).
+pub fn Ui_relayout(ui: Ui, old_w: int, old_h: int, new_w: int, new_h: int) -> Ui {
+    var u = ui
+    if old_w <= 0 { return u }
+    if old_h <= 0 { return u }
+    var dw = new_w - old_w
+    var dh = new_h - old_h
+    var i = 0
+    while i < u.widgets.len() {
+        var al = u.widgets[i].anchor_left
+        var ar = u.widgets[i].anchor_right
+        var at = u.widgets[i].anchor_top
+        var ab = u.widgets[i].anchor_bottom
+        var x = u.widgets[i].x
+        var y = u.widgets[i].y
+        var w = u.widgets[i].w
+        var h = u.widgets[i].h
+
+        if al == 1 {
+            if ar == 1 { w = w + dw }
+        } else {
+            if ar == 1 { x = x + dw }
+            else { x = (x * new_w) / old_w }
+        }
+        if at == 1 {
+            if ab == 1 { h = h + dh }
+        } else {
+            if ab == 1 { y = y + dh }
+            else { y = (y * new_h) / old_h }
+        }
+        // A stretched control must never invert. Clamping here rather than in
+        // the caller keeps a shrunk window from producing negative widths that
+        // the hit test would read as "always miss".
+        if w < 0 { w = 0 }
+        if h < 0 { h = 0 }
+        u.widgets[i].x = x
+        u.widgets[i].y = y
+        u.widgets[i].w = w
+        u.widgets[i].h = h
+        i = i + 1
+    }
+    // The coordinates are now authored AT the new size, so design_w/design_h -
+    // which mean exactly that - have to follow. Leaving them stale is a real bug
+    // rather than an omission: it makes the natural call
+    //
+    //     ui = Ui_relayout(ui, Ui_design_w(ui), Ui_design_h(ui), w, h)
+    //
+    // wrong on the SECOND resize (it would re-apply the delta from the original
+    // size to already-moved coordinates), and it makes a form saved after a
+    // resize record new coordinates against an old size - which reloads
+    // misplaced. Callers that pass old_w/old_h explicitly, as the round-trip
+    // test does, are unaffected.
+    u.design_w = new_w
+    u.design_h = new_h
+    return u
+}
+
+// ---- textarea: the editor model -------------------------------------------
+//
+// Every operation is a pure function of the buffer plus the caret, exposed as a
+// call because the buffer is a [string] inside a struct inside an array - which
+// code outside this module cannot index (see the accessor note above). That is
+// also why the caret lives IN the widget rather than in the caller: a caller
+// that kept its own caret would have to re-derive it after every insert, and the
+// two would drift the first time an edit changed the line count.
+
+pub fn Ui_textarea_line_count(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].lines.len()
+}
+
+pub fn Ui_textarea_line(ui: Ui, id: int, n: int) -> string {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return "" }
+    if n < 0 { return "" }
+    return line_copy(ui, i, n)
+}
+
+// The whole buffer, newline-joined. What a save or a "compile this handler" step
+// wants; NOT what the editor works on, which is the line array.
+pub fn Ui_textarea_text(ui: Ui, id: int) -> string {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return "" }
+    return join_lines_at(ui, i)
+}
+
+pub fn Ui_caret_line(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].caret_line
+}
+
+pub fn Ui_caret_col(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].caret_col
+}
+
+pub fn Ui_scroll_line(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].scroll_line
+}
+
+// Replace the whole buffer and put the caret at the start.
+pub fn Ui_set_textarea_text(ui: Ui, id: int, s: string) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].lines = split_lines(s)
+    u.widgets[i].text = s
+    u.widgets[i].caret_line = 0
+    u.widgets[i].caret_col = 0
+    u.widgets[i].scroll_line = 0
+    return u
+}
+
+// How many lines fit in the box. Needed by scrolling AND by the caret-follow
+// logic, so it is computed in one place from the same numbers the drawing uses.
+fn visible_rows(ui: Ui, i: int) -> int {
+    var lh = gui.Win_font_height(ui.font)
+    if lh <= 0 { lh = 16 }
+    var rows = (ui.widgets[i].h - 8) / lh
+    if rows < 1 { rows = 1 }
+    return rows
+}
+
+// Clamp the caret into the buffer and scroll so it is visible.
+//
+// Called after EVERY edit and EVERY movement, which is why it is one function:
+// a caret that is out of range by one is the single most common editor bug, and
+// it can only be prevented by having exactly one place that decides validity.
+// NB: the local is `cu`, not `x`. A local named `x` bound to a Ui ANYWHERE in
+// this module retypes the identifier `x` for every file that imports it:
+// `x.to_string()` on an int parameter called x, in a different file, emits
+// `Ui_to_string(x)` and fails in the C compiler. That is a compiler bug (a
+// local's inferred type is registered per-NAME rather than per-scope) and it is
+// reported with a 10-line repro; the reason it is called out here rather than
+// just fixed is that the next `var x = ui` added to this module silently breaks
+// every downstream file, and the error names neither this line nor this file.
+// It cost a working examples/designer.wyn to find.
+fn fix_caret(u: Ui, i: int) -> Ui {
+    var cu = u
+    var n = cu.widgets[i].lines.len()
+    if n == 0 {
+        cu.widgets[i].lines.push("")
+        n = 1
+    }
+    var cl = cu.widgets[i].caret_line
+    if cl < 0 { cl = 0 }
+    if cl >= n { cl = n - 1 }
+    var line = line_copy(cu, i, cl)
+    var cc = cu.widgets[i].caret_col
+    if cc < 0 { cc = 0 }
+    if cc > line.len() { cc = line.len() }
+    cu.widgets[i].caret_line = cl
+    cu.widgets[i].caret_col = cc
+
+    // Scroll to follow. Both directions, because a caret moved UP off the top
+    // is just as invisible as one moved down off the bottom.
+    var rows = visible_rows(cu, i)
+    var sl = cu.widgets[i].scroll_line
+    if cl < sl { sl = cl }
+    if cl >= sl + rows { sl = cl - rows + 1 }
+    if sl < 0 { sl = 0 }
+    cu.widgets[i].scroll_line = sl
+    // Keep `text` in step so the serialiser and Ui_text() never disagree with
+    // the line buffer.
+    cu.widgets[i].text = join_lines_at(cu, i)
+    return cu
+}
+
+// Insert printable text at the caret. Newlines in `s` split the line, so
+// pasting a block works through the same path as typing one character.
+pub fn Ui_textarea_insert(ui: Ui, id: int, s: string) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var chunks = s.split("\n")
+    var k = 0
+    while k < chunks.len() {
+        if k > 0 {
+            u = Ui_textarea_newline(u, id)
+            i = Ui_index_of(u, id)
+        }
+        var piece = chunks[k]
+        if piece.len() > 0 {
+            var cl = u.widgets[i].caret_line
+            var cc = u.widgets[i].caret_col
+            var line = line_copy(u, i, cl)
+            u.widgets[i].lines[cl] = line.substring(0, cc) + piece
+                + line.substring(cc, line.len())
+            u.widgets[i].caret_col = cc + piece.len()
+        }
+        k = k + 1
+    }
+    return fix_caret(u, i)
+}
+
+// Split the current line at the caret. The tail moves to a NEW line below and
+// the caret goes to its start - the behaviour every editor has, and the reason
+// insert_line_at exists (the builtin [string].insert drops the value).
+pub fn Ui_textarea_newline(ui: Ui, id: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var cl = u.widgets[i].caret_line
+    var cc = u.widgets[i].caret_col
+    var line = line_copy(u, i, cl)
+    var tail = line.substring(cc, line.len())
+    // FOURTH COMPILER BUG, and the mirror of the one line_copy works around.
+    // Storing a LOCAL string variable into an array element does not retain it,
+    // and the scope-exit release then frees the string the array now holds:
+    //
+    //     var head = line.substring(0, cc)
+    //     u.widgets[i].lines[cl] = head      // stored, NOT retained
+    //     ...                                // wyn_rc_release(head) at return
+    //
+    // so the line reads back empty. Assigning the EXPRESSION rather than a local
+    // gets a fresh allocation that nothing else releases. Minimised and reported.
+    // (`tail` is safe: insert_line_at pushes it, and array push does retain.)
+    u.widgets[i].lines[cl] = line.substring(0, cc)
+    u = insert_line_at(u, i, cl + 1, tail)
+    u.widgets[i].caret_line = cl + 1
+    u.widgets[i].caret_col = 0
+    return fix_caret(u, i)
+}
+
+// Delete the character before the caret. At column 0 this JOINS this line onto
+// the previous one and leaves the caret at the join point - not a no-op, which
+// is what a naive implementation does and what makes a multi-line editor feel
+// broken (you can create a line you cannot remove).
+pub fn Ui_textarea_backspace(ui: Ui, id: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var cl = u.widgets[i].caret_line
+    var cc = u.widgets[i].caret_col
+    if cc > 0 {
+        var line = line_copy(u, i, cl)
+        u.widgets[i].lines[cl] = line.substring(0, cc - 1)
+            + line.substring(cc, line.len())
+        u.widgets[i].caret_col = cc - 1
+        return fix_caret(u, i)
+    }
+    if cl == 0 { return u }
+    var prev = line_copy(u, i, cl - 1)
+    var cur = line_copy(u, i, cl)
+    u.widgets[i].lines[cl - 1] = prev + cur
+    u.widgets[i].lines.remove_at(cl)
+    u.widgets[i].caret_line = cl - 1
+    u.widgets[i].caret_col = prev.len()
+    return fix_caret(u, i)
+}
+
+// Delete the character AT the caret; at end-of-line, pull the next line up.
+pub fn Ui_textarea_delete(ui: Ui, id: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var cl = u.widgets[i].caret_line
+    var cc = u.widgets[i].caret_col
+    var line = line_copy(u, i, cl)
+    if cc < line.len() {
+        u.widgets[i].lines[cl] = line.substring(0, cc)
+            + line.substring(cc + 1, line.len())
+        return fix_caret(u, i)
+    }
+    if cl + 1 >= u.widgets[i].lines.len() { return u }
+    var nxt = line_copy(u, i, cl + 1)
+    u.widgets[i].lines[cl] = line + nxt
+    u.widgets[i].lines.remove_at(cl + 1)
+    return fix_caret(u, i)
+}
+
+// Move the caret by (dline, dcol).
+//
+// Horizontal movement WRAPS across lines: left at column 0 goes to the end of
+// the previous line, right at end-of-line goes to the start of the next. That
+// wrap is what makes arrow keys usable for editing rather than only for
+// pointing; clamping instead traps the caret at a line boundary.
+pub fn Ui_caret_move(ui: Ui, id: int, dline: int, dcol: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var cl = u.widgets[i].caret_line
+    var cc = u.widgets[i].caret_col
+    var n = u.widgets[i].lines.len()
+
+    if dcol < 0 {
+        if cc == 0 {
+            if cl > 0 {
+                cl = cl - 1
+                cc = line_copy(u, i, cl).len()
+            }
+        } else {
+            cc = cc - 1
+        }
+    }
+    if dcol > 0 {
+        if cc >= line_copy(u, i, cl).len() {
+            if cl + 1 < n {
+                cl = cl + 1
+                cc = 0
+            }
+        } else {
+            cc = cc + 1
+        }
+    }
+    if dline != 0 { cl = cl + dline }
+    u.widgets[i].caret_line = cl
+    u.widgets[i].caret_col = cc
+    return fix_caret(u, i)
+}
+
+pub fn Ui_caret_home(ui: Ui, id: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].caret_col = 0
+    return fix_caret(u, i)
+}
+
+pub fn Ui_caret_end(ui: Ui, id: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var cl = u.widgets[i].caret_line
+    u.widgets[i].caret_col = line_copy(u, i, cl).len()
+    return fix_caret(u, i)
+}
+
+// Scroll without moving the caret - what a mouse wheel does.
+pub fn Ui_textarea_scroll(ui: Ui, id: int, dlines: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var sl = u.widgets[i].scroll_line + dlines
+    var maxs = u.widgets[i].lines.len() - 1
+    if sl > maxs { sl = maxs }
+    if sl < 0 { sl = 0 }
+    u.widgets[i].scroll_line = sl
+    return u
+}
+
+// Rows currently visible in this textarea. Public so a test can assert the
+// scroll behaviour without hardcoding the font metrics it depends on.
+pub fn Ui_textarea_rows(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return visible_rows(ui, i)
+}
+
+// Put the caret where a click landed. (mx, my) are in the SAME space as the
+// widget's x/y, so a designer that draws at an offset subtracts it first.
+pub fn Ui_textarea_click(ui: Ui, id: int, mx: int, my: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var lh = gui.Win_font_height(u.font)
+    if lh <= 0 { lh = 16 }
+    var row = (my - u.widgets[i].y - 4) / lh
+    if row < 0 { row = 0 }
+    var cl = u.widgets[i].scroll_line + row
+    var n = u.widgets[i].lines.len()
+    if cl >= n { cl = n - 1 }
+    if cl < 0 { cl = 0 }
+
+    // Walk prefixes and take the nearest boundary, using the same
+    // Win_text_width the renderer uses. Dividing by an average character width
+    // instead puts the caret in the wrong place in any proportional font, which
+    // is every font here.
+    var line = line_copy(u, i, cl)
+    var target = mx - u.widgets[i].x - 5
+    var best = 0
+    var k = 0
+    while k <= line.len() {
+        var wpx = gui.Win_text_width(u.font, line.substring(0, k))
+        if wpx <= target { best = k }
+        k = k + 1
+    }
+    u.widgets[i].caret_line = cl
+    u.widgets[i].caret_col = best
+    return fix_caret(u, i)
 }
 
 // ---- by id ----
@@ -507,11 +1235,23 @@ pub fn Ui_events(ui: Ui) -> Ui {
                             u.focus = w.id
                             gui.Win_text_input(u.win, 1)
                         }
+                        if w.kind == KIND_TEXTAREA {
+                            u.focus = w.id
+                            gui.Win_text_input(u.win, 1)
+                        }
                     }
                 }
                 i = i + 1
             }
             if u.focus == -1 { gui.Win_text_input(u.win, 0) }
+            // Caret placement AFTER focus is settled, and outside the scan loop:
+            // Ui_textarea_click rebuilds `u`, so calling it while iterating over
+            // u.widgets would edit a list the loop is still walking.
+            if u.focus != -1 {
+                if Ui_kind_of(u, u.focus) == KIND_TEXTAREA {
+                    u = Ui_textarea_click(u, u.focus, u.mouse_x, u.mouse_y)
+                }
+            }
         }
         if ev == gui.EV_MOUSE_UP {
             u.mouse_x = gui.Win_event_x()
@@ -533,34 +1273,75 @@ pub fn Ui_events(ui: Ui) -> Ui {
             }
             u.active = -1
         }
+        if ev == gui.EV_WHEEL {
+            // The wheel scrolls the textarea under the pointer, focused or not -
+            // that is what every editor does, and requiring focus first makes a
+            // long document feel stuck.
+            var wid = Ui_hit_test(u, u.mouse_x, u.mouse_y)
+            if wid != -1 {
+                if Ui_kind_of(u, wid) == KIND_TEXTAREA {
+                    // Positive wheel-y is "away from the user" = scroll up.
+                    var dy = gui.Win_event_y()
+                    if dy > 0 { u = Ui_textarea_scroll(u, wid, 0 - 3) }
+                    if dy < 0 { u = Ui_textarea_scroll(u, wid, 3) }
+                }
+            }
+        }
         if ev == gui.EV_TEXT {
             if u.focus != -1 {
                 // NB: the file-local extern, not gui.Win_event_text() - see the
                 // COMPILER WORKAROUND note at the top of this file.
                 var typed = Win_event_text()
-                var k = 0
-                while k < u.widgets.len() {
-                    if u.widgets[k].id == u.focus {
-                        u.widgets[k].text = u.widgets[k].text + typed
+                if Ui_kind_of(u, u.focus) == KIND_TEXTAREA {
+                    u = Ui_textarea_insert(u, u.focus, typed)
+                } else {
+                    var k = 0
+                    while k < u.widgets.len() {
+                        if u.widgets[k].id == u.focus {
+                            u.widgets[k].text = u.widgets[k].text + typed
+                        }
+                        k = k + 1
                     }
-                    k = k + 1
                 }
             }
         }
         if ev == gui.EV_KEY_DOWN {
             var key = gui.Win_event_key()
-            if key == gui.SCANCODE_ESCAPE { u.running = 0 }
-            if key == gui.SCANCODE_BACKSPACE {
-                if u.focus != -1 {
-                    var m = 0
-                    while m < u.widgets.len() {
-                        if u.widgets[m].id == u.focus {
-                            var t = u.widgets[m].text
-                            if t.len() > 0 {
-                                u.widgets[m].text = t.substring(0, t.len() - 1)
+            // A focused textarea OWNS the keyboard, including Escape: in a code
+            // pane Escape means "leave the pane", and closing the whole program
+            // because the user finished typing is not recoverable.
+            var editing = 0
+            if u.focus != -1 {
+                if Ui_kind_of(u, u.focus) == KIND_TEXTAREA { editing = 1 }
+            }
+            if editing == 1 {
+                var fid = u.focus
+                if key == gui.SCANCODE_ESCAPE {
+                    u.focus = -1
+                    gui.Win_text_input(u.win, 0)
+                }
+                if key == gui.SCANCODE_LEFT { u = Ui_caret_move(u, fid, 0, 0 - 1) }
+                if key == gui.SCANCODE_RIGHT { u = Ui_caret_move(u, fid, 0, 1) }
+                if key == gui.SCANCODE_UP { u = Ui_caret_move(u, fid, 0 - 1, 0) }
+                if key == gui.SCANCODE_DOWN { u = Ui_caret_move(u, fid, 1, 0) }
+                if key == gui.SCANCODE_RETURN { u = Ui_textarea_newline(u, fid) }
+                if key == gui.SCANCODE_BACKSPACE { u = Ui_textarea_backspace(u, fid) }
+                if key == gui.SCANCODE_DELETE { u = Ui_textarea_delete(u, fid) }
+                if key == gui.SCANCODE_TAB { u = Ui_textarea_insert(u, fid, "    ") }
+            } else {
+                if key == gui.SCANCODE_ESCAPE { u.running = 0 }
+                if key == gui.SCANCODE_BACKSPACE {
+                    if u.focus != -1 {
+                        var m = 0
+                        while m < u.widgets.len() {
+                            if u.widgets[m].id == u.focus {
+                                var t = u.widgets[m].text
+                                if t.len() > 0 {
+                                    u.widgets[m].text = t.substring(0, t.len() - 1)
+                                }
                             }
+                            m = m + 1
                         }
-                        m = m + 1
                     }
                 }
             }
@@ -710,6 +1491,74 @@ fn draw_widget(ui: Ui, w: Widget) {
         gui.Win_clip_pop(win)
         return
     }
+
+    if w.kind == KIND_TEXTAREA {
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 16, 16, 20)
+        var ar = 120
+        var ag = 120
+        var ab = 140
+        if w.id == ui.focus {
+            ar = ui.accent_r
+            ag = ui.accent_g
+            ab = ui.accent_b
+        }
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, ar, ag, ab)
+
+        gui.Win_clip_push(win, w.x + 1, w.y + 1, w.w - 2, w.h - 2)
+        var lh = gui.Win_font_height(font)
+        if lh <= 0 { lh = 16 }
+        // Only the visible window of lines. Drawing all of them and relying on
+        // the clip is correct but costs a Win_text call per line of a file that
+        // may be thousands long, every frame.
+        var rows = (w.h - 8) / lh
+        if rows < 1 { rows = 1 }
+        var n = w.lines.len()
+        var r = 0
+        while r < rows {
+            var ln = w.scroll_line + r
+            if ln < n {
+                var ly = w.y + 4 + r * lh
+                // Highlight the caret's line, so you can see where you are in a
+                // wall of code even when the caret itself is off to the right.
+                if ln == w.caret_line {
+                    if w.id == ui.focus {
+                        gui.Win_rect(win, w.x + 1, ly - 1, w.w - 2, lh, 26, 26, 34)
+                    }
+                }
+                gui.Win_text(win, font, w.lines[ln], w.x + 5, ly,
+                             ui.fg_r, ui.fg_g, ui.fg_b)
+            }
+            r = r + 1
+        }
+        if w.id == ui.focus {
+            var crow = w.caret_line - w.scroll_line
+            if crow >= 0 {
+                if crow < rows {
+                    var upto = w.lines[w.caret_line].substring(0, w.caret_col)
+                    var cx = w.x + 5 + gui.Win_text_width(font, upto)
+                    gui.Win_rect(win, cx, w.y + 4 + crow * lh, 2, lh - 2,
+                                 ui.fg_r, ui.fg_g, ui.fg_b)
+                }
+            }
+        }
+        gui.Win_clip_pop(win)
+
+        // A scrollbar thumb, only when the content overflows. Not decoration: in
+        // a box that shows 10 of 400 lines there is otherwise no indication that
+        // there is anything above or below the visible text.
+        if n > rows {
+            var track_h = w.h - 4
+            var thumb_h = (track_h * rows) / n
+            if thumb_h < 8 { thumb_h = 8 }
+            var span = n - rows
+            var ty = w.y + 2
+            if span > 0 {
+                ty = w.y + 2 + ((track_h - thumb_h) * w.scroll_line) / span
+            }
+            gui.Win_rect(win, w.x + w.w - 6, ty, 4, thumb_h, 90, 90, 110)
+        }
+        return
+    }
 }
 
 // Draw every widget, in declaration order, so a panel declared first sits
@@ -767,3 +1616,4 @@ pub fn Ui_frame(ui: Ui) -> Ui {
     gui.Win_delay(16)
     return u
 }
+

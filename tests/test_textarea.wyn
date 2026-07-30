@@ -1,0 +1,341 @@
+// test_textarea - the multi-line editor, driven through REAL platform events.
+//
+//   SDL_VIDEODRIVER=dummy WYN_ROOT=/path/to/wyn  wyn run tests/test_textarea.wyn
+//
+// Two halves, deliberately:
+//
+//  1. THE MODEL, with no window. Every editing operation called directly, so a
+//     failure names the operation.
+//  2. THE SAME OPERATIONS through Win_push_key_down / Win_push_text and
+//     Ui_events. This is the part that matters: a test that only calls
+//     Ui_textarea_insert proves insert works and says nothing about whether
+//     typing a character reaches it. Under SDL_VIDEODRIVER=dummy the window is
+//     real to SDL and invisible, so the dispatch under test is the shipping one.
+//
+// The scrolling assertions need real font metrics (visible_rows is computed from
+// Win_font_height), which is why part 2 needs a window and part 1 does not.
+
+import gui
+import widgets
+
+var fails = 0
+
+fn check(label: string, got: string, want: string) {
+    if got == want {
+        print("  ok   ${label} = [${got}]")
+    } else {
+        print("  FAIL ${label}: got [${got}] want [${want}]")
+        fails = fails + 1
+    }
+}
+
+fn check_int(label: string, got: int, want: int) {
+    check(label, got.to_string(), want.to_string())
+}
+
+// Caret position as "line:col" - one assertion instead of two, and a caret is
+// only ever right or wrong as a pair.
+fn caret(ui: Ui, id: int) -> string {
+    return widgets.Ui_caret_line(ui, id).to_string() + ":"
+        + widgets.Ui_caret_col(ui, id).to_string()
+}
+
+// The buffer with visible line breaks, so a failure shows WHERE the split went
+// wrong instead of printing a multi-line blob into the middle of the report.
+fn dump(ui: Ui, id: int) -> string {
+    var out = ""
+    var i = 0
+    while i < widgets.Ui_textarea_line_count(ui, id) {
+        if i > 0 { out = out + "|" }
+        out = out + widgets.Ui_textarea_line(ui, id, i)
+        i = i + 1
+    }
+    return out
+}
+
+fn model_tests() {
+    print("=== textarea model (no window) ===")
+    var ui = widgets.Ui_new(-1, -1)
+    ui = widgets.Ui_textarea(ui, "", 0, 0, 400, 200)
+    var id = widgets.Ui_last_id(ui)
+
+    // The invariant everything else rests on: an empty buffer is ONE empty line,
+    // never zero. With zero lines there is nowhere to put the caret and every
+    // operation below needs a special case.
+    check_int("empty buffer is 1 line, not 0",
+              widgets.Ui_textarea_line_count(ui, id), 1)
+    check("caret at origin", caret(ui, id), "0:0")
+
+    print("-- typing --")
+    ui = widgets.Ui_textarea_insert(ui, id, "hello")
+    check("typed 'hello'", dump(ui, id), "hello")
+    check("caret after typing", caret(ui, id), "0:5")
+
+    print("-- Enter splits the line, tail moves down --")
+    ui = widgets.Ui_caret_move(ui, id, 0, 0 - 2)
+    ui = widgets.Ui_caret_move(ui, id, 0, 0 - 2)
+    check("caret moved left twice", caret(ui, id), "0:3")
+    ui = widgets.Ui_textarea_newline(ui, id)
+    check("split at col 3", dump(ui, id), "hel|lo")
+    check("caret at start of the new line", caret(ui, id), "1:0")
+
+    print("-- multi-line insert (a paste) goes through the same path --")
+    var u2 = widgets.Ui_new(-1, -1)
+    u2 = widgets.Ui_textarea(u2, "", 0, 0, 400, 200)
+    var i2 = widgets.Ui_last_id(u2)
+    u2 = widgets.Ui_textarea_insert(u2, i2, "fn f() {\n    x = 1\n}")
+    check("pasted 3 lines", dump(u2, i2), "fn f() {|    x = 1|}")
+    check_int("line count", widgets.Ui_textarea_line_count(u2, i2), 3)
+    check("caret at the end of the paste", caret(u2, i2), "2:1")
+    check("flattened text round-trips the newlines",
+          widgets.Ui_textarea_text(u2, i2), "fn f() {\n    x = 1\n}")
+
+    print("-- backspace mid-line --")
+    u2 = widgets.Ui_textarea_backspace(u2, i2)
+    check("removed '}'", dump(u2, i2), "fn f() {|    x = 1|")
+    check("caret", caret(u2, i2), "2:0")
+
+    print("-- backspace at column 0 JOINS onto the previous line --")
+    // The operation a naive editor makes a no-op, which leaves you able to
+    // create a line you cannot remove.
+    u2 = widgets.Ui_textarea_backspace(u2, i2)
+    check("lines joined", dump(u2, i2), "fn f() {|    x = 1")
+    check_int("line count fell to 2", widgets.Ui_textarea_line_count(u2, i2), 2)
+    // "    x = 1" is 9 characters, so the join point is column 9: the caret goes
+    // to the END of what was the previous line, not to the start of the joined
+    // text. That is where the next keystroke has to land.
+    check("caret sits at the join point", caret(u2, i2), "1:9")
+
+    print("-- backspace at 0:0 is a no-op, not a crash --")
+    var u3 = widgets.Ui_new(-1, -1)
+    u3 = widgets.Ui_textarea(u3, "abc", 0, 0, 400, 200)
+    var i3 = widgets.Ui_last_id(u3)
+    u3 = widgets.Ui_caret_home(u3, i3)
+    u3 = widgets.Ui_textarea_backspace(u3, i3)
+    check("unchanged", dump(u3, i3), "abc")
+    check("caret still at origin", caret(u3, i3), "0:0")
+
+    print("-- Delete at the caret; at end-of-line it pulls the next line up --")
+    var u4 = widgets.Ui_new(-1, -1)
+    u4 = widgets.Ui_textarea(u4, "ab\ncd", 0, 0, 400, 200)
+    var i4 = widgets.Ui_last_id(u4)
+    u4 = widgets.Ui_caret_home(u4, i4)
+    u4 = widgets.Ui_textarea_delete(u4, i4)
+    check("deleted 'a'", dump(u4, i4), "b|cd")
+    u4 = widgets.Ui_caret_end(u4, i4)
+    check("caret at end of line 0", caret(u4, i4), "0:1")
+    u4 = widgets.Ui_textarea_delete(u4, i4)
+    check("line 1 pulled up", dump(u4, i4), "bcd")
+    check_int("one line now", widgets.Ui_textarea_line_count(u4, i4), 1)
+    // At the very end of the buffer there is nothing to pull up.
+    u4 = widgets.Ui_caret_end(u4, i4)
+    u4 = widgets.Ui_textarea_delete(u4, i4)
+    check("delete at end of buffer is a no-op", dump(u4, i4), "bcd")
+
+    print("-- arrows: vertical movement CLAMPS the column to the shorter line --")
+    var u5 = widgets.Ui_new(-1, -1)
+    u5 = widgets.Ui_textarea(u5, "longer line\nab\nanother long one", 0, 0, 400, 200)
+    var i5 = widgets.Ui_last_id(u5)
+    u5 = widgets.Ui_caret_end(u5, i5)
+    check("caret at end of line 0", caret(u5, i5), "0:11")
+    u5 = widgets.Ui_caret_move(u5, i5, 1, 0)
+    // Column 11 does not exist on "ab". Clamping to the line end is what every
+    // editor does; not clamping indexes past the string.
+    check("down onto a shorter line clamps the column", caret(u5, i5), "1:2")
+    u5 = widgets.Ui_caret_move(u5, i5, 1, 0)
+    check("down again", caret(u5, i5), "2:2")
+    u5 = widgets.Ui_caret_move(u5, i5, 1, 0)
+    check("down past the last line stays on it", caret(u5, i5), "2:2")
+    u5 = widgets.Ui_caret_move(u5, i5, 0 - 9, 0)
+    check("up past the first line stays on it", caret(u5, i5), "0:2")
+
+    print("-- arrows: horizontal movement WRAPS across lines --")
+    u5 = widgets.Ui_caret_home(u5, i5)
+    u5 = widgets.Ui_caret_move(u5, i5, 0, 0 - 1)
+    check("left at 0:0 stays put", caret(u5, i5), "0:0")
+    u5 = widgets.Ui_caret_move(u5, i5, 1, 0)
+    u5 = widgets.Ui_caret_move(u5, i5, 0, 0 - 1)
+    // Left at column 0 goes to the END of the previous line. Clamping instead
+    // traps the caret at a line boundary and makes arrows useless for editing.
+    check("left at col 0 wraps to the end of the line above",
+          caret(u5, i5), "0:11")
+    u5 = widgets.Ui_caret_move(u5, i5, 0, 1)
+    check("right at end-of-line wraps to the start of the next",
+          caret(u5, i5), "1:0")
+
+    print("-- set_textarea_text replaces the buffer and resets the caret --")
+    u5 = widgets.Ui_set_textarea_text(u5, i5, "x\ny")
+    check("replaced", dump(u5, i5), "x|y")
+    check("caret reset", caret(u5, i5), "0:0")
+
+    print("-- an out-of-range line read is total, not a trap --")
+    check("line -1", widgets.Ui_textarea_line(u5, i5, 0 - 1), "")
+    check("line 99", widgets.Ui_textarea_line(u5, i5, 99), "")
+    check("unknown id", widgets.Ui_textarea_line(u5, 12345, 0), "")
+    check_int("caret of an unknown id", widgets.Ui_caret_line(u5, 12345), 0)
+    print("")
+}
+
+// The half that proves TYPING reaches the editor, not just that the editor works.
+fn event_tests(win: int, font: int) {
+    print("=== textarea through REAL events (Win_push_* -> Ui_events) ===")
+    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_textarea(ui, "", 20, 20, 400, 160)
+    var id = widgets.Ui_last_id(ui)
+
+    print("-- click focuses it --")
+    gui.Win_push_mouse_down(win, 40, 40, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, 40, 40, gui.MOUSE_LEFT)
+    ui = widgets.Ui_events(ui)
+    check_int("focus is the textarea", widgets.Ui_focus(ui), id)
+
+    print("-- typed text arrives as EV_TEXT and is inserted --")
+    gui.Win_push_text(win, "a")
+    gui.Win_push_text(win, "b")
+    gui.Win_push_text(win, "c")
+    ui = widgets.Ui_events(ui)
+    check("typed abc", dump(ui, id), "abc")
+    check("caret", caret(ui, id), "0:3")
+
+    print("-- Return splits, through the real key event --")
+    gui.Win_push_key_down(win, gui.SCANCODE_RETURN)
+    ui = widgets.Ui_events(ui)
+    gui.Win_push_text(win, "d")
+    ui = widgets.Ui_events(ui)
+    check("two lines", dump(ui, id), "abc|d")
+    check("caret on line 1", caret(ui, id), "1:1")
+
+    print("-- arrow keys move the caret --")
+    gui.Win_push_key_down(win, gui.SCANCODE_UP)
+    ui = widgets.Ui_events(ui)
+    check("up", caret(ui, id), "0:1")
+    gui.Win_push_key_down(win, gui.SCANCODE_RIGHT)
+    ui = widgets.Ui_events(ui)
+    check("right", caret(ui, id), "0:2")
+    gui.Win_push_key_down(win, gui.SCANCODE_LEFT)
+    gui.Win_push_key_down(win, gui.SCANCODE_LEFT)
+    ui = widgets.Ui_events(ui)
+    check("left twice", caret(ui, id), "0:0")
+    gui.Win_push_key_down(win, gui.SCANCODE_DOWN)
+    ui = widgets.Ui_events(ui)
+    check("down", caret(ui, id), "1:0")
+
+    print("-- Backspace at 1:0 joins the lines --")
+    gui.Win_push_key_down(win, gui.SCANCODE_BACKSPACE)
+    ui = widgets.Ui_events(ui)
+    check("joined", dump(ui, id), "abcd")
+
+    print("-- Tab inserts 4 spaces (a code pane needs indentation) --")
+    gui.Win_push_key_down(win, gui.SCANCODE_TAB)
+    ui = widgets.Ui_events(ui)
+    check("indented", dump(ui, id), "abc    d")
+
+    print("-- ESCAPE in a focused textarea BLURS; it must not quit --")
+    // A code pane that closes the program when the user finishes typing is not
+    // recoverable, so a focused editor owns Escape.
+    check_int("running before", widgets.Ui_running(ui), 1)
+    gui.Win_push_key_down(win, gui.SCANCODE_ESCAPE)
+    ui = widgets.Ui_events(ui)
+    check_int("still running", widgets.Ui_running(ui), 1)
+    check_int("focus dropped", widgets.Ui_focus(ui), 0 - 1)
+
+    print("-- ESCAPE with nothing focused still quits --")
+    gui.Win_push_key_down(win, gui.SCANCODE_ESCAPE)
+    ui = widgets.Ui_events(ui)
+    check_int("running now 0", widgets.Ui_running(ui), 0)
+
+    print("-- vertical scrolling follows the caret --")
+    var u2 = widgets.Ui_new(win, font)
+    // A 60px box: only a few lines fit, so a 40-line buffer must scroll.
+    u2 = widgets.Ui_textarea(u2, "", 20, 20, 300, 60)
+    var i2 = widgets.Ui_last_id(u2)
+    var body = "L0"
+    var k = 1
+    while k < 40 {
+        body = body + "\n" + "L" + k.to_string()
+        k = k + 1
+    }
+    u2 = widgets.Ui_set_textarea_text(u2, i2, body)
+    var rows = widgets.Ui_textarea_rows(u2, i2)
+    print("   rows visible in a 60px box = ${rows}")
+    check_int("scrolled to the top initially", widgets.Ui_scroll_line(u2, i2), 0)
+    // Walk the caret to the last line; scroll_line must have followed.
+    var m = 0
+    while m < 39 {
+        u2 = widgets.Ui_caret_move(u2, i2, 1, 0)
+        m = m + 1
+    }
+    check_int("caret reached the last line", widgets.Ui_caret_line(u2, i2), 39)
+    check_int("scroll followed the caret down",
+              widgets.Ui_scroll_line(u2, i2), 40 - rows)
+    // And back up: a caret moved off the TOP is just as invisible as one moved
+    // off the bottom, so the follow has to work in both directions.
+    var n = 0
+    while n < 39 {
+        u2 = widgets.Ui_caret_move(u2, i2, 0 - 1, 0)
+        n = n + 1
+    }
+    check_int("scroll followed the caret back up",
+              widgets.Ui_scroll_line(u2, i2), 0)
+
+    print("-- the wheel scrolls WITHOUT moving the caret --")
+    var before = widgets.Ui_caret_line(u2, i2)
+    u2 = widgets.Ui_textarea_scroll(u2, i2, 10)
+    check_int("scrolled", widgets.Ui_scroll_line(u2, i2), 10)
+    check_int("caret unmoved", widgets.Ui_caret_line(u2, i2), before)
+    u2 = widgets.Ui_textarea_scroll(u2, i2, 9999)
+    check_int("scroll clamps at the last line",
+              widgets.Ui_scroll_line(u2, i2), 39)
+    u2 = widgets.Ui_textarea_scroll(u2, i2, 0 - 9999)
+    check_int("and at the first", widgets.Ui_scroll_line(u2, i2), 0)
+
+    print("-- clicking places the caret on the clicked line --")
+    // Line height comes from the font, so derive the target rather than
+    // hardcoding a pixel: a different default font would silently pick line 0.
+    var lh = gui.Win_font_height(font)
+    u2 = widgets.Ui_textarea_click(u2, i2, 22, 20 + 4 + 2 * lh + 1)
+    check_int("clicked row 2 -> caret line 2", widgets.Ui_caret_line(u2, i2), 2)
+    // A click far to the right lands at the end of the line, not past it.
+    u2 = widgets.Ui_textarea_click(u2, i2, 9999, 20 + 4 + 2 * lh + 1)
+    check_int("click past the line end clamps to its length",
+              widgets.Ui_caret_col(u2, i2),
+              widgets.Ui_textarea_line(u2, i2, 2).len())
+
+    print("-- a full frame leaves the clip stack balanced --")
+    // An unbalanced push leaks the clip into the next frame, after which
+    // everything drawn is invisible for reasons that look nothing like a clip
+    // bug. The textarea pushes twice (box, then scrollbar path), so this is the
+    // assertion that catches a missing pop.
+    check_int("depth before", gui.Win_clip_depth(win), 0)
+    widgets.Ui_draw(u2)
+    check_int("depth after", gui.Win_clip_depth(win), 0)
+    print("")
+}
+
+fn main() {
+    model_tests()
+
+    if gui.Win_available() == 0 {
+        print("no display: skipping the event half (run with SDL_VIDEODRIVER=dummy)")
+    } else {
+        var win = gui.Win_window("textarea test", 600, 400)
+        if win < 0 {
+            print("could not open a window: skipping the event half")
+        } else {
+            var font = gui.Win_font_default(15)
+            if font < 0 {
+                print("no font: skipping the event half")
+            } else {
+                event_tests(win, font)
+                gui.Win_font_free(font)
+            }
+            gui.Win_close(win)
+        }
+    }
+
+    if fails == 0 {
+        print("=== ALL TEXTAREA TESTS PASSED ===")
+    } else {
+        print("=== ${fails} TEXTAREA TEST(S) FAILED ===")
+    }
+}

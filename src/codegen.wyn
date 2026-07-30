@@ -1,0 +1,344 @@
+// codegen - TWO-FILE GENERATION, the WinForms split.
+//
+//   Form1.designer.wyn   regenerated freely, every time. Never hand-edited.
+//   Form1.wyn            handler BODIES. Never rewritten, only appended to.
+//
+// WHY THE SPLIT IS THE WHOLE FEATURE
+//
+// A designer that emits one file has to choose between two failures. Either it
+// rewrites the file and destroys the code the user wrote inside the handlers, or
+// it refuses to rewrite and the layout stops tracking the design. WinForms solved
+// this in 2002 by splitting: machine-owned layout in one file, human-owned logic
+// in the other, and the machine never touches the human's file except to APPEND a
+// stub for a handler that does not exist yet.
+//
+// So the contract here is exact:
+//
+//   * Form1.designer.wyn is overwritten unconditionally. Nothing a human writes
+//     in it survives, and that is intentional - it carries a header saying so.
+//   * Form1.wyn is created if absent. If it exists, a handler stub is appended
+//     ONLY when no `fn <name>` for it is already present. An existing body is
+//     never read, never reformatted, and never replaced.
+//
+// The "is it already there" test is a text search for `fn <name>(`. That is a
+// heuristic, and the direction it fails in is chosen deliberately: it can only
+// ever DECLINE to add a stub (a match inside a comment or a string), which leaves
+// a missing handler and a compile error the user can fix in one line. The other
+// direction - failing to notice an existing handler and appending a second
+// definition - would also be a compile error, but the fix means deleting code,
+// and if the user does not notice, it means their body is now dead. Prefer the
+// failure that cannot lose work.
+//
+// WHY THE DESIGNER FILE WRAPS EVERY HANDLER
+//
+// A module-qualified function cannot be used as a VALUE: `Form1.on_ok` passed to
+// Ui_button fails with "Expected: function, Got: int" (verified, reported). So
+// Form1.designer.wyn defines a local one-line wrapper per handler:
+//
+//     fn h_on_ok(id: int) { Form1.on_ok(id) }
+//
+// and passes the wrapper. This is not a stylistic indirection - it is the only
+// shape that compiles today, and it also happens to be where a future
+// designer-side hook (logging, undo) would go.
+
+import widgets
+
+// ---- identifier hygiene ---------------------------------------------------
+
+// Turn arbitrary label text into a legal identifier fragment.
+//
+// A generator that emits a label verbatim produces `fn on_sign in(id: int)` from
+// the caption "Sign in", and a file that does not compile is the defining
+// failure of this feature. Non-alphanumerics become "_", a leading digit gets an
+// "x" prefix, and an empty result becomes "x" - so the output is ALWAYS a legal
+// identifier, whatever the user typed.
+pub fn ident(s: string) -> string {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        var c = s.char_at(i)
+        var ok = 0
+        if c >= "a" { if c <= "z" { ok = 1 } }
+        if c >= "A" { if c <= "Z" { ok = 1 } }
+        if c >= "0" { if c <= "9" { ok = 1 } }
+        if c == "_" { ok = 1 }
+        if ok == 1 { out = out + c } else { out = out + "_" }
+        i = i + 1
+    }
+    if out.len() == 0 { return "x" }
+    var f = out.char_at(0)
+    if f >= "0" { if f <= "9" { return "x" + out } }
+    return out
+}
+
+// A Wyn string literal for `s`.
+//
+// Backslash FIRST, or escaping the quote would then have its own backslash
+// escaped again and the literal would end early. The classic ordering bug, and
+// it shows up as a syntax error hundreds of lines from its cause.
+pub fn quote(s: string) -> string {
+    var out = "\""
+    var i = 0
+    while i < s.len() {
+        var c = s.char_at(i)
+        if c == "\\" { out = out + "\\\\" }
+        else {
+            if c == "\"" { out = out + "\\\"" }
+            else {
+                if c == "\n" { out = out + "\\n" }
+                else {
+                    if c == "\t" { out = out + "\\t" }
+                    else { out = out + c }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+// Which kinds take a handler. One place, so adding a kind cannot half-wire it.
+pub fn takes_handler(kind: int) -> int {
+    if kind == widgets.KIND_BUTTON { return 1 }
+    if kind == widgets.KIND_CHECKBOX { return 1 }
+    return 0
+}
+
+// The handler name for widget i: the document's own if it has one, otherwise
+// derived from the caption and the id.
+//
+// The id is in the derived name so two buttons both captioned "OK" do not
+// collapse into one duplicated definition. A name the DOCUMENT carries is used
+// verbatim, because it is the user's (or an assistant's) choice and renaming it
+// silently would break the body already written in Form1.wyn.
+pub fn handler_of(ui: Ui, i: int) -> string {
+    var given = widgets.Ui_handler_name_at(ui, i)
+    if given.len() > 0 { return given }
+    return "on_" + ident(widgets.Ui_label_at(ui, i)).lower()
+        + "_" + widgets.Ui_id_at(ui, i).to_string()
+}
+
+// ---- Form1.designer.wyn ---------------------------------------------------
+
+fn ctor_line(ui: Ui, i: int) -> string {
+    var kind = widgets.Ui_kind_at(ui, i)
+    var x = widgets.Ui_x_at(ui, i).to_string()
+    var y = widgets.Ui_y_at(ui, i).to_string()
+    var w = widgets.Ui_w_at(ui, i).to_string()
+    var h = widgets.Ui_h_at(ui, i).to_string()
+    var label = quote(widgets.Ui_label_at(ui, i))
+    var hw = "h_" + handler_of(ui, i)
+
+    if kind == widgets.KIND_LABEL {
+        return "    ui = widgets.Ui_label(ui, " + label + ", " + x + ", " + y + ")\n"
+    }
+    if kind == widgets.KIND_BUTTON {
+        return "    ui = widgets.Ui_button(ui, " + label + ", " + x + ", " + y
+            + ", " + w + ", " + h + ", " + hw + ")\n"
+    }
+    if kind == widgets.KIND_CHECKBOX {
+        return "    ui = widgets.Ui_checkbox(ui, " + label + ", " + x + ", " + y
+            + ", " + widgets.Ui_checked_at(ui, i).to_string()
+            + ", " + hw + ")\n"
+    }
+    if kind == widgets.KIND_ENTRY {
+        return "    ui = widgets.Ui_entry(ui, " + quote(widgets.Ui_text_at(ui, i))
+            + ", " + x + ", " + y + ", " + w + ", " + h + ")\n"
+    }
+    if kind == widgets.KIND_TEXTAREA {
+        return "    ui = widgets.Ui_textarea(ui, " + quote(widgets.Ui_text_at(ui, i))
+            + ", " + x + ", " + y + ", " + w + ", " + h + ")\n"
+    }
+    if kind == widgets.KIND_PANEL {
+        return "    ui = widgets.Ui_panel(ui, " + x + ", " + y
+            + ", " + w + ", " + h + ")\n"
+    }
+    return "    // unsupported kind " + kind.to_string() + "\n"
+}
+
+// Emit the ANCHOR call, but only when the widget is not on the default.
+//
+// Anchors are only interesting when they differ from left+top, and a form of 40
+// controls would otherwise carry 40 identical no-op lines that bury the three
+// that matter.
+fn anchor_line(ui: Ui, i: int) -> string {
+    var l = widgets.Ui_anchor_left_at(ui, i)
+    var r = widgets.Ui_anchor_right_at(ui, i)
+    var t = widgets.Ui_anchor_top_at(ui, i)
+    var b = widgets.Ui_anchor_bottom_at(ui, i)
+    if l == 1 {
+        if r == 0 {
+            if t == 1 {
+                if b == 0 { return "" }
+            }
+        }
+    }
+    return "    ui = widgets.Ui_set_anchor(ui, widgets.Ui_last_id(ui), "
+        + l.to_string() + ", " + r.to_string() + ", "
+        + t.to_string() + ", " + b.to_string() + ")\n"
+}
+
+// Form1.designer.wyn, in full.
+pub fn gen_designer(ui: Ui) -> string {
+    var form = widgets.Ui_name(ui)
+    var n = widgets.Ui_count(ui)
+    var s = ""
+
+    s = s + "// " + form + ".designer.wyn - GENERATED. DO NOT EDIT.\n"
+    s = s + "//\n"
+    s = s + "// Regenerated in full every time the form is saved. Any edit here is\n"
+    s = s + "// lost on the next save; put your code in " + form + ".wyn instead.\n"
+    s = s + "//\n"
+    s = s + "// Source of truth: " + form + ".json\n"
+    s = s + "//   WYN_ROOT=/path/to/wyn  wyn run " + form + ".designer.wyn\n"
+    s = s + "// Build the gui backend first: ./csrc/build.sh\n\n"
+    s = s + "import gui\n"
+    s = s + "import widgets\n"
+    s = s + "import " + form + "\n\n"
+
+    // Wrappers. A module-qualified fn is not usable as a value, so each handler
+    // gets a local one-liner that forwards to the body in Form1.wyn.
+    var wrote_any = 0
+    var i = 0
+    while i < n {
+        if takes_handler(widgets.Ui_kind_at(ui, i)) == 1 {
+            if wrote_any == 0 {
+                s = s + "// ---- handler wrappers ----\n"
+                s = s + "// A module-qualified fn cannot be passed as a value, so each\n"
+                s = s + "// handler is forwarded through a local wrapper.\n"
+                wrote_any = 1
+            }
+            var hn = handler_of(ui, i)
+            s = s + "fn h_" + hn + "(id: int) { " + form + "." + hn + "(id) }\n"
+        }
+        i = i + 1
+    }
+    if wrote_any == 1 { s = s + "\n" }
+
+    s = s + "fn main() {\n"
+    s = s + "    if gui.Win_available() == 0 {\n"
+    s = s + "        print(\"no display available - skipping\")\n"
+    s = s + "        return\n"
+    s = s + "    }\n"
+    s = s + "    var win = gui.Win_window(" + quote(form) + ", "
+        + widgets.Ui_design_w(ui).to_string() + ", "
+        + widgets.Ui_design_h(ui).to_string() + ")\n"
+    s = s + "    if win < 0 {\n"
+    s = s + "        print(\"could not open a window\")\n"
+    s = s + "        return\n"
+    s = s + "    }\n"
+    s = s + "    var font = gui.Win_font_default(15)\n"
+    s = s + "    if font < 0 {\n"
+    s = s + "        print(\"no font found\")\n"
+    s = s + "        gui.Win_close(win)\n"
+    s = s + "        return\n"
+    s = s + "    }\n\n"
+
+    s = s + "    // ---- the form, declared once ----\n"
+    s = s + "    var ui = widgets.Ui_new(win, font)\n"
+    s = s + "    ui = widgets.Ui_set_name(ui, " + quote(form) + ")\n"
+    s = s + "    ui = widgets.Ui_set_design_size(ui, "
+        + widgets.Ui_design_w(ui).to_string() + ", "
+        + widgets.Ui_design_h(ui).to_string() + ")\n"
+    var j = 0
+    while j < n {
+        s = s + ctor_line(ui, j)
+        // enabled is not a constructor argument, so a disabled control needs a
+        // follow-up call or the generated form comes up clickable.
+        if widgets.Ui_enabled_at(ui, j) == 0 {
+            s = s + "    ui = widgets.Ui_set_enabled(ui, widgets.Ui_last_id(ui), 0)\n"
+        }
+        s = s + anchor_line(ui, j)
+        j = j + 1
+    }
+
+    s = s + "\n    // ---- run ----\n"
+    s = s + "    while widgets.Ui_running(ui) == 1 {\n"
+    s = s + "        ui = widgets.Ui_frame(ui)\n"
+    s = s + "    }\n\n"
+    s = s + "    gui.Win_font_free(font)\n"
+    s = s + "    gui.Win_close(win)\n"
+    s = s + "}\n"
+    return s
+}
+
+// ---- Form1.wyn ------------------------------------------------------------
+
+// The initial Form1.wyn, for when it does not exist yet.
+pub fn gen_code_skeleton(ui: Ui) -> string {
+    var form = widgets.Ui_name(ui)
+    var s = ""
+    s = s + "// " + form + ".wyn - YOUR CODE. Never regenerated.\n"
+    s = s + "//\n"
+    s = s + "// The designer appends a stub here for a handler that does not exist yet\n"
+    s = s + "// and NEVER touches a body you have written. Rename a handler in the\n"
+    s = s + "// designer and you will get a new empty stub; the old one stays, because\n"
+    s = s + "// deleting code you wrote is not a thing a tool should do quietly.\n\n"
+    return s
+}
+
+// One handler stub.
+pub fn gen_stub(name: string, label: string) -> string {
+    var s = ""
+    s = s + "// " + label + "\n"
+    s = s + "pub fn " + name + "(id: int) {\n"
+    s = s + "    print(\"" + name + " (widget \" + id.to_string() + \")\")\n"
+    s = s + "}\n\n"
+    return s
+}
+
+// Is `fn <name>(` already in this text?
+//
+// Matched WITH the open paren so `on_ok` cannot match `on_ok_2`, and searched as
+// both "pub fn " and "fn " because a handler must be `pub` to be callable from
+// the designer file but a user may have dropped the `pub` while editing - in
+// which case appending a second definition is the wrong answer; the right answer
+// is to leave it alone and let the compiler say "not public".
+pub fn has_handler(text: string, name: string) -> int {
+    if text.index_of("fn " + name + "(") >= 0 { return 1 }
+    return 0
+}
+
+// ---- writing both files ---------------------------------------------------
+
+// Write Form1.designer.wyn and Form1.wyn into `dir`.
+//
+// Returns the number of handler stubs APPENDED - the one number a caller needs
+// for a status line ("2 new handlers"), and the number a test asserts is 0 on the
+// second run.
+pub fn Form_generate(ui: Ui, dir: string) -> int {
+    var form = widgets.Ui_name(ui)
+    var dpath = dir + "/" + form + ".designer.wyn"
+    var cpath = dir + "/" + form + ".wyn"
+
+    // Unconditional: this file is entirely machine-owned.
+    File::write(dpath, gen_designer(ui))
+
+    // The user's file: read what is there, or start a skeleton.
+    var existing = ""
+    if File::exists(cpath) == 1 {
+        existing = File::read(cpath)
+    } else {
+        existing = gen_code_skeleton(ui)
+    }
+
+    // Append only the missing stubs. `added` tracks the names appended in THIS
+    // pass as well, so a form with two buttons sharing one handler name gets one
+    // definition, not two - which would not compile.
+    var out = existing
+    var added = 0
+    var i = 0
+    while i < widgets.Ui_count(ui) {
+        if takes_handler(widgets.Ui_kind_at(ui, i)) == 1 {
+            var name = handler_of(ui, i)
+            if has_handler(out, name) == 0 {
+                out = out + gen_stub(name, widgets.Ui_label_at(ui, i)
+                    + " (" + widgets.Ui_kind_name(widgets.Ui_kind_at(ui, i)) + ")")
+                added = added + 1
+            }
+        }
+        i = i + 1
+    }
+    File::write(cpath, out)
+    return added
+}

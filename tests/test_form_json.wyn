@@ -1,0 +1,221 @@
+// test_form_json - the form document round trip, field by field.
+//
+//   WYN_ROOT=/path/to/wyn  wyn run tests/test_form_json.wyn
+//
+// Needs no display: a Ui with win = -1 is a legitimate document, so the whole
+// model and its serialiser are testable with no SDL at all.
+//
+// WHAT THIS TEST IS FOR
+//
+// "Save a form, load it back, assert the widget table is IDENTICAL." A designer
+// whose save loses a field is worse than one that cannot save: the loss is
+// invisible until someone reopens the file, and by then the original is gone. So
+// the assertion is field-by-field equality via Form_diff, not a count and a
+// spot check, and the payload deliberately includes the values that break naive
+// serialisers - embedded quotes, backslashes, newlines, a 0 in a field whose
+// "missing" default is 1, and every anchor combination.
+
+import widgets
+import form
+
+var fails = 0
+
+fn check(label: string, got: string, want: string) {
+    if got == want {
+        print("  ok   ${label} = ${got}")
+    } else {
+        print("  FAIL ${label}: got [${got}] want [${want}]")
+        fails = fails + 1
+    }
+}
+
+fn check_int(label: string, got: int, want: int) {
+    check(label, got.to_string(), want.to_string())
+}
+
+// A form with one of everything, and with the values that break serialisers.
+fn build_form() -> Ui {
+    var ui = widgets.Ui_new(-1, -1)
+    ui = widgets.Ui_set_name(ui, "LoginForm")
+    ui = widgets.Ui_set_design_size(ui, 640, 480)
+
+    ui = widgets.Ui_label(ui, "Username", 16, 16)
+    ui = widgets.Ui_entry(ui, "", 16, 40, 200, 26)
+    var user = widgets.Ui_last_id(ui)
+    // right+bottom anchored: this field must FOLLOW a resize, which is the
+    // difference between storing anchors and honouring them.
+    ui = widgets.Ui_set_anchor(ui, user, 1, 1, 1, 0)
+
+    ui = widgets.Ui_label(ui, "Password", 16, 76)
+    ui = widgets.Ui_entry(ui, "", 16, 100, 200, 26)
+
+    ui = widgets.Ui_checkbox(ui, "Remember me", 16, 140, 1, noop)
+    var rem = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, rem, "on_remember_toggled")
+
+    ui = widgets.Ui_button(ui, "Sign in", 16, 176, 96, 28, noop)
+    var ok = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, ok, "on_sign_in")
+    // bottom-right corner button: free left/top, pinned right/bottom.
+    ui = widgets.Ui_set_anchor(ui, ok, 0, 1, 0, 1)
+
+    ui = widgets.Ui_button(ui, "Cancel", 120, 176, 96, 28, noop)
+    var cancel = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, cancel, "on_cancel")
+    // enabled = 0. A 0 in a field whose absent-key default is 1 is the exact
+    // case a has()-less reader gets wrong in the safe-looking direction.
+    ui = widgets.Ui_set_enabled(ui, cancel, 0)
+
+    // The values that break naive escaping: a quote, a backslash, a tab, and
+    // (in the textarea) newlines.
+    ui = widgets.Ui_label(ui, "he said \"hi\" c:\\tmp\tdone", 16, 216)
+
+    ui = widgets.Ui_textarea(ui,
+        "fn on_sign_in(id: int) {\n    print(\"signing in\")\n}", 16, 244, 400, 120)
+    var code = widgets.Ui_last_id(ui)
+    // A textarea that fills the form: all four anchors pinned.
+    ui = widgets.Ui_set_anchor(ui, code, 1, 1, 1, 1)
+
+    ui = widgets.Ui_panel(ui, 440, 244, 160, 120)
+    return ui
+}
+
+fn noop(id: int) { }
+
+fn main() {
+    print("=== form JSON round trip ===")
+
+    var a = build_form()
+    print("built: ${widgets.Ui_count(a)} widgets, form ${widgets.Ui_name(a)}")
+
+    var path = "/tmp/wyn_form_roundtrip.json"
+    var saved = form.Form_save(a, path)
+    check_int("Form_save wrote the file", saved, 1)
+
+    // ---- the JSON is real JSON, and readable ----
+    var text = File::read(path)
+    print("")
+    print("--- Form1.json as written (this is the document an assistant edits) ---")
+    print(text)
+
+    // ---- load it back and compare EVERY field ----
+    var b = form.Form_load(path, -1, -1)
+    print("--- field-by-field comparison ---")
+    var diff = form.Form_diff(a, b)
+    if diff == "" {
+        print("  ok   identical: every field of every widget survived the trip")
+    } else {
+        print("  FAIL differences found:")
+        print(diff)
+        fails = fails + 1
+    }
+
+    // Spot-check the values that would be wrong if the escaping were, so a
+    // failure names the cause rather than only "documents differ".
+    print("")
+    print("--- the values that break naive serialisers ---")
+    check("label with quote/backslash/tab", widgets.Ui_label_at(b, 7),
+          "he said \"hi\" c:\\tmp\tdone")
+    check("textarea text (2 newlines)", widgets.Ui_text_at(b, 8),
+          "fn on_sign_in(id: int) {\n    print(\"signing in\")\n}")
+    check_int("textarea reloaded as 3 lines",
+              widgets.Ui_textarea_line_count(b, widgets.Ui_id_at(b, 8)), 3)
+    check("disabled button stayed disabled",
+          widgets.Ui_enabled_at(b, 6).to_string(), "0")
+    check("handler name preserved", widgets.Ui_handler_name_at(b, 5), "on_sign_in")
+    check_int("ids preserved (not renumbered)", widgets.Ui_id_at(b, 5),
+              widgets.Ui_id_at(a, 5))
+    check_int("next_id clears every loaded id",
+              widgets.Ui_last_id(b) + 1 > widgets.Ui_id_at(b, 9), 1)
+
+    // ---- save the LOADED form: the text must be byte-identical ----
+    //
+    // Stronger than comparing the models: it proves the writer is deterministic
+    // and that nothing was normalised on the way in. A format whose second save
+    // differs from its first produces a spurious diff on every open, which makes
+    // the git-reviewability the format was chosen for worthless.
+    print("")
+    var text2 = form.Form_to_json(b)
+    check_int("re-serialising the loaded form is byte-identical",
+              text == text2, 1)
+    if text != text2 {
+        print("  first:")
+        print(text)
+        print("  second:")
+        print(text2)
+    }
+
+    // ---- an AI-style edit: hand-written JSON loads ----
+    //
+    // The whole point of the format. This string is what "add a login button"
+    // looks like as a file edit, written by something that has never seen this
+    // codebase - no ids on some widgets, keys in a different order, missing
+    // optional keys, and one kind this build does not know.
+    print("")
+    print("--- a hand-written / assistant-written document loads ---")
+    var hand = "{\n"
+        + "  \"form\": \"Quick\",\n"
+        + "  \"widgets\": [\n"
+        + "    {\"kind\": \"label\", \"x\": 10, \"y\": 10, \"label\": \"Name:\"},\n"
+        + "    {\"kind\": \"entry\", \"y\": 30, \"x\": 10, \"w\": 180, \"h\": 24},\n"
+        + "    {\"kind\": \"button\", \"x\": 10, \"y\": 64, \"w\": 80, \"h\": 26,\n"
+        + "     \"label\": \"Go\", \"handler\": \"on_go\",\n"
+        + "     \"anchor\": {\"left\": 0, \"right\": 1, \"top\": 0, \"bottom\": 1}},\n"
+        + "    {\"kind\": \"hologram\", \"x\": 0, \"y\": 0}\n"
+        + "  ]\n"
+        + "}\n"
+    var c = form.Form_from_json(hand, -1, -1)
+    check("form name from a hand-written doc", widgets.Ui_name(c), "Quick")
+    check_int("3 of 4 loaded (unknown kind SKIPPED, not defaulted)",
+              widgets.Ui_count(c), 3)
+    check("width defaulted when the key is absent",
+          widgets.Ui_design_w(c).to_string(), "780")
+    check("enabled defaulted to 1 when absent",
+          widgets.Ui_enabled_at(c, 0).to_string(), "1")
+    check("handler read from the hand-written doc",
+          widgets.Ui_handler_name_at(c, 2), "on_go")
+    check_int("anchors read from the hand-written doc",
+              widgets.Ui_anchor_right_at(c, 2), 1)
+    check_int("ids assigned where the doc omitted them",
+              widgets.Ui_id_at(c, 0), 1)
+
+    // ---- anchors are HONOURED, not merely stored ----
+    print("")
+    print("--- resize-follows-anchor (Ui_relayout 640x480 -> 840x580) ---")
+    var r = form.Form_load(path, -1, -1)
+    var before_ok_x = widgets.Ui_x_at(r, 5)
+    var before_user_w = widgets.Ui_w_at(r, 1)
+    var before_code_h = widgets.Ui_h_at(r, 8)
+    var before_label_x = widgets.Ui_x_at(r, 0)
+    r = widgets.Ui_relayout(r, 640, 480, 840, 580)
+    // left only (the default): absolutely unmoved. This is the assertion that
+    // says anchors did not break the classic behaviour.
+    check_int("label (left+top only) x unchanged",
+              widgets.Ui_x_at(r, 0), before_label_x)
+    // left+right: the width takes the whole +200.
+    check_int("entry (left+right) w stretched by +200",
+              widgets.Ui_w_at(r, 1), before_user_w + 200)
+    // right only: slides, keeps its width.
+    check_int("Sign in (right+bottom) x slid by +200",
+              widgets.Ui_x_at(r, 5), before_ok_x + 200)
+    check_int("Sign in width unchanged by sliding",
+              widgets.Ui_w_at(r, 5), 96)
+    // top+bottom: the height takes the whole +100.
+    check_int("textarea (all four) h stretched by +100",
+              widgets.Ui_h_at(r, 8), before_code_h + 100)
+
+    // Two consecutive resizes must equal one resize to the final size -
+    // otherwise dragging a window edge accumulates drift.
+    var r2 = form.Form_load(path, -1, -1)
+    r2 = widgets.Ui_relayout(r2, 640, 480, 740, 530)
+    r2 = widgets.Ui_relayout(r2, 740, 530, 840, 580)
+    check("two resizes == one resize to the same size",
+          form.Form_diff(r, r2), "")
+
+    print("")
+    if fails == 0 {
+        print("=== ALL FORM JSON TESTS PASSED ===")
+    } else {
+        print("=== ${fails} FORM JSON TEST(S) FAILED ===")
+    }
+}

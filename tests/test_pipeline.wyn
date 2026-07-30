@@ -1,0 +1,200 @@
+// test_pipeline - THE KEYSTONE, end to end, from a hand-written JSON file to a
+// compiled binary.
+//
+//   WYN_ROOT=/path/to/wyn  wyn run tests/test_pipeline.wyn
+//
+// Run from the repo ROOT: the generated files `import widgets`, which resolves
+// via ./src/ relative to the current directory.
+//
+// WHY THIS TEST IS THE ONE THAT MATTERS
+//
+// The other tests each check one link: test_form_json checks that save/load
+// round-trips, test_codegen checks that the two-file generator's output compiles.
+// Neither proves the claim the whole design rests on:
+//
+//   "an AI assistant edits the same JSON the designer edits, so 'add a login
+//    form' becomes a file edit"
+//
+// That claim is only true if a document NOTHING IN THIS REPO WROTE - typed out by
+// hand below, exactly as an assistant would emit it - goes all the way to a
+// binary. So this test writes JSON as literal text, loads it through the real
+// parser, generates both .wyn files, and BUILDS them. Every link in the chain, in
+// order, with no shortcut around any of them.
+//
+// And then the second half does what a designer does: mutate the loaded document
+// (move a control, rename a handler), save it, and confirm the file on disk
+// changed and still round-trips. Designer and assistant editing the same file is
+// the point; a test that only ever reads would not show it.
+
+import widgets
+import form
+import codegen
+
+var fails = 0
+
+fn check(label: string, got: string, want: string) {
+    if got == want {
+        print("  ok   ${label} = ${got}")
+    } else {
+        print("  FAIL ${label}: got [${got}] want [${want}]")
+        fails = fails + 1
+    }
+}
+
+fn check_int(label: string, got: int, want: int) {
+    check(label, got.to_string(), want.to_string())
+}
+
+var PROJ = "scratch/pipeline"
+
+fn build_ok(path: string) -> int {
+    var wyn = Env::get("WYN_ROOT") + "/wyn"
+    var rc = System::exec_code(wyn + " build " + path + " > /dev/null 2>&1")
+    if rc == 0 { return 1 }
+    return 0
+}
+
+// The document an assistant would write for "add a login form".
+//
+// Deliberately NOT the output of Form_to_json: it is indented differently, its
+// keys are in a different order, it OMITS optional keys (no "enabled", no
+// "anchor" on most widgets, no "text"), and it uses a nested anchor object on
+// only the two controls that need one. A reader that only accepts its own output
+// is not a format, it is a cache.
+fn assistant_doc() -> string {
+    var s = "{\n"
+    s = s + "  \"form\": \"LoginForm\",\n"
+    s = s + "  \"width\": 420,\n"
+    s = s + "  \"height\": 260,\n"
+    s = s + "  \"widgets\": [\n"
+    s = s + "    { \"kind\": \"label\", \"x\": 24, \"y\": 24, \"label\": \"Sign in\" },\n"
+    s = s + "    { \"kind\": \"label\", \"x\": 24, \"y\": 64, \"label\": \"Email\" },\n"
+    s = s + "    { \"kind\": \"entry\", \"x\": 100, \"y\": 58, \"w\": 280, \"h\": 28,\n"
+    s = s + "      \"anchor\": { \"left\": 1, \"right\": 1, \"top\": 1, \"bottom\": 0 } },\n"
+    s = s + "    { \"kind\": \"label\", \"x\": 24, \"y\": 104, \"label\": \"Password\" },\n"
+    s = s + "    { \"kind\": \"entry\", \"x\": 100, \"y\": 98, \"w\": 280, \"h\": 28,\n"
+    s = s + "      \"anchor\": { \"left\": 1, \"right\": 1, \"top\": 1, \"bottom\": 0 } },\n"
+    s = s + "    { \"kind\": \"checkbox\", \"x\": 100, \"y\": 140, \"label\": \"Remember me\",\n"
+    s = s + "      \"checked\": 1, \"handler\": \"on_remember_changed\" },\n"
+    s = s + "    { \"kind\": \"button\", \"x\": 100, \"y\": 180, \"w\": 110, \"h\": 32,\n"
+    s = s + "      \"label\": \"Sign in\", \"handler\": \"on_sign_in\" },\n"
+    // enabled: 0 on a control whose "missing" default is 1 - the case a reader
+    // that ignores absent-vs-zero gets wrong in the direction of shipping a
+    // clickable button that should be greyed out.
+    s = s + "    { \"kind\": \"button\", \"x\": 224, \"y\": 180, \"w\": 110, \"h\": 32,\n"
+    s = s + "      \"label\": \"Cancel\", \"handler\": \"on_cancel\", \"enabled\": 0 }\n"
+    s = s + "  ]\n"
+    s = s + "}\n"
+    return s
+}
+
+fn main() {
+    print("=== the whole pipeline: hand-written JSON -> a built binary ===")
+
+    File::create_dir_all(PROJ)
+    var jpath = PROJ + "/LoginForm.json"
+    var dpath = PROJ + "/LoginForm.designer.wyn"
+    var cpath = PROJ + "/LoginForm.wyn"
+    File::delete(dpath)
+    File::delete(cpath)
+
+    print("-- 1. an ASSISTANT writes the document (not this repo's serialiser) --")
+    File::write(jpath, assistant_doc())
+    check_int("the file is on disk", File::exists(jpath), 1)
+
+    print("-- 2. the real parser loads it --")
+    // win/font = -1: a document has no window, which is what makes the whole
+    // model testable with no display.
+    var ui = form.Form_load(jpath, 0 - 1, 0 - 1)
+    check("the form's name came from the document", widgets.Ui_name(ui), "LoginForm")
+    check_int("all 8 widgets loaded", widgets.Ui_count(ui), 8)
+    check_int("width from the document", widgets.Ui_design_w(ui), 420)
+    // The interesting reads: the keys the document OMITTED, and the one it set
+    // to a value equal to nothing.
+    check_int("a control with no \"enabled\" key defaults to enabled",
+        widgets.Ui_enabled_at(ui, 0), 1)
+    check_int("...but an explicit 0 is honoured (Cancel is disabled)",
+        widgets.Ui_enabled_at(ui, 7), 0)
+    check_int("a control with no \"anchor\" key gets left+top",
+        widgets.Ui_anchor_left_at(ui, 0), 1)
+    check_int("...and no right anchor", widgets.Ui_anchor_right_at(ui, 0), 0)
+    check_int("the document's own anchor is read (entry stretches)",
+        widgets.Ui_anchor_right_at(ui, 2), 1)
+    check("the document's handler NAME survived",
+        widgets.Ui_handler_name_at(ui, 6), "on_sign_in")
+    check_int("ids were assigned where the document omitted them",
+        widgets.Ui_id_at(ui, 0), 1)
+
+    print("-- 3. generate both .wyn files from the loaded document --")
+    var added = codegen.Form_generate(ui, PROJ)
+    check_int("three handler stubs (2 buttons + 1 checkbox)", added, 3)
+    var code = File::read(cpath)
+    // The names came from the DOCUMENT, not from the captions, so they are the
+    // names an assistant chose and the ones a human would already have written
+    // bodies for.
+    check_int("the stub is named as the document asked",
+        code.index_of("pub fn on_sign_in(id: int)") >= 0 ? 1 : 0, 1)
+    check_int("...and so is the checkbox's",
+        code.index_of("pub fn on_remember_changed(id: int)") >= 0 ? 1 : 0, 1)
+
+    print("-- 4. THE ASSERTION: it compiles --")
+    check_int("wyn build LoginForm.designer.wyn", build_ok(dpath), 1)
+
+    print("-- 5. a human writes a real body; regeneration leaves it alone --")
+    var edited = File::read(cpath)
+    edited = edited + "\n// a real body, hand-written\n"
+        + "pub fn validate(email: string) -> int {\n"
+        + "    if email.index_of(\"@\") < 0 { return 0 }\n"
+        + "    return 1\n"
+        + "}\n"
+    File::write(cpath, edited)
+    var again = codegen.Form_generate(ui, PROJ)
+    check_int("nothing appended on a regeneration", again, 0)
+    var after = File::read(cpath)
+    check_int("the hand-written body is still there",
+        after.index_of("email.index_of") >= 0 ? 1 : 0, 1)
+    check_int("and it still compiles", build_ok(dpath), 1)
+
+    print("-- 6. the DESIGNER edits the same document the assistant wrote --")
+    // Move a control and rename a handler - exactly what dragging a button and
+    // typing in a property inspector does.
+    var btn = widgets.Ui_id_at(ui, 6)
+    ui = widgets.Ui_move(ui, btn, 140, 200)
+    ui = widgets.Ui_set_handler_name(ui, btn, "on_submit")
+    ui = widgets.Ui_set_anchor(ui, btn, 0, 1, 0, 1)
+    check_int("saved", form.Form_save(ui, jpath), 1)
+    var text2 = File::read(jpath)
+    check_int("the file on disk now carries the new handler name",
+        text2.index_of("on_submit") >= 0 ? 1 : 0, 1)
+    check_int("...and no longer the old one",
+        text2.index_of("on_sign_in") < 0 ? 1 : 0, 1)
+
+    print("-- 7. reload the designer's own output, field by field --")
+    // The round trip that matters after an edit: what was saved is what loads.
+    var back = form.Form_load(jpath, 0 - 1, 0 - 1)
+    check("Form_diff reports no difference", form.Form_diff(ui, back), "")
+    check_int("the move survived (x)", widgets.Ui_x_of(back, btn), 140)
+    check_int("the new anchor survived", widgets.Ui_anchor_bottom_at(back, 6), 1)
+
+    print("-- 8. regenerating after the rename ADDS a stub, keeps the old body --")
+    // Renaming a handler in the designer must not delete the body the user wrote
+    // under the old name. A new empty stub plus the orphan is the only choice
+    // that cannot lose work.
+    var n3 = codegen.Form_generate(back, PROJ)
+    check_int("one new stub for the renamed handler", n3, 1)
+    var final_code = File::read(cpath)
+    check_int("the new stub exists",
+        final_code.index_of("pub fn on_submit(id: int)") >= 0 ? 1 : 0, 1)
+    check_int("the ORPHANED old body was not deleted",
+        final_code.index_of("pub fn on_sign_in(id: int)") >= 0 ? 1 : 0, 1)
+    check_int("the hand-written helper still survives",
+        final_code.index_of("email.index_of") >= 0 ? 1 : 0, 1)
+    check_int("and the whole thing still compiles", build_ok(dpath), 1)
+
+    print("")
+    if fails == 0 {
+        print("=== ALL PIPELINE TESTS PASSED ===")
+    } else {
+        print("=== ${fails} PIPELINE TEST(S) FAILED ===")
+    }
+}

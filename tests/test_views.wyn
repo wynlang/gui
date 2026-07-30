@@ -1,0 +1,295 @@
+// test_views - MULTIPLE FORMS IN ONE WINDOW, over one shared state.
+//
+//   SDL_VIDEODRIVER=dummy WYN_ROOT=/path/to/wyn  wyn run tests/test_views.wyn
+//
+// Two halves, for the same reason the textarea test has two: the model half runs
+// with no display at all (a Views with win = -1 is a legitimate value), and the
+// event half drives SYNTHETIC INPUT through the real SDL queue, so what is under
+// test is the code the user's fingers reach, not a parallel test-only path.
+//
+// WHAT THE INTERESTING ASSERTIONS ARE
+//
+// Not "switching changes an int". The three things that can actually be wrong:
+//
+//   1. RETAINED STATE ACROSS A SWITCH. Leave a form with text typed into it, come
+//      back, and the text is still there. This is the entire justification for
+//      retained widgets over immediate mode; if a switch loses it, the feature is
+//      worse than useless because the loss is silent.
+//   2. ONLY THE CURRENT VIEW SEES EVENTS. A click at (x, y) must not also hit
+//      whatever happens to sit at (x, y) on a hidden form. Asserted by putting a
+//      button at the SAME coordinates on both views and requiring exactly one of
+//      the two counters to move.
+//   3. HIDDEN VIEWS ARE RELAID OUT TOO. A resize while form B is hidden must
+//      still re-anchor B, or switching to it afterwards shows a form laid out for
+//      the old window size.
+
+import gui
+import widgets
+import views
+
+var fails = 0
+
+fn check(label: string, got: string, want: string) {
+    if got == want {
+        print("  ok   ${label} = ${got}")
+    } else {
+        print("  FAIL ${label}: got [${got}] want [${want}]")
+        fails = fails + 1
+    }
+}
+
+fn check_int(label: string, got: int, want: int) {
+    check(label, got.to_string(), want.to_string())
+}
+
+// Handlers count their calls in module-level state, because a Wyn closure cannot
+// capture a mutable reference to the surrounding state - which is exactly the
+// constraint that made shared-state-over-a-bus the right design.
+var hits_a = 0
+var hits_b = 0
+
+fn on_a(id: int) { hits_a = hits_a + 1 }
+fn on_b(id: int) { hits_b = hits_b + 1 }
+
+fn model_tests() {
+    print("=== views: the model (no display needed) ===")
+
+    var app = views.Views_new(-1, -1)
+    check_int("a new app has no views", views.Views_count(app), 0)
+    check_int("and nothing current", views.Views_current(app), 0 - 1)
+    check_int("and is therefore not running", views.Views_running(app), 0)
+
+    var login = widgets.Ui_new(-1, -1)
+    login = widgets.Ui_set_name(login, "Login")
+    login = widgets.Ui_set_design_size(login, 640, 480)
+    login = widgets.Ui_entry(login, "", 16, 40, 200, 26)
+    var user_id = widgets.Ui_last_id(login)
+    login = widgets.Ui_checkbox(login, "Remember", 16, 80, 1, on_a)
+    var rem_id = widgets.Ui_last_id(login)
+    // right+bottom anchored, so the relayout assertion below has something to
+    // actually move.
+    login = widgets.Ui_button(login, "Sign in", 16, 120, 96, 28, on_a)
+    var signin_id = widgets.Ui_last_id(login)
+    login = widgets.Ui_set_anchor(login, signin_id, 0, 1, 0, 1)
+
+    var home = widgets.Ui_new(-1, -1)
+    home = widgets.Ui_set_name(home, "Home")
+    home = widgets.Ui_set_design_size(home, 640, 480)
+    home = widgets.Ui_label(home, "not signed in", 16, 16)
+    var greet_id = widgets.Ui_last_id(home)
+
+    app = views.Views_add(app, login)
+    check_int("the first view added becomes current", views.Views_current(app), 0)
+    check("...and it is the one we added", views.Views_current_name(app), "Login")
+    app = views.Views_add(app, home)
+    check_int("two views", views.Views_count(app), 2)
+    check("adding a second does NOT steal the display",
+        views.Views_current_name(app), "Login")
+
+    print("-- lookup by name --")
+    check_int("Login is 0", views.Views_index_of(app, "Login"), 0)
+    check_int("Home is 1", views.Views_index_of(app, "Home"), 1)
+    check_int("an unknown name is -1", views.Views_index_of(app, "Nope"), 0 - 1)
+    check("name_at out of range is empty, not a trap",
+        views.Views_name_at(app, 99), "")
+
+    print("-- switching --")
+    app = views.Views_show(app, "Home")
+    check("showed Home", views.Views_current_name(app), "Home")
+    check_int("leaving Login pushed it onto the history",
+        views.Views_history_depth(app), 1)
+    // The typo case. A name reaching Views_show comes from a handler, a JSON
+    // document or an assistant, so it can be wrong; blanking the window is the
+    // worst available response.
+    app = views.Views_show(app, "Nope")
+    check("an unknown name is a no-op", views.Views_current_name(app), "Home")
+    check_int("and does not touch the history",
+        views.Views_history_depth(app), 1)
+    // Re-showing the current view must not stack a self-referential history
+    // entry, or Back becomes a no-op exactly when the user needs it.
+    app = views.Views_show(app, "Home")
+    check_int("re-showing the current view adds no history",
+        views.Views_history_depth(app), 1)
+    app = views.Views_back(app)
+    check("back returned to Login", views.Views_current_name(app), "Login")
+    check_int("history consumed", views.Views_history_depth(app), 0)
+    app = views.Views_back(app)
+    check("back with an empty history is a no-op",
+        views.Views_current_name(app), "Login")
+
+    print("-- shared state: typed slots, absent != zero --")
+    check_int("an unset int reads its default",
+        views.Views_get_int(app, "user_id", 0 - 5), 0 - 5)
+    check_int("...and reports itself absent", views.Views_has_int(app, "user_id"), 0)
+    app = views.Views_set_int(app, "user_id", 0)
+    // The assertion that matters: 0 was SET, so it must not read as the default.
+    // A slot API that returns 0 for "missing" cannot tell these apart, and a
+    // counter or an id of 0 is legitimate.
+    check_int("a slot set to 0 reads back as 0, not as the default",
+        views.Views_get_int(app, "user_id", 0 - 5), 0)
+    check_int("...and reports itself present", views.Views_has_int(app, "user_id"), 1)
+    app = views.Views_set_int(app, "user_id", 42)
+    check_int("overwriting updates in place",
+        views.Views_get_int(app, "user_id", 0), 42)
+    check_int("and does not add a second slot",
+        views.Views_has_int(app, "user_id"), 1)
+    check("an unset string reads its default",
+        views.Views_get_str(app, "name", "anon"), "anon")
+    app = views.Views_set_str(app, "name", "")
+    check("a slot set to the EMPTY STRING is present, not absent",
+        views.Views_get_str(app, "name", "anon"), "")
+
+    print("-- the actual cross-form data path --")
+    // Form A has an entry; form B has to display what was typed into it. This is
+    // "form A changed something form B shows", concretely.
+    app = views.Views_set_view_text(app, "Login", user_id, "ada")
+    app = views.Views_pull_text(app, "Login", user_id, "name")
+    check("Login's entry reached the shared slot",
+        views.Views_get_str(app, "name", "?"), "ada")
+    var who = views.Views_get_str(app, "name", "?")
+    app = views.Views_push_label(app, "Home", greet_id, "welcome, " + who)
+    check("...and the slot reached Home's label",
+        views.Views_view_label(app, "Home", greet_id), "welcome, ada")
+    app = views.Views_pull_checked(app, "Login", rem_id, "remember")
+    check_int("a checkbox pulls through too",
+        views.Views_get_int(app, "remember", 0), 1)
+
+    print("-- every cross-view call is TOTAL --")
+    // A designer deletes controls, so code that names one can outlive it. Every
+    // one of these has to answer rather than trap.
+    check("text of an unknown view", views.Views_view_text(app, "Ghost", 1), "")
+    check_int("checked of an unknown view",
+        views.Views_view_checked(app, "Ghost", 1), 0)
+    check("label of an unknown id", views.Views_view_label(app, "Home", 999), "")
+    check_int("count of an unknown view", views.Views_view_count(app, "Ghost"), 0)
+    // A pull from a control that no longer exists must leave the slot ALONE
+    // rather than clobbering it with "" - a stale id silently erasing good state
+    // is worse than the pull failing.
+    app = views.Views_pull_text(app, "Login", 999, "name")
+    check("a pull from a dead id does not clobber the slot",
+        views.Views_get_str(app, "name", "?"), "ada")
+    app = views.Views_pull_text(app, "Ghost", user_id, "name")
+    check("nor does a pull from a dead view",
+        views.Views_get_str(app, "name", "?"), "ada")
+
+    print("-- a resize relays out HIDDEN views too --")
+    // Currently showing Login; Home is hidden. Both must move, or switching to
+    // Home after a resize shows a form laid out for the old size - a bug that
+    // only appears on the second view the user visits.
+    var before_x = widgets.Ui_x_of(views_at(app, "Login"), signin_id)
+    app = views.Views_relayout(app, 640, 480, 840, 480)
+    check_int("the visible view's right-anchored button slid by +200",
+        widgets.Ui_x_of(views_at(app, "Login"), signin_id), before_x + 200)
+    // Home's label is left+top anchored, so its own coordinates should NOT move;
+    // what proves the hidden view was processed is that its design size tracked.
+    check_int("the hidden view was relaid out as well (design width)",
+        widgets.Ui_design_w(views_at(app, "Home")), 840)
+    print("")
+}
+
+// Reading a whole view back out. views.wyn deliberately exposes per-field
+// accessors rather than the Ui itself, so the test gets at one for the two
+// assertions above through Views_index_of + a local helper.
+fn views_at(app: Views, name: string) -> Ui {
+    return views.Views_view(app, name)
+}
+
+fn event_tests(win: int, font: int) {
+    print("=== views through REAL events ===")
+
+    hits_a = 0
+    hits_b = 0
+
+    // The two views carry a button at IDENTICAL coordinates. That is the point:
+    // if events leaked to hidden views, one click would move both counters.
+    var va = widgets.Ui_new(win, font)
+    va = widgets.Ui_set_name(va, "A")
+    va = widgets.Ui_button(va, "A-btn", 40, 40, 120, 30, on_a)
+    va = widgets.Ui_entry(va, "", 40, 100, 200, 26)
+    var a_entry = widgets.Ui_last_id(va)
+
+    var vb = widgets.Ui_new(win, font)
+    vb = widgets.Ui_set_name(vb, "B")
+    vb = widgets.Ui_button(vb, "B-btn", 40, 40, 120, 30, on_b)
+
+    var app = views.Views_new(win, font)
+    app = views.Views_add(app, va)
+    app = views.Views_add(app, vb)
+
+    print("-- a click reaches the CURRENT view only --")
+    gui.Win_push_mouse_move(win, 100, 55)
+    gui.Win_push_mouse_down(win, 100, 55, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, 100, 55, gui.MOUSE_LEFT)
+    app = views.Views_events(app)
+    check_int("A's handler fired", hits_a, 1)
+    check_int("B's handler at the SAME coordinates did NOT", hits_b, 0)
+
+    print("-- ...and after switching, the other one --")
+    app = views.Views_show(app, "B")
+    gui.Win_push_mouse_move(win, 100, 55)
+    gui.Win_push_mouse_down(win, 100, 55, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, 100, 55, gui.MOUSE_LEFT)
+    app = views.Views_events(app)
+    check_int("B's handler fired", hits_b, 1)
+    check_int("A's did not fire again", hits_a, 1)
+
+    print("-- RETAINED STATE: typed text survives leaving and returning --")
+    app = views.Views_show(app, "A")
+    gui.Win_push_mouse_move(win, 100, 110)
+    gui.Win_push_mouse_down(win, 100, 110, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, 100, 110, gui.MOUSE_LEFT)
+    app = views.Views_events(app)
+    gui.Win_push_text(win, "hello")
+    app = views.Views_events(app)
+    check("typed into A's entry", views.Views_view_text(app, "A", a_entry), "hello")
+    // Leave, do something on B, come back. This is the whole argument for
+    // retained widgets: an immediate-mode UI cannot do it, because its state
+    // exists only as a side effect of the draw loop that is no longer running.
+    app = views.Views_show(app, "B")
+    gui.Win_push_text(win, "XXX")
+    app = views.Views_events(app)
+    check("keystrokes on B did not leak into A's entry",
+        views.Views_view_text(app, "A", a_entry), "hello")
+    app = views.Views_show(app, "A")
+    check("A's text survived the round trip",
+        views.Views_view_text(app, "A", a_entry), "hello")
+
+    print("-- a frame draws only the current view, and balances the clip stack --")
+    check_int("depth before", gui.Win_clip_depth(win), 0)
+    app = views.Views_frame(app)
+    check_int("depth after", gui.Win_clip_depth(win), 0)
+
+    print("-- quitting --")
+    check_int("running", views.Views_running(app), 1)
+    app = views.Views_quit(app)
+    check_int("stopped", views.Views_running(app), 0)
+    print("")
+}
+
+fn main() {
+    model_tests()
+
+    if gui.Win_available() == 0 {
+        print("no display: skipping the event half (run with SDL_VIDEODRIVER=dummy)")
+    } else {
+        var win = gui.Win_window("views test", 600, 400)
+        if win < 0 {
+            print("could not open a window: skipping the event half")
+        } else {
+            var font = gui.Win_font_default(15)
+            if font < 0 {
+                print("no font: skipping the event half")
+            } else {
+                event_tests(win, font)
+                gui.Win_font_free(font)
+            }
+            gui.Win_close(win)
+        }
+    }
+
+    if fails == 0 {
+        print("=== ALL VIEWS TESTS PASSED ===")
+    } else {
+        print("=== ${fails} VIEWS TEST(S) FAILED ===")
+    }
+}

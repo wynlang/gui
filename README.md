@@ -139,16 +139,56 @@ Physical key positions. `SCANCODE_A`…`SCANCODE_D`, `SCANCODE_S`, `SCANCODE_V`,
 `SCANCODE_DELETE`, arrows, `SCANCODE_LCTRL`, `SCANCODE_LSHIFT`, `SCANCODE_LALT`,
 `SCANCODE_LGUI`.
 
+## Visual Wyn: the form designer
+
+Four modules sit on top of the drawing API. The keystone is that **a form is a
+JSON document**, and the generated `.wyn` code is strictly downstream of it -
+nothing ever parses generated code back into a form.
+
+| Module | What it is |
+|---|---|
+| `src/widgets.wyn` | The retained toolkit: labels, buttons, checkboxes, entries, panels, and a multi-line **textarea** with a caret, arrow-key movement, insert/backspace/delete and vertical scrolling. Plus 86 public functions, because code outside a module cannot index an array field of an imported struct. |
+| `src/form.wyn` | `Form_save` / `Form_load` / `Form_diff` - the JSON document, including per-widget **anchors** (`left/right/top/bottom`) and `Ui_relayout` to honour them on resize. |
+| `src/codegen.wyn` | `Form_generate` - the WinForms split: `Form1.designer.wyn` is regenerated freely, `Form1.wyn` holds handler bodies and is **never rewritten**. |
+| `src/views.wyn` | Several named forms in **one** window, switched by name, over one shared state struct. No event bus. |
+
+```bash
+wyn run examples/designer.wyn        # the visual designer
+wyn run examples/wizard.wyn          # three forms, one window, shared state
+```
+
+### Why the document, and not just generated code
+
+An AI assistant edits the same JSON the designer edits, so "add a login form" is
+a file edit - there is no AI inside the tool, no plugin API and no second
+representation to keep in step. That is only true if a document *nothing in this
+repo wrote* goes all the way to a binary, which is what `tests/test_pipeline.wyn`
+asserts: hand-written JSON -> parse -> generate both files -> `wyn build`.
+
+### Two things that will bite you
+
+- **Handlers cannot switch views.** A Wyn closure cannot capture a mutable
+  reference to surrounding state, so a handler cannot call `Views_show` itself.
+  It sets a module-level flag and the frame loop acts on it. `examples/wizard.wyn`
+  shows the shape.
+- **Structs pass by value**, so every mutator takes a value and *returns* it
+  (`ui = Ui_button(ui, …)`). A function that mutates `self` mutates a copy and
+  silently does nothing.
+
 ## Build and test
 
 ```bash
 ./csrc/build.sh              # build libgui/libgui.a (needs SDL3)
 ./csrc/run_backend_test.sh   # headless backend test - works over ssh and in CI
-wyn run tests/test_gui.wyn   # Wyn-level constant/layout tests
+WYN_ROOT=/path/to/wyn ./tests/run.sh   # every test + both example selftests
 ```
 
+`tests/run.sh` must be run from the repo root and sets `SDL_VIDEODRIVER=dummy`
+itself - the tests that need a window skip themselves without it and still report
+success, so forgetting it silently reduces coverage rather than failing.
+
 The backend test asserts return values and that bad handles stay inert. It
-cannot tell you the text was *legible* — a renderer passes a width test whether
+cannot tell you the text was *legible* - a renderer passes a width test whether
 it draws letters or mojibake. For that, look at it:
 
 ```bash
@@ -159,7 +199,7 @@ cc -Wall -Wextra -std=c11 -I ../src $(pkg-config --cflags sdl3) \
 
 ## Porting note: SDL2 to SDL3
 
-The SDL2 backend was removed rather than kept alongside. Several SDL2→SDL3
+The SDL2 backend was removed rather than kept alongside. Several SDL2->SDL3
 changes fail *silently*, which is the reason this package now hides the backend
 behind `src/gui_backend.h`:
 
@@ -169,8 +209,8 @@ behind `src/gui_backend.h`:
 - `SDL_CreateWindow` lost its x/y parameters (4 args, not 6).
 - `SDL_CreateRenderer` takes `(window, name)`; the index/flags are gone.
 - Mouse coordinates are `float`, in events and in `SDL_GetMouseState`.
-- `SDL_RenderDrawRect`/`Line` → `SDL_RenderRect`/`Line`, on `SDL_FRect`.
+- `SDL_RenderDrawRect`/`Line` -> `SDL_RenderRect`/`Line`, on `SDL_FRect`.
 
-On a machine with `sdl2-compat` installed, SDL2's `pkg-config` still resolves —
-to a shim over SDL3 — so the old code compiles clean and the breakage only
+On a machine with `sdl2-compat` installed, SDL2's `pkg-config` still resolves -
+to a shim over SDL3 - so the old code compiles clean and the breakage only
 appears against a real SDL2.

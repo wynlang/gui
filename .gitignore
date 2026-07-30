@@ -13,3 +13,18 @@ wyn_cc_err.txt
 examples/form
 examples/designer
 examples/showcase
+examples/wizard
+# Scratch projects the generator tests write into and then build
+scratch/
+# Test binaries left by `wyn build` inside tests/
+tests/test_*
+!tests/test_*.wyn
+# compiled examples and their generated C
+examples/*.wyn.c
+examples/*.wyn.out
+examples/designer
+examples/showcase
+examples/form
+examples/wizard
+libgui/
+*.bmp
