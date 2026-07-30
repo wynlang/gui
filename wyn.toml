@@ -6,3 +6,11 @@ description = "Cross-platform desktop GUI for Wyn (SDL3 backend, texture + text)
 [build]
 requires = ["sdl3"]  # brew install sdl3 / apt install libsdl3-dev
 # Text needs no extra dependency: stb_truetype is vendored in src/.
+
+# Links the native backend built by ./csrc/build.sh.
+# lib_dirs needs the Homebrew/system SDL3 path explicitly - it is not searched
+# by default.
+[ffi]
+libs         = ["gui", "SDL3"]
+lib_dirs     = ["libgui", "/opt/homebrew/lib"]
+include_dirs = ["src"]

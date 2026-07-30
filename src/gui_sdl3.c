@@ -86,7 +86,7 @@ static GuiFont g_fonts[MAX_FONTS];
 static int     g_init    = 0;
 static int     g_running = 1;
 
-// Payload of the most recent Gui_poll_event, read back through the accessors.
+// Payload of the most recent Win_poll_event, read back through the accessors.
 static int  g_ev_x, g_ev_y, g_ev_button, g_ev_key, g_ev_clicks;
 static char g_ev_text[64];
 
@@ -114,9 +114,9 @@ static int ensure_init(void) {
     return 1;
 }
 
-const char* Gui_backend_name(void) { return "sdl3"; }
+const char* Win_backend_name(void) { return "sdl3"; }
 
-int Gui_available(void) {
+long long Win_available(void) {
     if (g_init) return 1;
     if (!SDL_Init(SDL_INIT_VIDEO)) return 0;   // no display: report, do not abort
     g_init = 1;
@@ -125,7 +125,7 @@ int Gui_available(void) {
 
 // ---- lifecycle -----------------------------------------------------------
 
-long long Gui_window(const char* title, int width, int height) {
+long long Win_window(const char* title, long long width, long long height) {
     if (!ensure_init()) return -1;
     int id = -1;
     for (int i = 0; i < MAX_WINDOWS; i++) if (!g_wins[i].used) { id = i; break; }
@@ -153,20 +153,20 @@ long long Gui_window(const char* title, int width, int height) {
     return id;
 }
 
-int Gui_running(long long id) {
+long long Win_running(long long id) {
     (void)id;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) g_running = 0;
         // Escape closes, matching the previous SDL2 behaviour. A retained-mode
-        // program that wants Escape for itself should drive Gui_poll_event.
+        // program that wants Escape for itself should drive Win_poll_event.
         if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_ESCAPE)
             g_running = 0;
     }
     return g_running;
 }
 
-void Gui_close(long long id) {
+void Win_close(long long id) {
     GuiWin* w = win_at(id);
     if (w) {
         if (w->ren) SDL_DestroyRenderer(w->ren);
@@ -179,38 +179,38 @@ void Gui_close(long long id) {
 
 // ---- drawing -------------------------------------------------------------
 
-void Gui_clear(long long id, int r, int g, int b) {
+void Win_clear(long long id, long long r, long long g, long long b) {
     GuiWin* w = win_at(id); if (!w) return;
     SDL_SetRenderDrawColor(w->ren, (Uint8)r, (Uint8)g, (Uint8)b, 255);
     SDL_RenderClear(w->ren);
 }
 
-void Gui_rect(long long id, int x, int y, int rw, int rh, int r, int g, int b) {
+void Win_rect(long long id, long long x, long long y, long long rw, long long rh, long long r, long long g, long long b) {
     GuiWin* w = win_at(id); if (!w) return;
     SDL_SetRenderDrawColor(w->ren, (Uint8)r, (Uint8)g, (Uint8)b, 255);
     SDL_FRect rect = { (float)x, (float)y, (float)rw, (float)rh };
     SDL_RenderFillRect(w->ren, &rect);
 }
 
-void Gui_rect_outline(long long id, int x, int y, int rw, int rh, int r, int g, int b) {
+void Win_rect_outline(long long id, long long x, long long y, long long rw, long long rh, long long r, long long g, long long b) {
     GuiWin* w = win_at(id); if (!w) return;
     SDL_SetRenderDrawColor(w->ren, (Uint8)r, (Uint8)g, (Uint8)b, 255);
     SDL_FRect rect = { (float)x, (float)y, (float)rw, (float)rh };
     SDL_RenderRect(w->ren, &rect);          // SDL2: SDL_RenderDrawRect
 }
 
-void Gui_line(long long id, int x1, int y1, int x2, int y2, int r, int g, int b) {
+void Win_line(long long id, long long x1, long long y1, long long x2, long long y2, long long r, long long g, long long b) {
     GuiWin* w = win_at(id); if (!w) return;
     SDL_SetRenderDrawColor(w->ren, (Uint8)r, (Uint8)g, (Uint8)b, 255);
     SDL_RenderLine(w->ren, (float)x1, (float)y1, (float)x2, (float)y2);
 }
 
-void Gui_present(long long id) {
+void Win_present(long long id) {
     GuiWin* w = win_at(id); if (!w) return;
     SDL_RenderPresent(w->ren);
 }
 
-void Gui_clip(long long id, int x, int y, int cw, int ch) {
+void Win_clip(long long id, long long x, long long y, long long cw, long long ch) {
     GuiWin* w = win_at(id); if (!w) return;
     if (cw <= 0 || ch <= 0) { SDL_SetRenderClipRect(w->ren, NULL); return; }
     SDL_Rect c = { x, y, cw, ch };          // clip rect is integer, not FRect
@@ -219,7 +219,7 @@ void Gui_clip(long long id, int x, int y, int cw, int ch) {
 
 // ---- textures ------------------------------------------------------------
 
-long long Gui_texture(long long winid, int width, int height) {
+long long Win_texture(long long winid, long long width, long long height) {
     GuiWin* w = win_at(winid); if (!w) return -1;
     if (width <= 0 || height <= 0) return -1;
     int id = -1;
@@ -236,13 +236,13 @@ long long Gui_texture(long long winid, int width, int height) {
     return id;
 }
 
-int Gui_texture_update(long long id, const unsigned char* rgba, int w, int h) {
+long long Win_texture_update(long long id, const unsigned char* rgba, long long w, long long h) {
     GuiTex* t = tex_at(id); if (!t || !rgba) return 0;
     if (w != t->w || h != t->h) return 0;
     return SDL_UpdateTexture(t->tex, NULL, rgba, w * 4) ? 1 : 0;
 }
 
-int Gui_texture_update_f32(long long id, const float* rgba, int w, int h) {
+long long Win_texture_update_f32(long long id, const float* rgba, long long w, long long h) {
     GuiTex* t = tex_at(id); if (!t || !rgba) return 0;
     if (w != t->w || h != t->h) return 0;
     // The texture was created ABGR8888, so convert here rather than refusing.
@@ -276,14 +276,14 @@ int Gui_texture_update_f32(long long id, const float* rgba, int w, int h) {
     return ok;
 }
 
-void Gui_blit(long long winid, long long texid, int dx, int dy, int dw, int dh) {
+void Win_blit(long long winid, long long texid, long long dx, long long dy, long long dw, long long dh) {
     GuiWin* w = win_at(winid); if (!w) return;
     GuiTex* t = tex_at(texid); if (!t) return;
     SDL_FRect dst = { (float)dx, (float)dy, (float)dw, (float)dh };
     SDL_RenderTexture(w->ren, t->tex, NULL, &dst);   // SDL2: SDL_RenderCopy
 }
 
-void Gui_texture_free(long long id) {
+void Win_texture_free(long long id) {
     GuiTex* t = tex_at(id); if (!t) return;
     if (t->tex) SDL_DestroyTexture(t->tex);
     t->tex = NULL; t->used = 0;
@@ -366,7 +366,7 @@ static long long font_from_memory(unsigned char* data, long size, int pixel_heig
     return id;
 }
 
-long long Gui_font(const char* path, int pixel_height) {
+long long Win_font(const char* path, long long pixel_height) {
     if (!path) return -1;
     FILE* fp = fopen(path, "rb");
     if (!fp) { fprintf(stderr, "gui: cannot open font '%s'\n", path); return -1; }
@@ -381,7 +381,7 @@ long long Gui_font(const char* path, int pixel_height) {
     return font_from_memory(data, size, pixel_height);
 }
 
-long long Gui_font_default(int pixel_height) {
+long long Win_font_default(long long pixel_height) {
     // No font is embedded in the package (a TTF would add ~hundreds of KB to
     // every checkout), so fall back to the first platform font that exists.
     // Each path is a real default on its platform; the list is tried in order.
@@ -399,15 +399,15 @@ long long Gui_font_default(int pixel_height) {
         FILE* fp = fopen(candidates[i], "rb");
         if (!fp) continue;
         fclose(fp);
-        long long h = Gui_font(candidates[i], pixel_height);
+        long long h = Win_font(candidates[i], pixel_height);
         if (h >= 0) return h;
     }
     fprintf(stderr, "gui: no default font found; pass an explicit .ttf path\n");
     return -1;
 }
 
-void Gui_text(long long winid, long long fontid, const char* s,
-              int x, int y, int r, int g, int b) {
+void Win_text(long long winid, long long fontid, const char* s,
+              long long x, long long y, long long r, long long g, long long b) {
     GuiWin* w = win_at(winid); if (!w) return;
     GuiFont* f = font_at(fontid); if (!f || !s) return;
     // y is the TOP of the line, which is what a layout engine has; stb_truetype
@@ -436,7 +436,7 @@ void Gui_text(long long winid, long long fontid, const char* s,
     }
 }
 
-int Gui_text_width(long long fontid, const char* s) {
+long long Win_text_width(long long fontid, const char* s) {
     GuiFont* f = font_at(fontid); if (!f || !s) return 0;
     int wsum = 0;
     for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
@@ -449,12 +449,12 @@ int Gui_text_width(long long fontid, const char* s) {
     return wsum;
 }
 
-int Gui_font_height(long long fontid) {
+long long Win_font_height(long long fontid) {
     GuiFont* f = font_at(fontid);
     return f ? f->height : 0;
 }
 
-void Gui_font_free(long long fontid) {
+void Win_font_free(long long fontid) {
     GuiFont* f = font_at(fontid); if (!f) return;
     for (int i = 0; i < GLYPH_COUNT; i++)
         if (f->glyphs[i].tex) SDL_DestroyTexture(f->glyphs[i].tex);
@@ -464,36 +464,36 @@ void Gui_font_free(long long fontid) {
 
 // ---- input: polled state -------------------------------------------------
 
-int Gui_mouse_x(void) { float x = 0, y = 0; SDL_GetMouseState(&x, &y); (void)y; return (int)x; }
-int Gui_mouse_y(void) { float x = 0, y = 0; SDL_GetMouseState(&x, &y); (void)x; return (int)y; }
+long long Win_mouse_x(void) { float x = 0, y = 0; SDL_GetMouseState(&x, &y); (void)y; return (int)x; }
+long long Win_mouse_y(void) { float x = 0, y = 0; SDL_GetMouseState(&x, &y); (void)x; return (int)y; }
 
-int Gui_mouse_pressed(void) {
+long long Win_mouse_pressed(void) {
     float x, y;
     return (SDL_GetMouseState(&x, &y) & SDL_BUTTON_LMASK) ? 1 : 0;
 }
 
-int Gui_key_down(int scancode) {
+long long Win_key_down(long long scancode) {
     int n = 0;
     const bool* state = SDL_GetKeyboardState(&n);   // bool*, not Uint8*
     if (!state || scancode < 0 || scancode >= n) return 0;
     return state[scancode] ? 1 : 0;
 }
 
-void Gui_delay(int ms) { if (ms > 0) SDL_Delay((Uint32)ms); }
+void Win_delay(long long ms) { if (ms > 0) SDL_Delay((Uint32)ms); }
 
 // ---- input: the event queue ---------------------------------------------
 
-int Gui_poll_event(void) {
+long long Win_poll_event(void) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
             case SDL_EVENT_QUIT:
                 g_running = 0;
-                return GUI_EV_QUIT;
+                return WIN_EV_QUIT;
 
             case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
                 g_running = 0;
-                return GUI_EV_QUIT;
+                return WIN_EV_QUIT;
 
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
             case SDL_EVENT_MOUSE_BUTTON_UP:
@@ -501,52 +501,52 @@ int Gui_poll_event(void) {
                 g_ev_y = (int)e.button.y;
                 g_ev_button = e.button.button;
                 g_ev_clicks = e.button.clicks;  // backend-provided; do not time by hand
-                return (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) ? GUI_EV_MOUSE_DOWN
-                                                               : GUI_EV_MOUSE_UP;
+                return (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) ? WIN_EV_MOUSE_DOWN
+                                                               : WIN_EV_MOUSE_UP;
 
             case SDL_EVENT_MOUSE_MOTION:
                 g_ev_x = (int)e.motion.x;
                 g_ev_y = (int)e.motion.y;
-                return GUI_EV_MOUSE_MOVE;
+                return WIN_EV_MOUSE_MOVE;
 
             case SDL_EVENT_MOUSE_WHEEL:
                 g_ev_x = (int)e.wheel.x;
                 g_ev_y = (int)e.wheel.y;
-                return GUI_EV_WHEEL;
+                return WIN_EV_WHEEL;
 
             case SDL_EVENT_KEY_DOWN:
                 g_ev_key = (int)e.key.scancode;
-                return GUI_EV_KEY_DOWN;
+                return WIN_EV_KEY_DOWN;
 
             case SDL_EVENT_KEY_UP:
                 g_ev_key = (int)e.key.scancode;
-                return GUI_EV_KEY_UP;
+                return WIN_EV_KEY_UP;
 
             case SDL_EVENT_TEXT_INPUT:
                 // e.text.text is valid only until the next SDL_PollEvent, so copy it.
                 snprintf(g_ev_text, sizeof(g_ev_text), "%s", e.text.text ? e.text.text : "");
-                return GUI_EV_TEXT;
+                return WIN_EV_TEXT;
 
             case SDL_EVENT_WINDOW_RESIZED:
                 g_ev_x = e.window.data1;
                 g_ev_y = e.window.data2;
-                return GUI_EV_RESIZE;
+                return WIN_EV_RESIZE;
 
             default:
                 break;   // uninteresting event: keep draining
         }
     }
-    return GUI_EV_NONE;
+    return WIN_EV_NONE;
 }
 
-int Gui_event_x(void)      { return g_ev_x; }
-int Gui_event_y(void)      { return g_ev_y; }
-int Gui_event_button(void) { return g_ev_button; }
-int Gui_event_key(void)    { return g_ev_key; }
-int Gui_event_clicks(void) { return g_ev_clicks; }
-const char* Gui_event_text(void) { return g_ev_text; }
+long long Win_event_x(void)      { return g_ev_x; }
+long long Win_event_y(void)      { return g_ev_y; }
+long long Win_event_button(void) { return g_ev_button; }
+long long Win_event_key(void)    { return g_ev_key; }
+long long Win_event_clicks(void) { return g_ev_clicks; }
+const char* Win_event_text(void) { return g_ev_text; }
 
-void Gui_text_input(long long winid, int enable) {
+void Win_text_input(long long winid, long long enable) {
     GuiWin* w = win_at(winid); if (!w) return;
     if (enable) SDL_StartTextInput(w->win);
     else        SDL_StopTextInput(w->win);

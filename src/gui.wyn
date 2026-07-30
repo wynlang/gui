@@ -8,85 +8,85 @@
 // Text needs nothing extra - stb_truetype is vendored.
 //
 // Usage:
-//   var win = Gui_window("My App", 800, 600)
-//   var font = Gui_font_default(14)
-//   while Gui_running(win) == 1 {
-//       Gui_clear(win, 30, 30, 30)
-//       Gui_rect(win, 10, 10, 200, 50, 0, 120, 255)
-//       Gui_text(win, font, "Hello", 20, 25, 255, 255, 255)
-//       Gui_present(win)
-//       Gui_delay(16)
+//   var win = Win_window("My App", 800, 600)
+//   var font = Win_font_default(14)
+//   while Win_running(win) == 1 {
+//       Win_clear(win, 30, 30, 30)
+//       Win_rect(win, 10, 10, 200, 50, 0, 120, 255)
+//       Win_text(win, font, "Hello", 20, 25, 255, 255, 255)
+//       Win_present(win)
+//       Win_delay(16)
 //   }
-//   Gui_close(win)
+//   Win_close(win)
 
 // ---- Lifecycle ------------------------------------------------------------
 
-extern fn Gui_window(title: string, width: int, height: int) -> int;
-extern fn Gui_running(win: int) -> int;
-extern fn Gui_close(win: int);
+extern fn Win_window(title: string, width: int, height: int) -> int;
+extern fn Win_running(win: int) -> int;
+extern fn Win_close(win: int);
 
 // 1 if a display is available. A program that may run headless (CI, ssh)
 // should check this and exit cleanly rather than draw into nothing.
-extern fn Gui_available() -> int;
+extern fn Win_available() -> int;
 
 // "sdl3" today. For diagnostics, and for tests that skip without a display.
-extern fn Gui_backend_name() -> string;
+extern fn Win_backend_name() -> string;
 
 // ---- Drawing --------------------------------------------------------------
 
-extern fn Gui_clear(win: int, r: int, g: int, b: int);
-extern fn Gui_rect(win: int, x: int, y: int, w: int, h: int, r: int, g: int, b: int);
-extern fn Gui_rect_outline(win: int, x: int, y: int, w: int, h: int, r: int, g: int, b: int);
-extern fn Gui_line(win: int, x1: int, y1: int, x2: int, y2: int, r: int, g: int, b: int);
-extern fn Gui_present(win: int);
+extern fn Win_clear(win: int, r: int, g: int, b: int);
+extern fn Win_rect(win: int, x: int, y: int, w: int, h: int, r: int, g: int, b: int);
+extern fn Win_rect_outline(win: int, x: int, y: int, w: int, h: int, r: int, g: int, b: int);
+extern fn Win_line(win: int, x1: int, y1: int, x2: int, y2: int, r: int, g: int, b: int);
+extern fn Win_present(win: int);
 
 // Restrict drawing to a rectangle; pass w or h <= 0 to clear the clip.
 // Any scrolling or clipped widget needs this.
-extern fn Gui_clip(win: int, x: int, y: int, w: int, h: int);
+extern fn Win_clip(win: int, x: int, y: int, w: int, h: int);
 
 // ---- Textures -------------------------------------------------------------
 //
-// Drawing an image with one Gui_rect per pixel is not slow, it is unusable:
+// Drawing an image with one Win_rect per pixel is not slow, it is unusable:
 // a 1024x768 view is 786k calls a frame. An image viewport is one upload
 // plus one blit.
 
-extern fn Gui_texture(win: int, width: int, height: int) -> int;
-extern fn Gui_texture_update(tex: int, rgba: ptr, w: int, h: int) -> int;
+extern fn Win_texture(win: int, width: int, height: int) -> int;
+extern fn Win_texture_update(tex: int, rgba: ptr, w: int, h: int) -> int;
 
 // Upload float32 RGBA, LINEAR and PREMULTIPLIED - the representation an
 // imaging core already holds. Converts to display encoding internally.
-extern fn Gui_texture_update_f32(tex: int, rgba: ptr, w: int, h: int) -> int;
+extern fn Win_texture_update_f32(tex: int, rgba: ptr, w: int, h: int) -> int;
 
-extern fn Gui_blit(win: int, tex: int, dx: int, dy: int, dw: int, dh: int);
-extern fn Gui_texture_free(tex: int);
+extern fn Win_blit(win: int, tex: int, dx: int, dy: int, dw: int, dh: int);
+extern fn Win_texture_free(tex: int);
 
 // ---- Text -----------------------------------------------------------------
 
 // Load a .ttf at a pixel size. Returns a handle, or -1.
-extern fn Gui_font(path: string, pixel_height: int) -> int;
+extern fn Win_font(path: string, pixel_height: int) -> int;
 
 // First font that exists among the platform defaults, so a program need not
 // ship a .ttf nor guess at per-OS font paths.
-extern fn Gui_font_default(pixel_height: int) -> int;
+extern fn Win_font_default(pixel_height: int) -> int;
 
-extern fn Gui_text(win: int, font: int, s: string, x: int, y: int, r: int, g: int, b: int);
+extern fn Win_text(win: int, font: int, s: string, x: int, y: int, r: int, g: int, b: int);
 
-// Width Gui_text would occupy. Layout needs this BEFORE drawing - to centre a
+// Width Win_text would occupy. Layout needs this BEFORE drawing - to centre a
 // label, size a button to its caption, or place a text cursor.
-extern fn Gui_text_width(font: int, s: string) -> int;
+extern fn Win_text_width(font: int, s: string) -> int;
 
 // Baseline-to-baseline distance; the natural line height.
-extern fn Gui_font_height(font: int) -> int;
+extern fn Win_font_height(font: int) -> int;
 
-extern fn Gui_font_free(font: int);
+extern fn Win_font_free(font: int);
 
 // ---- Input: polled state --------------------------------------------------
 
-extern fn Gui_mouse_x() -> int;
-extern fn Gui_mouse_y() -> int;
-extern fn Gui_mouse_pressed() -> int;
-extern fn Gui_key_down(scancode: int) -> int;
-extern fn Gui_delay(ms: int);
+extern fn Win_mouse_x() -> int;
+extern fn Win_mouse_y() -> int;
+extern fn Win_mouse_pressed() -> int;
+extern fn Win_key_down(scancode: int) -> int;
+extern fn Win_delay(ms: int);
 
 // ---- Input: the event queue ----------------------------------------------
 //
@@ -95,24 +95,24 @@ extern fn Gui_delay(ms: int);
 // between two polls is simply lost. Dragging, double-click, text entry and
 // focus all need the transitions, so a retained-widget toolkit needs the queue.
 
-extern fn Gui_poll_event() -> int;
-extern fn Gui_event_x() -> int;
-extern fn Gui_event_y() -> int;
-extern fn Gui_event_button() -> int;
-extern fn Gui_event_key() -> int;
+extern fn Win_poll_event() -> int;
+extern fn Win_event_x() -> int;
+extern fn Win_event_y() -> int;
+extern fn Win_event_button() -> int;
+extern fn Win_event_key() -> int;
 
 // 1 single, 2 double - reported by the platform, so do not hand-roll timing.
-extern fn Gui_event_clicks() -> int;
+extern fn Win_event_clicks() -> int;
 
-// For EV_TEXT: the typed UTF-8. Valid until the next Gui_poll_event().
-extern fn Gui_event_text() -> string;
+// For EV_TEXT: the typed UTF-8. Valid until the next Win_poll_event().
+extern fn Win_event_text() -> string;
 
 // Text input must be enabled explicitly: while active the OS may show an IME
 // candidate window and sends TEXT events instead of raw keys. A text field
 // enables on focus, disables on blur.
-extern fn Gui_text_input(win: int, enable: int);
+extern fn Win_text_input(win: int, enable: int);
 
-// Event kinds returned by Gui_poll_event()
+// Event kinds returned by Win_poll_event()
 var EV_NONE = 0
 var EV_QUIT = 1
 var EV_MOUSE_DOWN = 2
@@ -124,12 +124,12 @@ var EV_TEXT = 7
 var EV_WHEEL = 8
 var EV_RESIZE = 9
 
-// Mouse buttons reported by Gui_event_button()
+// Mouse buttons reported by Win_event_button()
 var MOUSE_LEFT = 1
 var MOUSE_MIDDLE = 2
 var MOUSE_RIGHT = 3
 
-// Scancodes for Gui_key_down() and Gui_event_key().
+// Scancodes for Win_key_down() and Win_event_key().
 // Physical key positions, unchanged from SDL2 (SDL3 kept the scancode table).
 var SCANCODE_A = 4
 var SCANCODE_B = 5

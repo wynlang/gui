@@ -1,0 +1,461 @@
+// widgets - a retained-mode widget toolkit for Wyn, in Wyn.
+//
+// "Retained" means you DECLARE the interface once and the toolkit remembers it,
+// rather than re-describing every control on every frame:
+//
+//     var ui = Ui_new(win, font)
+//     ui = Ui_button(ui, "Save", 20, 20, 100, 30, on_save)
+//     while Ui_run(ui) == 1 { ui = Ui_frame(ui) }
+//
+// That is the Visual Basic model, and it is the one a visual designer can
+// generate code for: a form is a list of controls with properties and event
+// handlers, which is a data structure. An immediate-mode UI has no such
+// structure - the interface exists only as the side effect of running the draw
+// loop - so there is nothing for a designer to round-trip.
+//
+// Handlers are `fn(int) -> void`, taking the widget id. One handler can
+// therefore serve several controls, and a handler never needs a pointer to the
+// toolkit - which matters, because Wyn closures cannot capture a mutable
+// reference to the surrounding state.
+//
+// WHY THE FUNCTIONS RETURN `Ui`
+//
+// Every mutating call takes a Ui and returns it (`ui = Ui_button(ui, ...)`).
+// That is not a style choice: Wyn passes structs by value, so a function that
+// modified `self` in place would modify a copy and silently do nothing. Threading
+// the value through makes the data flow explicit and correct. It is the same
+// reason the widget list is rebuilt rather than mutated through an alias.
+
+import gui
+
+// Widget kinds. Plain ints, because these cross into arrays and comparisons in
+// hot paths and an enum buys nothing here.
+var KIND_LABEL = 0
+var KIND_BUTTON = 1
+var KIND_CHECKBOX = 2
+var KIND_ENTRY = 3
+var KIND_PANEL = 4
+
+// A single control. One flat struct for every kind rather than a variant per
+// kind: a designer's property inspector wants a uniform field set to read and
+// write, and `checked` being meaningless on a label costs one int.
+pub struct Widget {
+    id: int,
+    kind: int,
+    x: int, y: int, w: int, h: int,
+    label: string,
+    checked: int,          // CHECKBOX: 0 or 1
+    text: string,          // ENTRY: current contents
+    enabled: int,          // 0 = greyed out and unclickable
+    on_click: fn(int) -> void
+}
+
+// The toolkit state.
+pub struct Ui {
+    win: int,
+    font: int,
+    widgets: [Widget],
+    next_id: int,
+    hot: int,              // id under the pointer, or -1
+    active: int,           // id being pressed, or -1
+    focus: int,            // id receiving keystrokes, or -1
+    mouse_x: int,
+    mouse_y: int,
+    running: int,
+    // Theme. Fields rather than constants so a designer can preview a theme
+    // without recompiling.
+    bg_r: int, bg_g: int, bg_b: int,
+    fg_r: int, fg_g: int, fg_b: int,
+    accent_r: int, accent_g: int, accent_b: int
+}
+
+fn noop_handler(id: int) { }
+
+pub fn Ui_new(win: int, font: int) -> Ui {
+    return Ui {
+        win: win,
+        font: font,
+        widgets: [],
+        next_id: 1,
+        hot: -1,
+        active: -1,
+        focus: -1,
+        mouse_x: -1,
+        mouse_y: -1,
+        running: 1,
+        bg_r: 28, bg_g: 28, bg_b: 34,
+        fg_r: 235, fg_g: 235, fg_b: 240,
+        accent_r: 70, accent_g: 110, accent_b: 170
+    }
+}
+
+// ---- construction --------------------------------------------------------
+//
+// Each returns the Ui; the new widget's id is `ui.next_id - 1` afterwards, or
+// read it back with Ui_last_id().
+
+pub fn Ui_label(ui: Ui, text: string, x: int, y: int) -> Ui {
+    var u = ui
+    u.widgets.push(Widget {
+        id: u.next_id, kind: KIND_LABEL, x: x, y: y, w: 0, h: 0,
+        label: text, checked: 0, text: "", enabled: 1, on_click: noop_handler
+    })
+    u.next_id = u.next_id + 1
+    return u
+}
+
+pub fn Ui_button(ui: Ui, text: string, x: int, y: int, w: int, h: int,
+                 handler: fn(int) -> void) -> Ui {
+    var u = ui
+    u.widgets.push(Widget {
+        id: u.next_id, kind: KIND_BUTTON, x: x, y: y, w: w, h: h,
+        label: text, checked: 0, text: "", enabled: 1, on_click: handler
+    })
+    u.next_id = u.next_id + 1
+    return u
+}
+
+pub fn Ui_checkbox(ui: Ui, text: string, x: int, y: int, checked: int,
+                   handler: fn(int) -> void) -> Ui {
+    var u = ui
+    u.widgets.push(Widget {
+        id: u.next_id, kind: KIND_CHECKBOX, x: x, y: y, w: 18, h: 18,
+        label: text, checked: checked, text: "", enabled: 1, on_click: handler
+    })
+    u.next_id = u.next_id + 1
+    return u
+}
+
+pub fn Ui_entry(ui: Ui, initial: string, x: int, y: int, w: int, h: int) -> Ui {
+    var u = ui
+    u.widgets.push(Widget {
+        id: u.next_id, kind: KIND_ENTRY, x: x, y: y, w: w, h: h,
+        label: "", checked: 0, text: initial, enabled: 1, on_click: noop_handler
+    })
+    u.next_id = u.next_id + 1
+    return u
+}
+
+pub fn Ui_panel(ui: Ui, x: int, y: int, w: int, h: int) -> Ui {
+    var u = ui
+    u.widgets.push(Widget {
+        id: u.next_id, kind: KIND_PANEL, x: x, y: y, w: w, h: h,
+        label: "", checked: 0, text: "", enabled: 1, on_click: noop_handler
+    })
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// Id of the most recently added widget.
+pub fn Ui_last_id(ui: Ui) -> int {
+    return ui.next_id - 1
+}
+
+// ---- queries -------------------------------------------------------------
+
+pub fn Ui_hit(w: Widget, mx: int, my: int) -> int {
+    if mx < w.x { return 0 }
+    if my < w.y { return 0 }
+    if mx >= w.x + w.w { return 0 }
+    if my >= w.y + w.h { return 0 }
+    return 1
+}
+
+pub fn Ui_checked(ui: Ui, id: int) -> int {
+    var i = 0
+    while i < ui.widgets.len() {
+        if ui.widgets[i].id == id { return ui.widgets[i].checked }
+        i = i + 1
+    }
+    return 0
+}
+
+pub fn Ui_text(ui: Ui, id: int) -> string {
+    var i = 0
+    while i < ui.widgets.len() {
+        if ui.widgets[i].id == id { return ui.widgets[i].text }
+        i = i + 1
+    }
+    return ""
+}
+
+pub fn Ui_set_label(ui: Ui, id: int, s: string) -> Ui {
+    var u = ui
+    var i = 0
+    while i < u.widgets.len() {
+        if u.widgets[i].id == id { u.widgets[i].label = s }
+        i = i + 1
+    }
+    return u
+}
+
+pub fn Ui_set_enabled(ui: Ui, id: int, on: int) -> Ui {
+    var u = ui
+    var i = 0
+    while i < u.widgets.len() {
+        if u.widgets[i].id == id { u.widgets[i].enabled = on }
+        i = i + 1
+    }
+    return u
+}
+
+pub fn Ui_running(ui: Ui) -> int {
+    return ui.running
+}
+
+// ---- events --------------------------------------------------------------
+
+// Drain the queue and update hot/active/focus, firing handlers on click.
+//
+// A press must be tracked from down to up, not fired on down: a click is only a
+// click if it is RELEASED over the same control it started on. Firing on
+// mouse-down means dragging off a button still activates it, which every real
+// toolkit treats as a cancel.
+pub fn Ui_events(ui: Ui) -> Ui {
+    var u = ui
+    var ev = gui.Win_poll_event()
+    while ev != gui.EV_NONE {
+        if ev == gui.EV_QUIT {
+            u.running = 0
+        }
+        if ev == gui.EV_MOUSE_MOVE {
+            u.mouse_x = gui.Win_event_x()
+            u.mouse_y = gui.Win_event_y()
+        }
+        if ev == gui.EV_MOUSE_DOWN {
+            u.mouse_x = gui.Win_event_x()
+            u.mouse_y = gui.Win_event_y()
+            u.active = -1
+            u.focus = -1
+            var i = 0
+            while i < u.widgets.len() {
+                var w = u.widgets[i]
+                if w.enabled == 1 {
+                    if Ui_hit(w, u.mouse_x, u.mouse_y) == 1 {
+                        if w.kind == KIND_BUTTON { u.active = w.id }
+                        if w.kind == KIND_CHECKBOX { u.active = w.id }
+                        if w.kind == KIND_ENTRY {
+                            u.focus = w.id
+                            gui.Win_text_input(u.win, 1)
+                        }
+                    }
+                }
+                i = i + 1
+            }
+            if u.focus == -1 { gui.Win_text_input(u.win, 0) }
+        }
+        if ev == gui.EV_MOUSE_UP {
+            u.mouse_x = gui.Win_event_x()
+            u.mouse_y = gui.Win_event_y()
+            var j = 0
+            while j < u.widgets.len() {
+                var wu = u.widgets[j]
+                // Released over the SAME widget the press began on.
+                if wu.id == u.active {
+                    if Ui_hit(wu, u.mouse_x, u.mouse_y) == 1 {
+                        if wu.kind == KIND_CHECKBOX {
+                            if wu.checked == 1 { u.widgets[j].checked = 0 }
+                            else { u.widgets[j].checked = 1 }
+                        }
+                        wu.on_click(wu.id)
+                    }
+                }
+                j = j + 1
+            }
+            u.active = -1
+        }
+        if ev == gui.EV_TEXT {
+            if u.focus != -1 {
+                var typed = gui.Win_event_text()
+                var k = 0
+                while k < u.widgets.len() {
+                    if u.widgets[k].id == u.focus {
+                        u.widgets[k].text = u.widgets[k].text + typed
+                    }
+                    k = k + 1
+                }
+            }
+        }
+        if ev == gui.EV_KEY_DOWN {
+            var key = gui.Win_event_key()
+            if key == gui.SCANCODE_ESCAPE { u.running = 0 }
+            if key == gui.SCANCODE_BACKSPACE {
+                if u.focus != -1 {
+                    var m = 0
+                    while m < u.widgets.len() {
+                        if u.widgets[m].id == u.focus {
+                            var t = u.widgets[m].text
+                            if t.len() > 0 {
+                                u.widgets[m].text = t.substring(0, t.len() - 1)
+                            }
+                        }
+                        m = m + 1
+                    }
+                }
+            }
+        }
+        ev = gui.Win_poll_event()
+    }
+
+    // Recompute `hot` from the last known pointer position. Done here rather
+    // than in the move handler so it is also correct after a widget moves or is
+    // added, without waiting for the next mouse motion.
+    u.hot = -1
+    var h = 0
+    while h < u.widgets.len() {
+        var hw = u.widgets[h]
+        if hw.enabled == 1 {
+            if hw.kind != KIND_LABEL {
+                if hw.kind != KIND_PANEL {
+                    if Ui_hit(hw, u.mouse_x, u.mouse_y) == 1 { u.hot = hw.id }
+                }
+            }
+        }
+        h = h + 1
+    }
+    return u
+}
+
+// ---- drawing -------------------------------------------------------------
+
+fn draw_widget(ui: Ui, w: Widget) {
+    var win = ui.win
+    var font = ui.font
+
+    if w.kind == KIND_PANEL {
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 38, 38, 46)
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, 60, 60, 72)
+        return
+    }
+
+    if w.kind == KIND_LABEL {
+        var lr = ui.fg_r
+        var lg = ui.fg_g
+        var lb = ui.fg_b
+        if w.enabled == 0 {
+            lr = 110
+            lg = 110
+            lb = 120
+        }
+        gui.Win_text(win, font, w.label, w.x, w.y, lr, lg, lb)
+        return
+    }
+
+    if w.kind == KIND_BUTTON {
+        // Three visual states, because a button with no feedback feels broken
+        // even when it works: idle, hover, and pressed.
+        var br = 50
+        var bg = 50
+        var bb = 60
+        if w.enabled == 0 {
+            br = 40
+            bg = 40
+            bb = 46
+        } else {
+            if w.id == ui.active {
+                br = ui.accent_r - 20
+                bg = ui.accent_g - 20
+                bb = ui.accent_b - 20
+            } else {
+                if w.id == ui.hot {
+                    br = ui.accent_r
+                    bg = ui.accent_g
+                    bb = ui.accent_b
+                }
+            }
+        }
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, br, bg, bb)
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, 120, 120, 140)
+
+        // Centre the caption. This needs the measured width, which is why
+        // Win_text_width has to exist in the backend.
+        var tw = gui.Win_text_width(font, w.label)
+        var th = gui.Win_font_height(font)
+        var tr = ui.fg_r
+        var tg = ui.fg_g
+        var tb = ui.fg_b
+        if w.enabled == 0 {
+            tr = 110
+            tg = 110
+            tb = 120
+        }
+        gui.Win_text(win, font, w.label,
+                     w.x + (w.w - tw) / 2, w.y + (w.h - th) / 2, tr, tg, tb)
+        return
+    }
+
+    if w.kind == KIND_CHECKBOX {
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 45, 45, 54)
+        // NB: not `or` - that is a reserved keyword in Wyn (and/or/not are
+        // canonical), and using one as a variable name reports only
+        // "Expected variable name" while pointing at the name.
+        var br2 = 120
+        var bg2 = 120
+        var bb2 = 140
+        if w.id == ui.hot {
+            br2 = ui.accent_r
+            bg2 = ui.accent_g
+            bb2 = ui.accent_b
+        }
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, br2, bg2, bb2)
+        if w.checked == 1 {
+            gui.Win_rect(win, w.x + 4, w.y + 4, w.w - 8, w.h - 8,
+                         ui.accent_r + 40, ui.accent_g + 40, ui.accent_b + 40)
+        }
+        var ch = gui.Win_font_height(font)
+        gui.Win_text(win, font, w.label, w.x + w.w + 8,
+                     w.y + (w.h - ch) / 2, ui.fg_r, ui.fg_g, ui.fg_b)
+        return
+    }
+
+    if w.kind == KIND_ENTRY {
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 18, 18, 22)
+        var er = 120
+        var eg = 120
+        var eb = 140
+        if w.id == ui.focus {
+            er = ui.accent_r
+            eg = ui.accent_g
+            eb = ui.accent_b
+        }
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, er, eg, eb)
+
+        // Clip, so long text stops at the border instead of painting across the
+        // rest of the form.
+        gui.Win_clip(win, w.x + 1, w.y + 1, w.w - 2, w.h - 2)
+        var eh = gui.Win_font_height(font)
+        gui.Win_text(win, font, w.text, w.x + 5, w.y + (w.h - eh) / 2,
+                     ui.fg_r, ui.fg_g, ui.fg_b)
+        if w.id == ui.focus {
+            var cw = gui.Win_text_width(font, w.text)
+            gui.Win_rect(win, w.x + 6 + cw, w.y + 4, 2, w.h - 8,
+                         ui.fg_r, ui.fg_g, ui.fg_b)
+        }
+        gui.Win_clip(win, 0, 0, 0, 0)
+        return
+    }
+}
+
+// Draw every widget, in declaration order, so a panel declared first sits
+// behind the controls placed on it.
+pub fn Ui_draw(ui: Ui) {
+    gui.Win_clear(ui.win, ui.bg_r, ui.bg_g, ui.bg_b)
+    var i = 0
+    while i < ui.widgets.len() {
+        draw_widget(ui, ui.widgets[i])
+        i = i + 1
+    }
+    gui.Win_present(ui.win)
+}
+
+// One frame: events, then draw, then yield the CPU.
+//
+// The delay is not decoration. Without it this loop spins a core at 100%, which
+// on a laptop is audible within seconds - and a form that is idle 99% of the
+// time has no reason to burn a core.
+pub fn Ui_frame(ui: Ui) -> Ui {
+    var u = Ui_events(ui)
+    Ui_draw(u)
+    gui.Win_delay(16)
+    return u
+}

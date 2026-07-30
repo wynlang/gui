@@ -1,0 +1,82 @@
+// A form built the Visual Basic way: declare the controls once, wire each to a
+// handler, then run the loop. Nothing here re-describes the interface per frame.
+//
+//   WYN_ROOT=/path/to/wyn  wyn run examples/form.wyn
+//
+// Build the backend first: ./csrc/build.sh
+//
+// This is also the shape a visual designer emits - which is why the toolkit
+// keeps the controls as DATA. A form is a list of controls with properties and
+// handler names; that round-trips to and from a designer. An immediate-mode UI
+// cannot, because its interface exists only as a side effect of the draw loop.
+
+import gui
+import widgets
+
+// Handlers take the widget id, so one function can serve several controls and
+// no handler needs a reference to the toolkit - Wyn closures cannot capture a
+// mutable reference to the surrounding state, so a design that required one
+// would not work.
+fn on_save(id: int) {
+    println("Save clicked (widget " + id.to_string() + ")")
+}
+
+fn on_load(id: int) {
+    println("Load clicked (widget " + id.to_string() + ")")
+}
+
+fn on_toggle(id: int) {
+    println("Checkbox " + id.to_string() + " toggled")
+}
+
+fn main() {
+    if gui.Win_available() == 0 {
+        println("no display available - skipping")
+        return
+    }
+
+    var win = gui.Win_window("Wyn widgets - a form", 520, 380)
+    if win < 0 {
+        println("could not open a window")
+        return
+    }
+    var font = gui.Win_font_default(15)
+    if font < 0 {
+        println("no font found")
+        gui.Win_close(win)
+        return
+    }
+
+    // --- declare the form, once -------------------------------------------
+    var ui = widgets.Ui_new(win, font)
+
+    ui = widgets.Ui_label(ui, "A retained-mode form in Wyn", 24, 20)
+    ui = widgets.Ui_panel(ui, 20, 50, 480, 120)
+    ui = widgets.Ui_label(ui, "Name:", 36, 70)
+    ui = widgets.Ui_entry(ui, "", 100, 64, 240, 28)
+    var name_id = widgets.Ui_last_id(ui)
+
+    ui = widgets.Ui_checkbox(ui, "Remember me", 36, 110, 1, on_toggle)
+    var remember_id = widgets.Ui_last_id(ui)
+
+    ui = widgets.Ui_button(ui, "Save", 36, 200, 100, 34, on_save)
+    ui = widgets.Ui_button(ui, "Load", 150, 200, 100, 34, on_load)
+
+    ui = widgets.Ui_button(ui, "Disabled", 264, 200, 100, 34, on_save)
+    var disabled_id = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_enabled(ui, disabled_id, 0)
+
+    ui = widgets.Ui_label(ui, "Click a field and type. Esc to quit.", 24, 320)
+
+    // --- run --------------------------------------------------------------
+    while widgets.Ui_running(ui) == 1 {
+        ui = widgets.Ui_frame(ui)
+    }
+
+    // The form is data, so reading the result back is just a query.
+    println("name entered: '" + widgets.Ui_text(ui, name_id) + "'")
+    println("remember me:  " + widgets.Ui_checked(ui, remember_id).to_string())
+
+    gui.Win_font_free(font)
+    gui.Win_close(win)
+}
