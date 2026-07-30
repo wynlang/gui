@@ -54,6 +54,18 @@ var KIND_CHECKBOX = 2
 var KIND_ENTRY = 3
 var KIND_PANEL = 4
 var KIND_TEXTAREA = 5
+// Kind numbers are APPEND-ONLY. A saved document stores the kind as a NAME
+// (see Ui_kind_name), so renumbering would not corrupt files - but it would
+// silently reinterpret every `Ui_add_raw(.., 7, ..)` a generator emitted.
+var KIND_RADIO = 6
+var KIND_DROPDOWN = 7
+var KIND_SLIDER = 8
+var KIND_PROGRESS = 9
+var KIND_LISTBOX = 10
+var KIND_TABS = 11
+var KIND_GROUPBOX = 12
+var KIND_SPINNER = 13
+var KIND_MENUBAR = 14
 
 // A single control. One flat struct for every kind rather than a variant per
 // kind: a designer's property inspector wants a uniform field set to read and
@@ -102,7 +114,80 @@ pub struct Widget {
     lines: [string],
     caret_line: int,       // 0-based line the caret is on
     caret_col: int,        // 0-based column, 0 .. len(line)
-    scroll_line: int       // first visible line (vertical scrolling)
+    scroll_line: int,      // first visible line (vertical scrolling)
+
+    // ---- RADIO group identity ----
+    //
+    // The group name lives HERE, in the widget, not in a side table on the Ui.
+    // That is the whole design decision for radios and it is deliberate:
+    //
+    //  - A side table is a second structure that has to be kept in step with the
+    //    widget list. Delete a widget and the table still names it; load a
+    //    document and the table has to be rebuilt from it. Both are the class of
+    //    bug where the UI works until you edit it.
+    //  - The document is a flat list of widgets with a uniform field set
+    //    (Form_to_json writes exactly that). A group table would need a second
+    //    top-level JSON key, a loader for it, and a diff for it.
+    //  - A designer's property inspector edits a STRING field. Retyping "colors"
+    //    to "sizes" moves a radio between groups with no other bookkeeping.
+    //
+    // So exclusivity is a QUERY over the list ("clear checked on every RADIO with
+    // the same group") rather than stored state. Two radios are in one group iff
+    // their `group` strings are equal.
+    group: string,
+
+    // ---- DROPDOWN / LISTBOX / TABS / MENUBAR items ----
+    //
+    // One [string] shared by the four list-shaped kinds instead of four fields:
+    // the flat-struct rationale at the top applies, and a property inspector then
+    // has one "items" editor rather than four that differ only in name.
+    //
+    // MENUBAR packs two levels into it: each element is "File|New|Open|Save",
+    // i.e. the top-level title then its entries. A [[string]] is what this wants
+    // and Wyn has no nested array literal in a struct field that survives the
+    // module boundary, so the encoding is explicit and Ui_menu_item() decodes it.
+    items: [string],
+    sel: int,              // DROPDOWN/LISTBOX/TABS: selected index, -1 = none
+    open: int,             // DROPDOWN/MENUBAR: index of the open overlay, -1 = closed
+    scroll: int,           // LISTBOX: first visible row
+
+    // ---- SLIDER / PROGRESS / SPINNER numeric range ----
+    //
+    // Ints, not floats. Every one of these is ultimately a pixel position or a
+    // typed integer, a float range would need an epsilon in every comparison, and
+    // `step` only means anything on a discrete range. A PROGRESS bar's 0..1 is
+    // exposed as a float by Ui_progress_frac() and stored as val/vmin/vmax.
+    val: int,
+    vmin: int,
+    vmax: int,
+    vstep: int,            // SLIDER/SPINNER: quantum; <= 0 means 1
+
+    // ---- TOOLTIP hover dwell ----
+    //
+    // THE reason retained mode pays for itself. A tooltip appears after the
+    // pointer has RESTED for a while, so it needs to know when the hover began -
+    // state that must survive between frames. An immediate-mode UI has nowhere to
+    // put this; here it is a field.
+    //
+    // hover_since is a Time.now_millis() stamp, or 0 for "not hovering". 0 rather
+    // than -1 because an absent stamp and "hovered at time 0" must not be
+    // distinguishable by accident: Ui_tooltip_visible treats 0 as not hovering.
+    tooltip: string,
+    hover_since: int,
+
+    // ---- containment: TABS pages and GROUPBOX children ----
+    //
+    // `owner` is the id of the containing widget, or -1 for a top-level control.
+    // `page` is which tab page this widget belongs to, or -1 for "always shown"
+    // (which is what a GROUPBOX child, and every widget outside a TABS, is).
+    //
+    // A parent-pointer rather than a child list: a child list would duplicate the
+    // ordering already in `widgets` and could disagree with it, and Ui_delete
+    // would have to unlink from it. With a parent pointer a deleted container
+    // leaves orphans that Ui_visible() treats as top-level - degraded, but not
+    // corrupt.
+    owner: int,
+    page: int
 }
 
 // The toolkit state.
@@ -130,10 +215,159 @@ pub struct Ui {
     // without recompiling.
     bg_r: int, bg_g: int, bg_b: int,
     fg_r: int, fg_g: int, fg_b: int,
-    accent_r: int, accent_g: int, accent_b: int
+    accent_r: int, accent_g: int, accent_b: int,
+
+    // Milliseconds the pointer must REST on a widget before its tooltip appears.
+    // A field rather than a constant because it is the one tooltip number anyone
+    // ever wants to change, and because a test must be able to set it to 0 to
+    // assert the appearance without sleeping.
+    tooltip_delay: int,
+
+    // Injectable clock. Ui_events stamps hover_since from Time.now_millis(), but
+    // a TEST cannot wait 600ms per assertion and must not sleep to prove a timer.
+    // Setting this to a non-zero value makes the toolkit read time from here
+    // instead, so a test advances the clock by assignment. 0 = use the real one.
+    //
+    // This is the same reason the drag/slider path takes explicit coordinates:
+    // anything that depends on the outside world has to be substitutable or the
+    // behaviour is untestable, and untestable timing code is where tooltips
+    // always break (they appear immediately, or never).
+    fake_now: int,
+
+    // Which drag is in progress: the id of a SLIDER whose thumb is held, or -1.
+    // Separate from `active` because a slider tracks the pointer while it is
+    // down - a mouse-move with `drag` set changes the value, whereas `active` on
+    // a button only decides whether the release counts as a click.
+    drag: int
 }
 
 fn noop_handler(id: int) { }
+
+// Invoke a widget's handler.
+//
+// The call has to be spelled `wd.on_click(wd.id)` on a LOCAL bound to the array
+// element, and nothing else works:
+//
+//   u.widgets[i].on_click(id)   - "struct 'Widget' has no field 'on_click'"
+//   var h = wd.on_click; h(id)  - same, then "'h' is not a function"
+//
+// Only the direct member call on a local resolves the function-typed field. So
+// every dispatch site copies the element into a local and calls through it, and
+// this helper is where that shape lives so a new dispatch path cannot rediscover
+// it the hard way. `fire` takes the (ui, index) pair rather than a Widget for the
+// same reason line_copy does: a Widget PARAMETER hits the same checker path.
+fn fire(u: Ui, i: int) {
+    var wd = u.widgets[i]
+    wd.on_click(wd.id)
+}
+
+// ---- numeric helpers for SLIDER / SPINNER / PROGRESS ---------------------
+
+// Quantise `v` onto the [lo, hi] range in multiples of `step` counted FROM lo.
+//
+// From lo, not from zero: a 10..50 range with step 5 must admit 10, and
+// `v - v % step` would give 10 only by luck (it gives 10 here, but a 12..50 range
+// would then never produce 12, and its own minimum would be unreachable - which
+// looks like a broken widget, not an off-by-two).
+//
+// The clamp happens AFTER the snap, so a value snapping past `hi` lands on `hi`
+// rather than outside the range. Note `hi` itself may not be on the step grid
+// (10..53 step 5); the endpoints always win over the grid, because a slider whose
+// thumb cannot reach the right edge reads as broken.
+fn clamp_step(v: int, lo: int, hi: int, step: int) -> int {
+    if hi < lo { return lo }
+    var st = step
+    if st <= 0 { st = 1 }
+    var t = v
+    if t <= lo { return lo }
+    if t >= hi { return hi }
+    var off = t - lo
+    // Round to the NEAREST step, not down. Truncating makes a drag feel like it
+    // lags the pointer by up to a whole step in one direction only.
+    var q = ((off + st / 2) / st) * st
+    t = lo + q
+    if t > hi { t = hi }
+    if t < lo { t = lo }
+    return t
+}
+
+// A 0..1 float as the 0..1000 int a PROGRESS bar stores. Out-of-range input is
+// clamped rather than rejected: "97 of 95 files" happens, and a bar that draws
+// past its own border for it is worse than one that reads full.
+// NB the local is `ft`, not `t`. A local's inferred type is registered per-NAME
+// rather than per-scope (the same compiler bug the fix_caret comment documents
+// for `x`), so a `var t` bound to a FLOAT here retypes every other `var t` in
+// this module - including the two bound to strings in the spinner path, whose
+// `t.len()` and `t.substring(...)` then fail as "Unknown method for type
+// 'float'". It surfaces only when the compile order happens to put this function
+// first, so it is latent until an unrelated edit exposes it, and the error names
+// neither this line nor this function. Every numeric scratch local in this
+// module is therefore spelled distinctly on purpose.
+fn frac_to_val(f: float) -> int {
+    var ft = f
+    if ft < 0.0 { ft = 0.0 }
+    if ft > 1.0 { ft = 1.0 }
+    return (ft * 1000.0).to_int()
+}
+
+// Parse an integer out of user-typed text, tolerating junk and a leading minus.
+//
+// Hand-rolled rather than `s.to_int()`: a SPINNER's buffer is whatever the user
+// has typed so far, including "" and "-" and "12x", and the commit path needs a
+// definite number for every one of those rather than an error. Digits are taken
+// until the first non-digit, so "12x" is 12 - which is what a numeric field that
+// has just been pasted into should show.
+fn parse_int_lenient(s: string, dflt: int) -> int {
+    var i = 0
+    var neg = 0
+    if s.len() > 0 {
+        if s.substring(0, 1) == "-" {
+            neg = 1
+            i = 1
+        }
+    }
+    var seen = 0
+    var acc = 0
+    while i < s.len() {
+        var c = s.substring(i, i + 1)
+        var d = digit_val(c)
+        if d < 0 {
+            i = s.len()
+        } else {
+            acc = acc * 10 + d
+            seen = 1
+            i = i + 1
+        }
+    }
+    if seen == 0 { return dflt }
+    if neg == 1 { return 0 - acc }
+    return acc
+}
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return 0 - 1
+}
+
+// The toolkit's idea of "now", in milliseconds.
+//
+// Every timing decision reads the clock through here so a test can substitute
+// one. See the fake_now note on Ui: a tooltip test that slept would take longer
+// than the whole rest of the suite and would still be a flaky assertion about
+// scheduling rather than a claim about the dwell logic.
+fn ui_now(ui: Ui) -> int {
+    if ui.fake_now != 0 { return ui.fake_now }
+    return Time.now_millis()
+}
 
 // ---- line-buffer helpers -------------------------------------------------
 //
@@ -209,6 +443,21 @@ fn line_copy(ui: Ui, i: int, n: int) -> string {
     return "" + ui.widgets[i].lines[n]
 }
 
+// Read widget i's item n as a FRESH string.
+//
+// The exact analogue of line_copy for the `items` array, and it exists for the
+// exact same reason - a direct `ui.widgets[i].items[n]` in a module function
+// returning Ui emits a borrowed pointer plus a scope-exit release, which frees
+// the string the array still holds. Read the line_copy comment above; every
+// symptom there (an item that reads back empty after being touched once) applies
+// here verbatim. There is no way to share one function between the two arrays:
+// an array PARAMETER in a module function miscompiles.
+fn item_copy(ui: Ui, i: int, n: int) -> string {
+    if n < 0 { return "" }
+    if n >= ui.widgets[i].items.len() { return "" }
+    return "" + ui.widgets[i].items[n]
+}
+
 fn insert_line_at(ui: Ui, i: int, at: int, s: string) -> Ui {
     var u = ui
     var out: [string] = []
@@ -246,7 +495,10 @@ pub fn Ui_new(win: int, font: int) -> Ui {
         running: 1,
         bg_r: 28, bg_g: 28, bg_b: 34,
         fg_r: 235, fg_g: 235, fg_b: 240,
-        accent_r: 70, accent_g: 110, accent_b: 170
+        accent_r: 70, accent_g: 110, accent_b: 170,
+        tooltip_delay: 600,
+        fake_now: 0,
+        drag: 0 - 1
     }
 }
 
@@ -266,6 +518,7 @@ fn make_widget(id: int, kind: int, x: int, y: int, w: int, h: int,
                handler: fn(int) -> void) -> Widget {
     var ls: [string] = []
     ls.push(text)
+    var its: [string] = []
     return Widget {
         id: id, kind: kind, x: x, y: y, w: w, h: h,
         label: label, checked: checked, text: text, enabled: 1,
@@ -276,7 +529,15 @@ fn make_widget(id: int, kind: int, x: int, y: int, w: int, h: int,
         // same when it loads with these defaults.
         anchor_left: 1, anchor_right: 0,
         anchor_top: 1, anchor_bottom: 0,
-        lines: ls, caret_line: 0, caret_col: 0, scroll_line: 0
+        lines: ls, caret_line: 0, caret_col: 0, scroll_line: 0,
+        group: "",
+        items: its, sel: 0 - 1, open: 0 - 1, scroll: 0,
+        // A 0..100 range, so a SLIDER or SPINNER placed by a designer with no
+        // properties set is immediately draggable rather than a dead 0..0 track
+        // that Ui_slider_frac would have to special-case.
+        val: 0, vmin: 0, vmax: 100, vstep: 1,
+        tooltip: "", hover_since: 0,
+        owner: 0 - 1, page: 0 - 1
     }
 }
 
@@ -333,6 +594,195 @@ pub fn Ui_textarea(ui: Ui, initial: string, x: int, y: int, w: int, h: int) -> U
     var wd = make_widget(u.next_id, KIND_TEXTAREA, x, y, w, h,
                          "", 0, initial, noop_handler)
     wd.lines = split_lines(initial)
+    u.widgets.push(wd)
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// ---- the expanded widget set ---------------------------------------------
+//
+// Every constructor below follows the same three rules as the six above, and
+// they are worth stating because a new kind that breaks any of them is a bug the
+// designer only finds later:
+//
+//  1. Funnel through make_widget, so a new Widget field cannot be forgotten.
+//  2. Give w/h a sensible non-zero default when the caller has no reason to care
+//     (a 0x0 control is invisible AND unhittable, so it reads as "nothing was
+//     added" rather than "the size is wrong").
+//  3. Never touch `enabled`, `owner` or `page` - a caller sets those afterwards
+//     via Ui_set_enabled / Ui_set_owner / Ui_set_page. Passing them here would
+//     make every constructor take four arguments nobody uses.
+
+// A radio button. `group` is the exclusivity domain: checking this one clears
+// every other RADIO with the same group string, and radios with different
+// groups are independent.
+//
+// `checked` at construction is honoured verbatim rather than being run through
+// the exclusivity rule, because a form's initial state comes from the document
+// and silently "fixing" it would make a hand-written JSON with two checked
+// radios load as something the file does not say. Ui_radio_select is what
+// enforces the invariant; declaring a bad initial state is the author's error
+// and stays visible.
+pub fn Ui_radio(ui: Ui, text: string, group: string, x: int, y: int,
+                checked: int, handler: fn(int) -> void) -> Ui {
+    var u = ui
+    var wd = make_widget(u.next_id, KIND_RADIO, x, y, 16, 16,
+                         text, checked, "", handler)
+    wd.group = group
+    u.widgets.push(wd)
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// A dropdown / combo box. `items` is a newline-separated list, for the same
+// reason Ui_textarea takes newline-separated text: it is what a JSON document
+// field and a designer's multi-line property editor both naturally hold, and it
+// avoids an array PARAMETER, which a module function cannot take (see the
+// join_lines_at note above).
+//
+// Starts CLOSED with the given selection. sel = -1 means "nothing chosen", which
+// draws as an empty box - a legitimate state for a required field.
+pub fn Ui_dropdown(ui: Ui, items: string, x: int, y: int, w: int, h: int,
+                   sel: int, handler: fn(int) -> void) -> Ui {
+    var u = ui
+    var wd = make_widget(u.next_id, KIND_DROPDOWN, x, y, w, h,
+                         "", 0, "", handler)
+    wd.items = split_lines(items)
+    wd.sel = sel
+    wd.open = 0 - 1
+    u.widgets.push(wd)
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// A horizontal slider. Dragging the thumb or clicking the track sets the value,
+// quantised to `step` and clamped to [vmin, vmax].
+pub fn Ui_slider(ui: Ui, x: int, y: int, w: int, h: int,
+                 vmin: int, vmax: int, step: int, val: int,
+                 handler: fn(int) -> void) -> Ui {
+    var u = ui
+    var wd = make_widget(u.next_id, KIND_SLIDER, x, y, w, h,
+                         "", 0, "", handler)
+    wd.vmin = vmin
+    wd.vmax = vmax
+    wd.vstep = step
+    wd.val = clamp_step(val, vmin, vmax, step)
+    u.widgets.push(wd)
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// A progress bar. No interaction at all - it is the one widget here that is
+// pure output, which is why it never takes focus and never appears in the Tab
+// order (see Ui_focusable).
+//
+// The API is 0..1 as a float because that is how a caller thinks about progress
+// ("0.35 done"), while the storage is val over 0..1000. Ints avoid an epsilon in
+// every comparison, and 1000 steps is finer than any bar is wide in pixels.
+pub fn Ui_progress(ui: Ui, x: int, y: int, w: int, h: int, frac: float) -> Ui {
+    var u = ui
+    var wd = make_widget(u.next_id, KIND_PROGRESS, x, y, w, h,
+                         "", 0, "", noop_handler)
+    wd.vmin = 0
+    wd.vmax = 1000
+    wd.vstep = 1
+    wd.val = frac_to_val(frac)
+    u.widgets.push(wd)
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// A scrollable single-selection list. `items` is newline-separated, as for
+// Ui_dropdown.
+pub fn Ui_listbox(ui: Ui, items: string, x: int, y: int, w: int, h: int,
+                  sel: int, handler: fn(int) -> void) -> Ui {
+    var u = ui
+    var wd = make_widget(u.next_id, KIND_LISTBOX, x, y, w, h,
+                         "", 0, "", handler)
+    wd.items = split_lines(items)
+    wd.sel = sel
+    wd.scroll = 0
+    u.widgets.push(wd)
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// A tab strip. `titles` is newline-separated; the widget occupies only the STRIP
+// (x, y, w, h is the strip, not the page area).
+//
+// The strip does not own the page content. Clicking a tab sets `sel`, and a
+// widget whose `page` equals `sel` is visible - which means the pages are
+// ordinary widgets in the same flat list, and the designer can select, move and
+// edit a control on a hidden tab by switching to it. A tab that owned a nested
+// widget list would need a second containment model and a second draw path.
+pub fn Ui_tabs(ui: Ui, titles: string, x: int, y: int, w: int, h: int,
+               sel: int, handler: fn(int) -> void) -> Ui {
+    var u = ui
+    var wd = make_widget(u.next_id, KIND_TABS, x, y, w, h,
+                         "", 0, "", handler)
+    wd.items = split_lines(titles)
+    wd.sel = sel
+    u.widgets.push(wd)
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// A titled panel with a border. Like KIND_PANEL but with a caption drawn into
+// the top edge, and it CLIPS its children (Ui_draw_at pushes its rect), which is
+// what makes it a container rather than a decoration.
+pub fn Ui_groupbox(ui: Ui, title: string, x: int, y: int, w: int, h: int) -> Ui {
+    var u = ui
+    u.widgets.push(make_widget(u.next_id, KIND_GROUPBOX, x, y, w, h,
+                               title, 0, "", noop_handler))
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// A numeric stepper: a typed field with up/down buttons on its right edge.
+//
+// `text` carries what the user has TYPED and `val` the committed number. They are
+// deliberately separate: while typing "1" on the way to "12" the buffer is not
+// yet a valid value for a 10..99 range, and clamping on every keystroke would
+// make the field impossible to type into (it would jump to 10 and then to 19).
+// Ui_spinner_commit reconciles them - on blur, on Enter, and on a button press.
+pub fn Ui_spinner(ui: Ui, x: int, y: int, w: int, h: int,
+                  vmin: int, vmax: int, step: int, val: int,
+                  handler: fn(int) -> void) -> Ui {
+    var u = ui
+    var v = clamp_step(val, vmin, vmax, step)
+    var wd = make_widget(u.next_id, KIND_SPINNER, x, y, w, h,
+                         "", 0, v.to_string(), handler)
+    wd.vmin = vmin
+    wd.vmax = vmax
+    wd.vstep = step
+    wd.val = v
+    u.widgets.push(wd)
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// A menu bar with pull-down menus. `spec` is one line per top-level menu, each
+// line pipe-separated: title first, then its entries.
+//
+//     "File|New|Open|Save\nEdit|Undo|Cut|Copy"
+//
+// Two levels in one [string] rather than a nested array, because an array field
+// of an array does not survive the module boundary (see the `items` note on
+// Widget). The encoding is ugly and it is one decode function, Ui_menu_item;
+// the alternative is a second widget kind per menu and a parent pointer per
+// entry, which is a lot of structure for a fixed two-level shape.
+//
+// A separator is the entry "-", which draws as a rule and cannot be chosen.
+pub fn Ui_menubar(ui: Ui, spec: string, x: int, y: int, w: int, h: int,
+                  handler: fn(int) -> void) -> Ui {
+    var u = ui
+    var wd = make_widget(u.next_id, KIND_MENUBAR, x, y, w, h,
+                         "", 0, "", handler)
+    wd.items = split_lines(spec)
+    wd.open = 0 - 1
+    // sel is the index of the LAST CHOSEN entry within the open menu, so a
+    // handler can ask what was picked. -1 until something is.
+    wd.sel = 0 - 1
     u.widgets.push(wd)
     u.next_id = u.next_id + 1
     return u
@@ -579,6 +1029,15 @@ pub fn Ui_kind_name(kind: int) -> string {
     if kind == KIND_ENTRY { return "entry" }
     if kind == KIND_PANEL { return "panel" }
     if kind == KIND_TEXTAREA { return "textarea" }
+    if kind == KIND_RADIO { return "radio" }
+    if kind == KIND_DROPDOWN { return "dropdown" }
+    if kind == KIND_SLIDER { return "slider" }
+    if kind == KIND_PROGRESS { return "progress" }
+    if kind == KIND_LISTBOX { return "listbox" }
+    if kind == KIND_TABS { return "tabs" }
+    if kind == KIND_GROUPBOX { return "groupbox" }
+    if kind == KIND_SPINNER { return "spinner" }
+    if kind == KIND_MENUBAR { return "menubar" }
     return "unknown"
 }
 
@@ -593,6 +1052,15 @@ pub fn Ui_kind_from_name(name: string) -> int {
     if name == "entry" { return KIND_ENTRY }
     if name == "panel" { return KIND_PANEL }
     if name == "textarea" { return KIND_TEXTAREA }
+    if name == "radio" { return KIND_RADIO }
+    if name == "dropdown" { return KIND_DROPDOWN }
+    if name == "slider" { return KIND_SLIDER }
+    if name == "progress" { return KIND_PROGRESS }
+    if name == "listbox" { return KIND_LISTBOX }
+    if name == "tabs" { return KIND_TABS }
+    if name == "groupbox" { return KIND_GROUPBOX }
+    if name == "spinner" { return KIND_SPINNER }
+    if name == "menubar" { return KIND_MENUBAR }
     return -1
 }
 
@@ -1200,6 +1668,1496 @@ pub fn Ui_delete(ui: Ui, id: int) -> Ui {
     return u
 }
 
+// ---- the expanded widget set: geometry ------------------------------------
+//
+// EVERY pixel formula the new widgets use lives in this section and is exposed
+// as a public function. That is not gold-plating: a test that wants to click the
+// middle of a slider has to compute a coordinate, and if it computes that
+// coordinate with its own copy of the formula it is asserting against itself -
+// it passes whether or not the widget agrees. Worse, the formulas depend on
+// Win_font_height, so a hardcoded pixel silently tests a different row on a
+// machine with a different default font.
+//
+// So the test asks the toolkit where the thing IS, then clicks there, then
+// asserts the STATE that resulted. The geometry and the behaviour are then
+// checked against each other rather than both against a guess.
+
+// Row height for every list-shaped overlay (dropdown list, listbox row, menu
+// entry). One number for all of them, because a dropdown whose rows are a
+// different height from the listbox next to it looks like a bug, and because a
+// single source means a test that computes a row offset is right for all three.
+fn row_h(ui: Ui) -> int {
+    var lh = gui.Win_font_height(ui.font)
+    if lh <= 0 { lh = 16 }
+    return lh + 6
+}
+
+pub fn Ui_row_h(ui: Ui) -> int {
+    return row_h(ui)
+}
+
+// Height of a GROUPBOX caption strip - the band its title occupies and its
+// children must not be drawn into.
+fn cap_h(ui: Ui) -> int {
+    var lh = gui.Win_font_height(ui.font)
+    if lh <= 0 { lh = 16 }
+    return lh + 4
+}
+
+// Width of a SPINNER's up/down buttons, and of a DROPDOWN's arrow gutter.
+// A constant rather than a proportion of h: at h = 20 a proportional button is
+// 6px wide and unhittable, which is the failure this avoids.
+var BTN_W = 16
+
+// ---- containment ----
+
+pub fn Ui_set_owner(ui: Ui, id: int, owner: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].owner = owner
+    return u
+}
+
+pub fn Ui_set_page(ui: Ui, id: int, page: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].page = page
+    return u
+}
+
+pub fn Ui_owner_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return -1 }
+    return ui.widgets[i].owner
+}
+
+pub fn Ui_page_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return -1 }
+    return ui.widgets[i].page
+}
+
+// Is widget i drawn and clickable this frame?
+//
+// A widget is hidden only by a TABS owner whose selection is not its page. An
+// ORPHAN (owner names a widget that no longer exists) is treated as visible:
+// deleting a container must degrade to "its children float free", never to "its
+// children vanish and cannot be selected to be fixed".
+fn is_visible(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    var p = ui.widgets[i].page
+    if p == -1 { return 1 }
+    var ow = ui.widgets[i].owner
+    if ow == -1 { return 1 }
+    var oi = Ui_index_of(ui, ow)
+    if oi == -1 { return 1 }
+    if ui.widgets[oi].kind != KIND_TABS { return 1 }
+    if ui.widgets[oi].sel == p { return 1 }
+    return 0
+}
+
+pub fn Ui_visible(ui: Ui, id: int) -> int {
+    return is_visible(ui, Ui_index_of(ui, id))
+}
+
+// Does this kind CONFINE its children to its own rectangle?
+//
+// GROUPBOX does; TABS does not, and that asymmetry is the whole containment
+// model. A tab strip's x/y/w/h is the STRIP, not the page area - its children
+// live below it - so clipping them to the strip would make every control on
+// every page invisible. TABS owns its children for VISIBILITY only (which page
+// is current); GROUPBOX owns them geometrically.
+fn clips_children(kind: int) -> int {
+    if kind == KIND_GROUPBOX { return 1 }
+    return 0
+}
+
+// The rectangle a container's children are confined to.
+//
+// For a GROUPBOX that is the area below the caption, inset by the border. For
+// anything else it is the widget's own rect - so a caller can ask any widget for
+// its content box without special-casing, and adding a second container kind
+// later is a change here and nowhere else.
+fn content_x(ui: Ui, i: int) -> int {
+    if ui.widgets[i].kind == KIND_GROUPBOX { return ui.widgets[i].x + 2 }
+    return ui.widgets[i].x
+}
+
+fn content_y(ui: Ui, i: int) -> int {
+    if ui.widgets[i].kind == KIND_GROUPBOX { return ui.widgets[i].y + cap_h(ui) }
+    return ui.widgets[i].y
+}
+
+fn content_w(ui: Ui, i: int) -> int {
+    if ui.widgets[i].kind == KIND_GROUPBOX { return ui.widgets[i].w - 4 }
+    return ui.widgets[i].w
+}
+
+fn content_h(ui: Ui, i: int) -> int {
+    if ui.widgets[i].kind == KIND_GROUPBOX {
+        return ui.widgets[i].h - cap_h(ui) - 2
+    }
+    return ui.widgets[i].h
+}
+
+pub fn Ui_content_x_of(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return content_x(ui, i)
+}
+
+pub fn Ui_content_y_of(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return content_y(ui, i)
+}
+
+pub fn Ui_content_w_of(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return content_w(ui, i)
+}
+
+pub fn Ui_content_h_of(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return content_h(ui, i)
+}
+
+// ---- items ----
+
+pub fn Ui_item_count(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].items.len()
+}
+
+pub fn Ui_item(ui: Ui, id: int, n: int) -> string {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return "" }
+    return item_copy(ui, i, n)
+}
+
+// Replace the item list. Newline-separated, exactly as the constructors take it.
+//
+// The selection is CLAMPED rather than reset: a designer retyping the item list
+// of a dropdown that already has a choice should not silently lose it, but a
+// selection past the new end would index out of range in the draw path.
+pub fn Ui_set_items(ui: Ui, id: int, s: string) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].items = split_lines(s)
+    var n = u.widgets[i].items.len()
+    if u.widgets[i].sel >= n { u.widgets[i].sel = n - 1 }
+    if u.widgets[i].scroll >= n { u.widgets[i].scroll = 0 }
+    return u
+}
+
+pub fn Ui_sel(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return -1 }
+    return ui.widgets[i].sel
+}
+
+// Set the selection, clamped to the item list. -1 (nothing selected) is always
+// allowed; TABS is the one kind for which it is not, because a tab strip with no
+// current page would hide every page at once.
+pub fn Ui_set_sel(ui: Ui, id: int, n: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var t = n
+    var cnt = u.widgets[i].items.len()
+    if t >= cnt { t = cnt - 1 }
+    if t < 0 { t = -1 }
+    if u.widgets[i].kind == KIND_TABS {
+        if t < 0 { t = 0 }
+    }
+    u.widgets[i].sel = t
+    return u
+}
+
+pub fn Ui_scroll(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].scroll
+}
+
+// ---- RADIO exclusivity ----
+
+pub fn Ui_group_at(ui: Ui, i: int) -> string {
+    if in_range(ui, i) == 0 { return "" }
+    return ui.widgets[i].group
+}
+
+pub fn Ui_group_of(ui: Ui, id: int) -> string {
+    return Ui_group_at(ui, Ui_index_of(ui, id))
+}
+
+pub fn Ui_set_group(ui: Ui, id: int, g: string) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].group = g
+    return u
+}
+
+// Check this radio and clear every other RADIO in the same group.
+//
+// The invariant is enforced HERE and only here, which is why the group name is
+// on the widget rather than in a side table: exclusivity is one pass over the
+// list, so there is no second structure that can disagree with it. A widget of
+// any other kind is left alone - calling this on a button is a no-op rather than
+// an error, because a designer's "toggle" action is written once for all kinds.
+pub fn Ui_radio_select(ui: Ui, id: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    if u.widgets[i].kind != KIND_RADIO { return u }
+    // Copy the group name out before the loop: comparing against
+    // u.widgets[i].group while writing u.widgets[k] reads a field of the array
+    // being written, and the group string is what decides every clear.
+    var g = "" + u.widgets[i].group
+    var k = 0
+    while k < u.widgets.len() {
+        if u.widgets[k].kind == KIND_RADIO {
+            if u.widgets[k].group == g {
+                u.widgets[k].checked = 0
+            }
+        }
+        k = k + 1
+    }
+    u.widgets[i].checked = 1
+    return u
+}
+
+// ---- SLIDER / PROGRESS / SPINNER values ----
+
+pub fn Ui_val(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].val
+}
+
+pub fn Ui_vmin(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].vmin
+}
+
+pub fn Ui_vmax(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].vmax
+}
+
+pub fn Ui_vstep(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].vstep
+}
+
+// Set the value, snapped to the step grid and clamped to the range.
+//
+// Every write goes through clamp_step - including the one a designer's property
+// inspector makes - so an out-of-range value can never be STORED. Validating on
+// read instead would mean the drawn thumb and the reported value disagree, which
+// is the version of this bug that is hard to see.
+pub fn Ui_set_val(ui: Ui, id: int, v: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].val = clamp_step(v, u.widgets[i].vmin, u.widgets[i].vmax,
+                                  u.widgets[i].vstep)
+    if u.widgets[i].kind == KIND_SPINNER {
+        u.widgets[i].text = u.widgets[i].val.to_string()
+    }
+    return u
+}
+
+pub fn Ui_set_range(ui: Ui, id: int, lo: int, hi: int, step: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].vmin = lo
+    u.widgets[i].vmax = hi
+    u.widgets[i].vstep = step
+    return Ui_set_val(u, id, u.widgets[i].val)
+}
+
+// A PROGRESS bar's fill as 0..1.
+pub fn Ui_progress_frac(ui: Ui, id: int) -> float {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0.0 }
+    return ui.widgets[i].val.to_float() / 1000.0
+}
+
+pub fn Ui_set_progress(ui: Ui, id: int, f: float) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].val = frac_to_val(f)
+    return u
+}
+
+// ---- SLIDER geometry ----
+//
+// The track is inset by half a thumb at each end, so the THUMB stays inside the
+// widget at both extremes. Without the inset the value maps to the thumb's left
+// edge and the thumb hangs half out of the control at vmax - which looks like an
+// off-by-eight and is really a missing model of the thumb's width.
+
+fn slider_lo(ui: Ui, i: int) -> int {
+    return ui.widgets[i].x + BTN_W / 2
+}
+
+fn slider_span(ui: Ui, i: int) -> int {
+    var s = ui.widgets[i].w - BTN_W
+    if s < 0 { s = 0 }
+    return s
+}
+
+// Pixel x of the CENTRE of the thumb for the current value.
+pub fn Ui_slider_thumb_x(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    var rng = ui.widgets[i].vmax - ui.widgets[i].vmin
+    if rng <= 0 { return slider_lo(ui, i) }
+    return slider_lo(ui, i)
+        + (slider_span(ui, i) * (ui.widgets[i].val - ui.widgets[i].vmin)) / rng
+}
+
+// The value a click at pixel `mx` means - a pure query, so a test can check the
+// MAPPING at the two ends and the middle without pushing an event, and then
+// check that a real click agrees with it.
+//
+// Rounded, not truncated: with truncation the pointer has to travel a whole step
+// past a tick before the value changes, so the thumb visibly lags in one
+// direction only. Out-of-track x is clamped rather than ignored, because a drag
+// that leaves the widget must pin at the end and keep tracking, not freeze.
+pub fn Ui_slider_value_at(ui: Ui, id: int, mx: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    var lo = ui.widgets[i].vmin
+    var hi = ui.widgets[i].vmax
+    var span = slider_span(ui, i)
+    if span <= 0 { return clamp_step(lo, lo, hi, ui.widgets[i].vstep) }
+    var t = mx - slider_lo(ui, i)
+    if t < 0 { t = 0 }
+    if t > span { t = span }
+    var raw = lo + ((hi - lo) * t + span / 2) / span
+    return clamp_step(raw, lo, hi, ui.widgets[i].vstep)
+}
+
+// The current value as 0..1 - what a caller that wants a proportion asks for,
+// and what the draw path uses for the filled part of the track.
+pub fn Ui_slider_frac(ui: Ui, id: int) -> float {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0.0 }
+    var rng = ui.widgets[i].vmax - ui.widgets[i].vmin
+    if rng <= 0 { return 0.0 }
+    return (ui.widgets[i].val - ui.widgets[i].vmin).to_float() / rng.to_float()
+}
+
+// ---- DROPDOWN geometry and open/closed state ----
+
+pub fn Ui_open(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return -1 }
+    return ui.widgets[i].open
+}
+
+pub fn Ui_is_open(ui: Ui, id: int) -> int {
+    if Ui_open(ui, id) < 0 { return 0 }
+    return 1
+}
+
+// Open a DROPDOWN's list, or pull down MENUBAR menu `which`.
+//
+// `open` is the INDEX of the open overlay, so one field serves both kinds: a
+// dropdown has exactly one list (index 0) and a menubar has one per title.
+// Refuses on a disabled widget - a disabled control must not be openable by any
+// path, including a programmatic one, or "disabled" means only "does not respond
+// to the mouse" and every other caller has to re-check it.
+pub fn Ui_set_open(ui: Ui, id: int, which: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    if which >= 0 {
+        if u.widgets[i].enabled == 0 { return u }
+    }
+    u.widgets[i].open = which
+    return u
+}
+
+// Close every overlay. Called on a click outside one, on Escape, and before
+// opening another - so two overlays can never be open at once, which would make
+// "which one owns this click" ambiguous.
+pub fn Ui_close_overlays(ui: Ui) -> Ui {
+    var u = ui
+    var i = 0
+    while i < u.widgets.len() {
+        u.widgets[i].open = -1
+        i = i + 1
+    }
+    return u
+}
+
+fn any_overlay_open(ui: Ui) -> int {
+    var i = 0
+    while i < ui.widgets.len() {
+        if ui.widgets[i].open >= 0 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// The dropped-down list's rectangle: directly below the box, same width.
+pub fn Ui_overlay_x(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    if ui.widgets[i].kind == KIND_MENUBAR { return menu_title_x(ui, i, ui.widgets[i].open) }
+    return ui.widgets[i].x
+}
+
+pub fn Ui_overlay_y(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].y + ui.widgets[i].h
+}
+
+pub fn Ui_overlay_w(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    if ui.widgets[i].kind == KIND_MENUBAR { return menu_body_w(ui, i, ui.widgets[i].open) }
+    return ui.widgets[i].w
+}
+
+fn overlay_rows(ui: Ui, i: int) -> int {
+    if ui.widgets[i].kind == KIND_MENUBAR {
+        return menu_entry_count(ui, i, ui.widgets[i].open)
+    }
+    return ui.widgets[i].items.len()
+}
+
+pub fn Ui_overlay_h(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    if ui.widgets[i].open < 0 { return 0 }
+    return overlay_rows(ui, i) * row_h(ui)
+}
+
+// Centre-y of overlay row n, which is where a test clicks. A test that computed
+// `y + h + n * rh + rh / 2` itself would be asserting its own arithmetic.
+pub fn Ui_overlay_row_cy(ui: Ui, id: int, n: int) -> int {
+    return Ui_overlay_y(ui, id) + n * row_h(ui) + row_h(ui) / 2
+}
+
+// Which overlay row a point falls in, or -1.
+fn overlay_row_at(ui: Ui, i: int, mx: int, my: int) -> int {
+    if ui.widgets[i].open < 0 { return -1 }
+    var ox = content_x(ui, i)
+    if ui.widgets[i].kind == KIND_MENUBAR {
+        ox = menu_title_x(ui, i, ui.widgets[i].open)
+    } else {
+        ox = ui.widgets[i].x
+    }
+    var ow = ui.widgets[i].w
+    if ui.widgets[i].kind == KIND_MENUBAR {
+        ow = menu_body_w(ui, i, ui.widgets[i].open)
+    }
+    var oy = ui.widgets[i].y + ui.widgets[i].h
+    var rows = overlay_rows(ui, i)
+    var rh = row_h(ui)
+    if mx < ox { return -1 }
+    if mx >= ox + ow { return -1 }
+    if my < oy { return -1 }
+    if my >= oy + rows * rh { return -1 }
+    return (my - oy) / rh
+}
+
+// THE ONE THAT MATTERS: the id whose OPEN overlay covers this point, or -1.
+//
+// An open list is drawn ABOVE every other widget, so it must also be hit-tested
+// BEFORE every other widget. The bug this exists to prevent is the one every
+// dropdown has: the list paints over a button, the user clicks a list row, and
+// the click reaches the button underneath - because the hit test walked the
+// widget array in declaration order and the button comes later. Painting order
+// and hit order have to be the same order, and for an overlay that order is
+// "overlays first, reversed", not "declaration".
+//
+// Reverse order among overlays for the same reason the normal test takes the
+// last match: a later-declared overlay draws on top of an earlier one.
+pub fn Ui_overlay_hit(ui: Ui, mx: int, my: int) -> int {
+    var i = ui.widgets.len() - 1
+    while i >= 0 {
+        if ui.widgets[i].open >= 0 {
+            if is_visible(ui, i) == 1 {
+                if overlay_row_at(ui, i, mx, my) >= 0 { return ui.widgets[i].id }
+            }
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// Topmost thing under a point, overlays included. What a click dispatches to.
+pub fn Ui_hit_test_top(ui: Ui, mx: int, my: int) -> int {
+    var o = Ui_overlay_hit(ui, mx, my)
+    if o != -1 { return o }
+    var found = -1
+    var i = 0
+    while i < ui.widgets.len() {
+        if is_visible(ui, i) == 1 {
+            if Ui_hit(ui.widgets[i], mx, my) == 1 { found = ui.widgets[i].id }
+        }
+        i = i + 1
+    }
+    return found
+}
+
+// ---- LISTBOX ----
+
+fn list_rows(ui: Ui, i: int) -> int {
+    var rh = row_h(ui)
+    var r = (ui.widgets[i].h - 4) / rh
+    if r < 1 { r = 1 }
+    return r
+}
+
+pub fn Ui_listbox_rows(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return list_rows(ui, i)
+}
+
+// Centre-y of the visible row that currently shows item n, for a test to click.
+// Reads through `scroll`, so it is correct for a scrolled list too.
+pub fn Ui_listbox_item_cy(ui: Ui, id: int, n: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    var rh = row_h(ui)
+    return ui.widgets[i].y + 2 + (n - ui.widgets[i].scroll) * rh + rh / 2
+}
+
+fn list_row_at(ui: Ui, i: int, my: int) -> int {
+    var rh = row_h(ui)
+    var off = my - ui.widgets[i].y - 2
+    if off < 0 { return -1 }
+    var r = off / rh
+    if r >= list_rows(ui, i) { return -1 }
+    var n = ui.widgets[i].scroll + r
+    if n >= ui.widgets[i].items.len() { return -1 }
+    return n
+}
+
+// Scroll so the selection is on screen. Both directions, for the same reason the
+// textarea's caret-follow works both ways: a selection moved off the top is as
+// invisible as one moved off the bottom.
+fn fix_list_scroll(u: Ui, i: int) -> Ui {
+    var cu = u
+    var s = cu.widgets[i].sel
+    if s < 0 { return cu }
+    var rows = list_rows(cu, i)
+    var sc = cu.widgets[i].scroll
+    if s < sc { sc = s }
+    if s >= sc + rows { sc = s - rows + 1 }
+    if sc < 0 { sc = 0 }
+    cu.widgets[i].scroll = sc
+    return cu
+}
+
+// Move the selection by `d` rows, CLAMPED at both ends.
+//
+// Clamped, not wrapped. Holding Down in a list and having it jump back to the
+// top is the behaviour every user reads as a glitch; and a list whose selection
+// wraps cannot be driven to "the last item" by holding a key, which is the one
+// thing keyboard navigation is for. From no selection at all, either direction
+// enters the list rather than doing nothing.
+pub fn Ui_listbox_move(ui: Ui, id: int, d: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    if u.widgets[i].enabled == 0 { return u }
+    var n = u.widgets[i].items.len()
+    if n == 0 { return u }
+    var s = u.widgets[i].sel
+    if s < 0 {
+        if d > 0 { s = 0 } else { s = n - 1 }
+    } else {
+        s = s + d
+    }
+    if s < 0 { s = 0 }
+    if s >= n { s = n - 1 }
+    u.widgets[i].sel = s
+    return fix_list_scroll(u, i)
+}
+
+pub fn Ui_listbox_scroll(ui: Ui, id: int, d: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var sc = u.widgets[i].scroll + d
+    var maxs = u.widgets[i].items.len() - list_rows(u, i)
+    if maxs < 0 { maxs = 0 }
+    if sc > maxs { sc = maxs }
+    if sc < 0 { sc = 0 }
+    u.widgets[i].scroll = sc
+    return u
+}
+
+// ---- TABS ----
+//
+// Tab widths are measured from the titles, so a "Preferences" tab is wider than
+// an "OK" tab. That makes the x of tab n depend on every title before it, which
+// is exactly why Ui_tab_x is public: a test cannot know where tab 2 starts.
+
+fn tab_w(ui: Ui, i: int, n: int) -> int {
+    var t = item_copy(ui, i, n)
+    var w = gui.Win_text_width(ui.font, t) + 20
+    if w < 40 { w = 40 }
+    return w
+}
+
+pub fn Ui_tab_w(ui: Ui, id: int, n: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return tab_w(ui, i, n)
+}
+
+pub fn Ui_tab_x(ui: Ui, id: int, n: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    var cx = ui.widgets[i].x
+    var k = 0
+    while k < n {
+        cx = cx + tab_w(ui, i, k)
+        k = k + 1
+    }
+    return cx
+}
+
+// Centre-x of tab n. What a test clicks; also what the caption is centred on.
+pub fn Ui_tab_cx(ui: Ui, id: int, n: int) -> int {
+    return Ui_tab_x(ui, id, n) + Ui_tab_w(ui, id, n) / 2
+}
+
+fn tab_at(ui: Ui, i: int, mx: int) -> int {
+    var cx = ui.widgets[i].x
+    var k = 0
+    while k < ui.widgets[i].items.len() {
+        var w = tab_w(ui, i, k)
+        if mx >= cx {
+            if mx < cx + w { return k }
+        }
+        cx = cx + w
+        k = k + 1
+    }
+    return -1
+}
+
+pub fn Ui_tab_at(ui: Ui, id: int, mx: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return -1 }
+    return tab_at(ui, i, mx)
+}
+
+// ---- SPINNER ----
+//
+// The up/down buttons are stacked in a BTN_W gutter on the right edge. A test
+// needs their centres to click them, and the split point is h/2 which depends on
+// a height the test set - so these are derived, not constants.
+
+pub fn Ui_spinner_field_w(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    var fw = ui.widgets[i].w - BTN_W
+    if fw < 0 { fw = 0 }
+    return fw
+}
+
+pub fn Ui_spinner_btn_cx(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].x + ui.widgets[i].w - BTN_W / 2
+}
+
+pub fn Ui_spinner_up_cy(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].y + ui.widgets[i].h / 4
+}
+
+pub fn Ui_spinner_down_cy(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].y + (3 * ui.widgets[i].h) / 4
+}
+
+// Nudge the value by `d` steps, snapped and clamped, and re-sync the text.
+pub fn Ui_spinner_step(ui: Ui, id: int, d: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    if u.widgets[i].enabled == 0 { return u }
+    var st = u.widgets[i].vstep
+    if st <= 0 { st = 1 }
+    return Ui_set_val(u, id, u.widgets[i].val + d * st)
+}
+
+// Type into the field. The buffer is NOT validated here - see Ui_spinner.
+pub fn Ui_spinner_type(ui: Ui, id: int, s: string) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    if u.widgets[i].enabled == 0 { return u }
+    u.widgets[i].text = u.widgets[i].text + s
+    return u
+}
+
+pub fn Ui_spinner_backspace(ui: Ui, id: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    if u.widgets[i].enabled == 0 { return u }
+    var t = "" + u.widgets[i].text
+    if t.len() == 0 { return u }
+    u.widgets[i].text = t.substring(0, t.len() - 1)
+    return u
+}
+
+// Turn whatever is in the field into the value: parse leniently, clamp, and
+// write the clamped number BACK into the text.
+//
+// The write-back is the point. Without it the field can read "500" while the
+// value is 100, and the next commit re-parses the stale text - so the widget
+// shows one number and reports another for as long as it is not touched.
+// Called on Enter, on blur, and before any step, which is every path by which
+// the typed buffer stops being what the user is editing.
+pub fn Ui_spinner_commit(ui: Ui, id: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var v = parse_int_lenient(u.widgets[i].text, u.widgets[i].val)
+    return Ui_set_val(u, id, v)
+}
+
+// ---- MENUBAR: decoding the packed two-level spec ----
+//
+// Each `items` line is "Title|Entry|Entry". Element 0 of the split is the title,
+// so entry n is split element n + 1 - which is the whole reason these are three
+// functions rather than three open-coded splits at the call sites.
+
+pub fn Ui_menu_count(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].items.len()
+}
+
+fn menu_title(ui: Ui, i: int, m: int) -> string {
+    var line = item_copy(ui, i, m)
+    var parts = line.split("|")
+    if parts.len() == 0 { return "" }
+    return "" + parts[0]
+}
+
+pub fn Ui_menu_title(ui: Ui, id: int, m: int) -> string {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return "" }
+    return menu_title(ui, i, m)
+}
+
+fn menu_entry_count(ui: Ui, i: int, m: int) -> int {
+    if m < 0 { return 0 }
+    if m >= ui.widgets[i].items.len() { return 0 }
+    var parts = item_copy(ui, i, m).split("|")
+    if parts.len() <= 1 { return 0 }
+    return parts.len() - 1
+}
+
+pub fn Ui_menu_entry_count(ui: Ui, id: int, m: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return menu_entry_count(ui, i, m)
+}
+
+fn menu_entry(ui: Ui, i: int, m: int, n: int) -> string {
+    if m < 0 { return "" }
+    if m >= ui.widgets[i].items.len() { return "" }
+    var parts = item_copy(ui, i, m).split("|")
+    if n + 1 >= parts.len() { return "" }
+    if n < 0 { return "" }
+    return "" + parts[n + 1]
+}
+
+pub fn Ui_menu_entry(ui: Ui, id: int, m: int, n: int) -> string {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return "" }
+    return menu_entry(ui, i, m, n)
+}
+
+fn menu_title_w(ui: Ui, i: int, m: int) -> int {
+    var w = gui.Win_text_width(ui.font, menu_title(ui, i, m)) + 20
+    if w < 40 { w = 40 }
+    return w
+}
+
+fn menu_title_x(ui: Ui, i: int, m: int) -> int {
+    var cx = ui.widgets[i].x
+    var k = 0
+    while k < m {
+        cx = cx + menu_title_w(ui, i, k)
+        k = k + 1
+    }
+    return cx
+}
+
+pub fn Ui_menu_title_x(ui: Ui, id: int, m: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return menu_title_x(ui, i, m)
+}
+
+pub fn Ui_menu_title_cx(ui: Ui, id: int, m: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return menu_title_x(ui, i, m) + menu_title_w(ui, i, m) / 2
+}
+
+// Width of the pulled-down body: the widest entry, never narrower than its
+// title, so the menu cannot look detached from the title it hangs off.
+fn menu_body_w(ui: Ui, i: int, m: int) -> int {
+    var best = menu_title_w(ui, i, m)
+    var n = 0
+    while n < menu_entry_count(ui, i, m) {
+        var w = gui.Win_text_width(ui.font, menu_entry(ui, i, m, n)) + 24
+        if w > best { best = w }
+        n = n + 1
+    }
+    return best
+}
+
+fn menu_title_at(ui: Ui, i: int, mx: int) -> int {
+    var cx = ui.widgets[i].x
+    var k = 0
+    while k < ui.widgets[i].items.len() {
+        var w = menu_title_w(ui, i, k)
+        if mx >= cx {
+            if mx < cx + w { return k }
+        }
+        cx = cx + w
+        k = k + 1
+    }
+    return -1
+}
+
+// ---- TOOLTIPS ----
+
+pub fn Ui_set_tooltip(ui: Ui, id: int, s: string) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].tooltip = s
+    return u
+}
+
+pub fn Ui_tooltip_of(ui: Ui, id: int) -> string {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return "" }
+    return ui.widgets[i].tooltip
+}
+
+pub fn Ui_set_tooltip_delay(ui: Ui, ms: int) -> Ui {
+    var u = ui
+    u.tooltip_delay = ms
+    return u
+}
+
+pub fn Ui_tooltip_delay(ui: Ui) -> int {
+    return ui.tooltip_delay
+}
+
+// Substitute the clock. See the fake_now note on Ui: 0 restores the real one.
+pub fn Ui_set_fake_now(ui: Ui, t: int) -> Ui {
+    var u = ui
+    u.fake_now = t
+    return u
+}
+
+pub fn Ui_now(ui: Ui) -> int {
+    return ui_now(ui)
+}
+
+pub fn Ui_hover_since(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].hover_since
+}
+
+// Has the pointer RESTED on this widget long enough for its tooltip to show?
+//
+// Four conditions, and each one is a bug if dropped: a tooltip with no text is
+// an empty box, a stamp of 0 means "not hovering" (see the field comment), a
+// disabled control still explains itself so `enabled` is deliberately NOT
+// checked, and the dwell comparison is >= so a delay of 0 shows immediately
+// rather than never.
+pub fn Ui_tooltip_visible(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    if ui.widgets[i].tooltip.len() == 0 { return 0 }
+    if ui.widgets[i].hover_since == 0 { return 0 }
+    if is_visible(ui, i) == 0 { return 0 }
+    if ui_now(ui) - ui.widgets[i].hover_since < ui.tooltip_delay { return 0 }
+    return 1
+}
+
+// Update the hover stamps for the widget currently under the pointer.
+//
+// Stamped only on ENTRY, never re-stamped while the pointer stays: re-stamping
+// every frame is the bug that makes a tooltip never appear, and it is invisible
+// in any test that does not advance a clock.
+fn refresh_hover(u: Ui, id: int) -> Ui {
+    var cu = u
+    var t = ui_now(cu)
+    var i = 0
+    while i < cu.widgets.len() {
+        if cu.widgets[i].id == id {
+            if cu.widgets[i].hover_since == 0 { cu.widgets[i].hover_since = t }
+        } else {
+            cu.widgets[i].hover_since = 0
+        }
+        i = i + 1
+    }
+    return cu
+}
+
+// ---- keyboard focus order ----
+
+// Can this widget take the keyboard?
+//
+// PROGRESS, LABEL, PANEL and GROUPBOX cannot: they have nothing a key could do,
+// and a Tab order that stops on them makes the keyboard path through a form feel
+// broken for no gain. A DISABLED widget cannot either - that is what disabled
+// means, and leaving it in the Tab order is the version of this bug where the
+// control cannot be clicked but can still be typed into.
+pub fn Ui_focusable(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    if ui.widgets[i].enabled == 0 { return 0 }
+    if is_visible(ui, i) == 0 { return 0 }
+    var k = ui.widgets[i].kind
+    if k == KIND_LABEL { return 0 }
+    if k == KIND_PANEL { return 0 }
+    if k == KIND_PROGRESS { return 0 }
+    if k == KIND_GROUPBOX { return 0 }
+    return 1
+}
+
+// Move the focus to the next (dir = 1) or previous (dir = -1) focusable widget,
+// wrapping. Wrapping is right here and wrong for a list selection: Tab is a
+// cycle through a form by definition, whereas a list has a first and last item.
+pub fn Ui_focus_next(ui: Ui, dir: int) -> Ui {
+    var u = ui
+    var n = u.widgets.len()
+    if n == 0 { return u }
+    var start = 0
+    if u.focus != -1 {
+        var f = Ui_index_of(u, u.focus)
+        if f != -1 { start = f }
+    } else {
+        if dir > 0 { start = -1 } else { start = 0 }
+    }
+    var step = 1
+    if dir < 0 { step = -1 }
+    var k = 1
+    while k <= n {
+        var j = start + k * step
+        // Wrap by hand: Wyn's % on a negative left operand is not the
+        // mathematical modulus, so `(start + k*step) % n` walks off the front.
+        while j < 0 { j = j + n }
+        while j >= n { j = j - n }
+        if Ui_focusable(u, u.widgets[j].id) == 1 {
+            u.focus = u.widgets[j].id
+            return u
+        }
+        k = k + 1
+    }
+    return u
+}
+
+// ---- clipped hit testing --------------------------------------------------
+
+// Is (mx, my) inside widget i, AND inside its container's content box?
+//
+// The second half is the point. A child of a GROUPBOX is CLIPPED when it is
+// drawn, so the part hanging over the edge is not visible - and an invisible
+// control that still responds to clicks is worse than one that does not respond
+// at all, because the user cannot see what they hit. Geometry and paint have to
+// agree, so the hit test intersects with exactly the rectangle draw_children
+// pushes onto the clip stack.
+fn hit_clipped(ui: Ui, i: int, mx: int, my: int) -> int {
+    if Ui_hit(ui.widgets[i], mx, my) == 0 { return 0 }
+    if is_visible(ui, i) == 0 { return 0 }
+    var ow = ui.widgets[i].owner
+    if ow == -1 { return 1 }
+    var oi = Ui_index_of(ui, ow)
+    if oi == -1 { return 1 }
+    if clips_children(ui.widgets[oi].kind) == 0 { return 1 }
+    var cx = content_x(ui, oi)
+    var cy = content_y(ui, oi)
+    if mx < cx { return 0 }
+    if my < cy { return 0 }
+    if mx >= cx + content_w(ui, oi) { return 0 }
+    if my >= cy + content_h(ui, oi) { return 0 }
+    return 1
+}
+
+pub fn Ui_hit_clipped(ui: Ui, id: int, mx: int, my: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return hit_clipped(ui, i, mx, my)
+}
+
+// Topmost widget under the point, honouring clipping and tab visibility, with
+// open overlays winning outright. This is what a press dispatches to, and it is
+// the same order Ui_draw_into paints in - which is the invariant that keeps a
+// click landing on the thing the user can see.
+fn topmost_at(ui: Ui, mx: int, my: int) -> int {
+    var o = Ui_overlay_hit(ui, mx, my)
+    if o != -1 { return o }
+    var found = -1
+    var i = 0
+    while i < ui.widgets.len() {
+        if hit_clipped(ui, i, mx, my) == 1 { found = ui.widgets[i].id }
+        i = i + 1
+    }
+    return found
+}
+
+pub fn Ui_topmost_at(ui: Ui, mx: int, my: int) -> int {
+    return topmost_at(ui, mx, my)
+}
+
+// ---- press / release / motion ----------------------------------------------
+//
+// Split out of Ui_events and PUBLIC, because the mouse-down half of a click is
+// where every ordering decision lives and it must be assertable without a
+// window. Ui_events calls exactly these, so a test that drives them is driving
+// the shipping dispatch and not a parallel copy of it.
+
+// Commit whatever a focused SPINNER has typed, before the focus leaves it.
+//
+// A field that keeps a half-typed "5" when you click away, and then reports 5 on
+// the next commit, is the standard numeric-field bug. Blur is a commit point.
+fn blur_commit(u: Ui, old_focus: int) -> Ui {
+    var cu = u
+    if old_focus == -1 { return cu }
+    if old_focus == cu.focus { return cu }
+    var i = Ui_index_of(cu, old_focus)
+    if i == -1 { return cu }
+    if cu.widgets[i].kind != KIND_SPINNER { return cu }
+    return Ui_spinner_commit(cu, old_focus)
+}
+
+// Mouse button down at (mx, my).
+pub fn Ui_press(ui: Ui, mx: int, my: int) -> Ui {
+    var u = ui
+    u.mouse_x = mx
+    u.mouse_y = my
+    var was_focus = u.focus
+    u.active = -1
+    u.drag = -1
+
+    // 1. AN OPEN OVERLAY OWNS THE POINTER. Checked first and returned from, so no
+    //    widget underneath can see this press. Falling through to the ordinary
+    //    scan is the bug: the list paints over a button, the user clicks a row,
+    //    and the button fires because it comes later in the array.
+    var ovid = Ui_overlay_hit(u, mx, my)
+    if ovid != -1 {
+        u.active = ovid
+        u.focus = ovid
+        return blur_commit(u, was_focus)
+    }
+
+    // 2. A press elsewhere while an overlay is open only DISMISSES it. The press
+    //    is deliberately swallowed rather than also delivered: that is what a
+    //    platform menu does, and it means "click away to cancel" can never
+    //    activate whatever happened to be behind the list.
+    //
+    //    The exception is a press on the widget that OWNS the open overlay: on a
+    //    menu bar, sliding from File to Edit must switch menus, and dismissing
+    //    instead would make the second title need two clicks. So the dismissal
+    //    skips the owner and the ordinary dispatch below handles it.
+    if any_overlay_open(u) == 1 {
+        var owner_hit = -1
+        var q = 0
+        while q < u.widgets.len() {
+            if u.widgets[q].open >= 0 {
+                if hit_clipped(u, q, mx, my) == 1 { owner_hit = u.widgets[q].id }
+            }
+            q = q + 1
+        }
+        if owner_hit == -1 {
+            u = Ui_close_overlays(u)
+            u.focus = -1
+            gui.Win_text_input(u.win, 0)
+            return blur_commit(u, was_focus)
+        }
+    }
+
+    var target = topmost_at(u, mx, my)
+    if target == -1 {
+        u.focus = -1
+        gui.Win_text_input(u.win, 0)
+        return blur_commit(u, was_focus)
+    }
+    var ti = Ui_index_of(u, target)
+    // 3. DISABLED REFUSES INPUT. One check, before the kind dispatch, so a new
+    //    kind cannot forget it - which is how a disabled control ends up
+    //    clickable in exactly one of ten branches.
+    if u.widgets[ti].enabled == 0 {
+        u.focus = -1
+        gui.Win_text_input(u.win, 0)
+        return blur_commit(u, was_focus)
+    }
+
+    var kind = u.widgets[ti].kind
+    u.focus = -1
+
+    if kind == KIND_BUTTON { u.active = target }
+    if kind == KIND_CHECKBOX { u.active = target }
+    if kind == KIND_RADIO {
+        u.active = target
+        u.focus = target
+    }
+    if kind == KIND_ENTRY { u.focus = target }
+    if kind == KIND_TEXTAREA { u.focus = target }
+
+    if kind == KIND_DROPDOWN {
+        u.focus = target
+        // Toggle: a second click on the box closes the list. Without this the
+        // only way to dismiss it is to click elsewhere, and the box appears dead.
+        if u.widgets[ti].open >= 0 { u.widgets[ti].open = -1 }
+        else { u.widgets[ti].open = 0 }
+    }
+
+    if kind == KIND_SLIDER {
+        u.focus = target
+        u.drag = target
+        // A click on the TRACK jumps the thumb there and starts dragging, rather
+        // than requiring the thumb to be grabbed: the thumb is 16px wide and
+        // hitting it exactly is not a reasonable thing to ask.
+        u.widgets[ti].val = Ui_slider_value_at(u, target, mx)
+    }
+
+    if kind == KIND_LISTBOX {
+        u.focus = target
+        var r = list_row_at(u, ti, my)
+        if r >= 0 {
+            u.widgets[ti].sel = r
+            u = fix_list_scroll(u, ti)
+            // `active` so the RELEASE fires the handler. Selecting without ever
+            // telling the program is the version of this bug that looks fine on
+            // screen and does nothing - caught by asserting the handler ran, not
+            // just that `sel` changed.
+            u.active = target
+        }
+    }
+
+    if kind == KIND_TABS {
+        var t = tab_at(u, ti, mx)
+        // Only a hit ON a tab switches pages. A click in the empty strip to the
+        // right of the last tab must not select tab 0, which is what an
+        // unchecked -1 index does.
+        if t >= 0 {
+            u.widgets[ti].sel = t
+            u.active = target
+        }
+    }
+
+    if kind == KIND_SPINNER {
+        u.focus = target
+        var gutter = u.widgets[ti].x + u.widgets[ti].w - BTN_W
+        if mx >= gutter {
+            // A button press commits the typed buffer FIRST, then steps from the
+            // committed number. Stepping from the old value would discard what
+            // the user typed, and stepping from the raw text would skip the
+            // clamp.
+            u = Ui_spinner_commit(u, target)
+            if my < u.widgets[ti].y + u.widgets[ti].h / 2 {
+                u = Ui_spinner_step(u, target, 1)
+            } else {
+                u = Ui_spinner_step(u, target, 0 - 1)
+            }
+            u.active = target
+        }
+        gui.Win_text_input(u.win, 1)
+    }
+
+    if kind == KIND_MENUBAR {
+        u.focus = target
+        var m = menu_title_at(u, ti, mx)
+        if m >= 0 {
+            if u.widgets[ti].open == m { u.widgets[ti].open = -1 }
+            else { u.widgets[ti].open = m }
+        }
+    }
+
+    if u.focus == -1 { gui.Win_text_input(u.win, 0) }
+    else {
+        if kind == KIND_ENTRY { gui.Win_text_input(u.win, 1) }
+        if kind == KIND_TEXTAREA { gui.Win_text_input(u.win, 1) }
+    }
+    return blur_commit(u, was_focus)
+}
+
+// Mouse button up at (mx, my). A click counts only if it is RELEASED over the
+// same thing the press began on - dragging off a control cancels it.
+pub fn Ui_release(ui: Ui, mx: int, my: int) -> Ui {
+    var u = ui
+    u.mouse_x = mx
+    u.mouse_y = my
+    var act = u.active
+    var dragged = u.drag
+    u.active = -1
+    u.drag = -1
+
+    if dragged != -1 {
+        // A slider fires ONCE, on release, not on every pixel of the drag: a
+        // handler that saves a preference would otherwise be called sixty times
+        // a second while the thumb moves.
+        var di = Ui_index_of(u, dragged)
+        if di != -1 {
+            u.widgets[di].val = Ui_slider_value_at(u, dragged, mx)
+            fire(u, di)
+        }
+        return u
+    }
+
+    if act == -1 { return u }
+    var i = Ui_index_of(u, act)
+    if i == -1 { return u }
+    if u.widgets[i].enabled == 0 { return u }
+
+    // An overlay release: the row under the pointer is the choice. Computed from
+    // the CURRENT pointer position, so pressing on one row and releasing on
+    // another picks the one released over, exactly as a menu does.
+    if u.widgets[i].open >= 0 {
+        var r = overlay_row_at(u, i, mx, my)
+        if r < 0 {
+            u.widgets[i].open = -1
+            return u
+        }
+        if u.widgets[i].kind == KIND_MENUBAR {
+            var entry = menu_entry(u, i, u.widgets[i].open, r)
+            // A separator is inert: it closes nothing and chooses nothing, so a
+            // mis-aimed click near it does not silently invoke its neighbour.
+            if entry == "-" { return u }
+            u.widgets[i].sel = r
+        } else {
+            u.widgets[i].sel = r
+        }
+        u.widgets[i].open = -1
+        fire(u, i)
+        return u
+    }
+
+    if hit_clipped(u, i, mx, my) == 0 { return u }
+
+    if u.widgets[i].kind == KIND_CHECKBOX {
+        if u.widgets[i].checked == 1 { u.widgets[i].checked = 0 }
+        else { u.widgets[i].checked = 1 }
+    }
+    if u.widgets[i].kind == KIND_RADIO {
+        // Exclusivity is applied on the RELEASE, not the press, so a press that
+        // is dragged off does not leave the group changed.
+        u = Ui_radio_select(u, act)
+    }
+    fire(u, i)
+    return u
+}
+
+// Pointer moved to (mx, my): track a drag, and stamp the hover clock.
+pub fn Ui_motion(ui: Ui, mx: int, my: int) -> Ui {
+    var u = ui
+    u.mouse_x = mx
+    u.mouse_y = my
+    if u.drag != -1 {
+        var di = Ui_index_of(u, u.drag)
+        if di != -1 {
+            // Live tracking. Ui_slider_value_at clamps, so a drag that leaves the
+            // widget pins at the end and keeps following instead of freezing at
+            // whatever value it had when it crossed the border.
+            u.widgets[di].val = Ui_slider_value_at(u, u.drag, mx)
+        }
+    }
+    return refresh_hover(u, topmost_at(u, mx, my))
+}
+
+// ---- keyboard --------------------------------------------------------------
+
+// A key for the FOCUSED widget. Returns 1 if it was consumed, so the caller
+// knows whether to fall through to the form-level bindings (Escape quits, Tab
+// moves focus) - a focused listbox has to own Down, and the form has to own Tab.
+fn key_to_focus(u: Ui, key: int) -> Ui {
+    var cu = u
+    var fid = cu.focus
+    var i = Ui_index_of(cu, fid)
+    if i == -1 { return cu }
+    if cu.widgets[i].enabled == 0 { return cu }
+    var kind = cu.widgets[i].kind
+
+    if kind == KIND_TEXTAREA {
+        // A focused textarea OWNS the keyboard, including Escape: in a code pane
+        // Escape means "leave the pane", and closing the whole program because
+        // the user finished typing is not recoverable.
+        if key == gui.SCANCODE_ESCAPE {
+            cu.focus = -1
+            gui.Win_text_input(cu.win, 0)
+            return cu
+        }
+        if key == gui.SCANCODE_LEFT { return Ui_caret_move(cu, fid, 0, 0 - 1) }
+        if key == gui.SCANCODE_RIGHT { return Ui_caret_move(cu, fid, 0, 1) }
+        if key == gui.SCANCODE_UP { return Ui_caret_move(cu, fid, 0 - 1, 0) }
+        if key == gui.SCANCODE_DOWN { return Ui_caret_move(cu, fid, 1, 0) }
+        if key == gui.SCANCODE_RETURN { return Ui_textarea_newline(cu, fid) }
+        if key == gui.SCANCODE_BACKSPACE { return Ui_textarea_backspace(cu, fid) }
+        if key == gui.SCANCODE_DELETE { return Ui_textarea_delete(cu, fid) }
+        if key == gui.SCANCODE_TAB { return Ui_textarea_insert(cu, fid, "    ") }
+        return cu
+    }
+    if kind == KIND_ENTRY {
+        if key == gui.SCANCODE_BACKSPACE {
+            var t = "" + cu.widgets[i].text
+            if t.len() > 0 {
+                cu.widgets[i].text = t.substring(0, t.len() - 1)
+            }
+        }
+        return cu
+    }
+
+    if kind == KIND_LISTBOX {
+        if key == gui.SCANCODE_UP { return Ui_listbox_move(cu, fid, 0 - 1) }
+        if key == gui.SCANCODE_DOWN { return Ui_listbox_move(cu, fid, 1) }
+        return cu
+    }
+    if kind == KIND_SLIDER {
+        var st = cu.widgets[i].vstep
+        if st <= 0 { st = 1 }
+        if key == gui.SCANCODE_LEFT {
+            return Ui_set_val(cu, fid, cu.widgets[i].val - st)
+        }
+        if key == gui.SCANCODE_RIGHT {
+            return Ui_set_val(cu, fid, cu.widgets[i].val + st)
+        }
+        return cu
+    }
+    if kind == KIND_SPINNER {
+        if key == gui.SCANCODE_UP {
+            cu = Ui_spinner_commit(cu, fid)
+            return Ui_spinner_step(cu, fid, 1)
+        }
+        if key == gui.SCANCODE_DOWN {
+            cu = Ui_spinner_commit(cu, fid)
+            return Ui_spinner_step(cu, fid, 0 - 1)
+        }
+        if key == gui.SCANCODE_RETURN { return Ui_spinner_commit(cu, fid) }
+        if key == gui.SCANCODE_BACKSPACE { return Ui_spinner_backspace(cu, fid) }
+        return cu
+    }
+    if kind == KIND_DROPDOWN {
+        if key == gui.SCANCODE_UP { return Ui_set_sel(cu, fid, cu.widgets[i].sel - 1) }
+        if key == gui.SCANCODE_DOWN { return Ui_set_sel(cu, fid, cu.widgets[i].sel + 1) }
+        if key == gui.SCANCODE_RETURN {
+            if cu.widgets[i].open >= 0 { cu.widgets[i].open = -1 }
+            else { cu.widgets[i].open = 0 }
+        }
+        return cu
+    }
+    if kind == KIND_TABS {
+        if key == gui.SCANCODE_LEFT { return Ui_set_sel(cu, fid, cu.widgets[i].sel - 1) }
+        if key == gui.SCANCODE_RIGHT { return Ui_set_sel(cu, fid, cu.widgets[i].sel + 1) }
+        return cu
+    }
+    if kind == KIND_RADIO {
+        if key == gui.SCANCODE_SPACE { return Ui_radio_select(cu, fid) }
+        return cu
+    }
+    if kind == KIND_CHECKBOX {
+        if key == gui.SCANCODE_SPACE {
+            if cu.widgets[i].checked == 1 { cu.widgets[i].checked = 0 }
+            else { cu.widgets[i].checked = 1 }
+        }
+        return cu
+    }
+    return cu
+}
+
+// Does the focused widget own this key? Decided separately from acting on it, so
+// the "did anyone consume it" question has one answer and the form-level
+// fallback cannot double-handle a key.
+fn focus_owns_key(ui: Ui, key: int) -> int {
+    var i = Ui_index_of(ui, ui.focus)
+    if i == -1 { return 0 }
+    if ui.widgets[i].enabled == 0 { return 0 }
+    var kind = ui.widgets[i].kind
+    if kind == KIND_TEXTAREA { return 1 }
+    if key == gui.SCANCODE_TAB { return 0 }
+    if key == gui.SCANCODE_ESCAPE { return 0 }
+    if kind == KIND_ENTRY {
+        if key == gui.SCANCODE_BACKSPACE { return 1 }
+    }
+    if kind == KIND_LISTBOX {
+        if key == gui.SCANCODE_UP { return 1 }
+        if key == gui.SCANCODE_DOWN { return 1 }
+    }
+    if kind == KIND_SLIDER {
+        if key == gui.SCANCODE_LEFT { return 1 }
+        if key == gui.SCANCODE_RIGHT { return 1 }
+    }
+    if kind == KIND_SPINNER { return 1 }
+    if kind == KIND_DROPDOWN {
+        if key == gui.SCANCODE_UP { return 1 }
+        if key == gui.SCANCODE_DOWN { return 1 }
+        if key == gui.SCANCODE_RETURN { return 1 }
+    }
+    if kind == KIND_TABS {
+        if key == gui.SCANCODE_LEFT { return 1 }
+        if key == gui.SCANCODE_RIGHT { return 1 }
+    }
+    if kind == KIND_RADIO {
+        if key == gui.SCANCODE_SPACE { return 1 }
+    }
+    if kind == KIND_CHECKBOX {
+        if key == gui.SCANCODE_SPACE { return 1 }
+    }
+    return 0
+}
+
+// Public key entry point, so the keyboard path is testable with no window.
+//
+// Precedence, and every level of it is a bug if reordered: an open overlay owns
+// Escape (Escape in a menu closes the menu, it does not quit the program), then
+// the focused widget owns its own keys, then Tab moves the focus, then Escape
+// quits.
+pub fn Ui_key(ui: Ui, key: int) -> Ui {
+    var u = ui
+    if key == gui.SCANCODE_ESCAPE {
+        if any_overlay_open(u) == 1 { return Ui_close_overlays(u) }
+    }
+    if u.focus != -1 {
+        if focus_owns_key(u, key) == 1 { return key_to_focus(u, key) }
+    }
+    if key == gui.SCANCODE_TAB {
+        var was = u.focus
+        u = Ui_focus_next(u, 1)
+        return blur_commit(u, was)
+    }
+    if key == gui.SCANCODE_ESCAPE { u.running = 0 }
+    return u
+}
+
 // ---- events --------------------------------------------------------------
 
 // Drain the queue and update hot/active/focus, firing handlers on click.
@@ -1216,37 +3174,15 @@ pub fn Ui_events(ui: Ui) -> Ui {
             u.running = 0
         }
         if ev == gui.EV_MOUSE_MOVE {
-            u.mouse_x = gui.Win_event_x()
-            u.mouse_y = gui.Win_event_y()
+            u = Ui_motion(u, gui.Win_event_x(), gui.Win_event_y())
         }
         if ev == gui.EV_MOUSE_DOWN {
-            u.mouse_x = gui.Win_event_x()
-            u.mouse_y = gui.Win_event_y()
-            u.active = -1
-            u.focus = -1
-            var i = 0
-            while i < u.widgets.len() {
-                var w = u.widgets[i]
-                if w.enabled == 1 {
-                    if Ui_hit(w, u.mouse_x, u.mouse_y) == 1 {
-                        if w.kind == KIND_BUTTON { u.active = w.id }
-                        if w.kind == KIND_CHECKBOX { u.active = w.id }
-                        if w.kind == KIND_ENTRY {
-                            u.focus = w.id
-                            gui.Win_text_input(u.win, 1)
-                        }
-                        if w.kind == KIND_TEXTAREA {
-                            u.focus = w.id
-                            gui.Win_text_input(u.win, 1)
-                        }
-                    }
-                }
-                i = i + 1
-            }
-            if u.focus == -1 { gui.Win_text_input(u.win, 0) }
-            // Caret placement AFTER focus is settled, and outside the scan loop:
-            // Ui_textarea_click rebuilds `u`, so calling it while iterating over
-            // u.widgets would edit a list the loop is still walking.
+            // The whole press decision is Ui_press, so the dispatch a test drives
+            // and the dispatch a user gets are literally the same function.
+            u = Ui_press(u, gui.Win_event_x(), gui.Win_event_y())
+            // Caret placement AFTER focus is settled: Ui_textarea_click rebuilds
+            // `u`, so doing it inside the press scan would edit a list that scan
+            // is still walking.
             if u.focus != -1 {
                 if Ui_kind_of(u, u.focus) == KIND_TEXTAREA {
                     u = Ui_textarea_click(u, u.focus, u.mouse_x, u.mouse_y)
@@ -1254,36 +3190,24 @@ pub fn Ui_events(ui: Ui) -> Ui {
             }
         }
         if ev == gui.EV_MOUSE_UP {
-            u.mouse_x = gui.Win_event_x()
-            u.mouse_y = gui.Win_event_y()
-            var j = 0
-            while j < u.widgets.len() {
-                var wu = u.widgets[j]
-                // Released over the SAME widget the press began on.
-                if wu.id == u.active {
-                    if Ui_hit(wu, u.mouse_x, u.mouse_y) == 1 {
-                        if wu.kind == KIND_CHECKBOX {
-                            if wu.checked == 1 { u.widgets[j].checked = 0 }
-                            else { u.widgets[j].checked = 1 }
-                        }
-                        wu.on_click(wu.id)
-                    }
-                }
-                j = j + 1
-            }
-            u.active = -1
+            u = Ui_release(u, gui.Win_event_x(), gui.Win_event_y())
         }
         if ev == gui.EV_WHEEL {
-            // The wheel scrolls the textarea under the pointer, focused or not -
-            // that is what every editor does, and requiring focus first makes a
-            // long document feel stuck.
-            var wid = Ui_hit_test(u, u.mouse_x, u.mouse_y)
+            // The wheel scrolls whatever is under the pointer, focused or not -
+            // that is what every editor and list does, and requiring focus first
+            // makes a long document feel stuck.
+            var wid = Ui_topmost_at(u, u.mouse_x, u.mouse_y)
             if wid != -1 {
-                if Ui_kind_of(u, wid) == KIND_TEXTAREA {
-                    // Positive wheel-y is "away from the user" = scroll up.
-                    var dy = gui.Win_event_y()
+                // Positive wheel-y is "away from the user" = scroll up.
+                var dy = gui.Win_event_y()
+                var wk = Ui_kind_of(u, wid)
+                if wk == KIND_TEXTAREA {
                     if dy > 0 { u = Ui_textarea_scroll(u, wid, 0 - 3) }
                     if dy < 0 { u = Ui_textarea_scroll(u, wid, 3) }
+                }
+                if wk == KIND_LISTBOX {
+                    if dy > 0 { u = Ui_listbox_scroll(u, wid, 0 - 3) }
+                    if dy < 0 { u = Ui_listbox_scroll(u, wid, 3) }
                 }
             }
         }
@@ -1298,7 +3222,13 @@ pub fn Ui_events(ui: Ui) -> Ui {
                     var k = 0
                     while k < u.widgets.len() {
                         if u.widgets[k].id == u.focus {
-                            u.widgets[k].text = u.widgets[k].text + typed
+                            // Disabled refuses TYPING too. Without this a control
+                            // greyed out while focused keeps accepting keystrokes,
+                            // which is the half-disabled state that is hardest to
+                            // notice: it looks dead and still changes.
+                            if u.widgets[k].enabled == 1 {
+                                u.widgets[k].text = u.widgets[k].text + typed
+                            }
                         }
                         k = k + 1
                     }
@@ -1306,45 +3236,7 @@ pub fn Ui_events(ui: Ui) -> Ui {
             }
         }
         if ev == gui.EV_KEY_DOWN {
-            var key = gui.Win_event_key()
-            // A focused textarea OWNS the keyboard, including Escape: in a code
-            // pane Escape means "leave the pane", and closing the whole program
-            // because the user finished typing is not recoverable.
-            var editing = 0
-            if u.focus != -1 {
-                if Ui_kind_of(u, u.focus) == KIND_TEXTAREA { editing = 1 }
-            }
-            if editing == 1 {
-                var fid = u.focus
-                if key == gui.SCANCODE_ESCAPE {
-                    u.focus = -1
-                    gui.Win_text_input(u.win, 0)
-                }
-                if key == gui.SCANCODE_LEFT { u = Ui_caret_move(u, fid, 0, 0 - 1) }
-                if key == gui.SCANCODE_RIGHT { u = Ui_caret_move(u, fid, 0, 1) }
-                if key == gui.SCANCODE_UP { u = Ui_caret_move(u, fid, 0 - 1, 0) }
-                if key == gui.SCANCODE_DOWN { u = Ui_caret_move(u, fid, 1, 0) }
-                if key == gui.SCANCODE_RETURN { u = Ui_textarea_newline(u, fid) }
-                if key == gui.SCANCODE_BACKSPACE { u = Ui_textarea_backspace(u, fid) }
-                if key == gui.SCANCODE_DELETE { u = Ui_textarea_delete(u, fid) }
-                if key == gui.SCANCODE_TAB { u = Ui_textarea_insert(u, fid, "    ") }
-            } else {
-                if key == gui.SCANCODE_ESCAPE { u.running = 0 }
-                if key == gui.SCANCODE_BACKSPACE {
-                    if u.focus != -1 {
-                        var m = 0
-                        while m < u.widgets.len() {
-                            if u.widgets[m].id == u.focus {
-                                var t = u.widgets[m].text
-                                if t.len() > 0 {
-                                    u.widgets[m].text = t.substring(0, t.len() - 1)
-                                }
-                            }
-                            m = m + 1
-                        }
-                    }
-                }
-            }
+            u = Ui_key(u, gui.Win_event_key())
         }
         ev = gui.Win_poll_event()
     }
@@ -1352,6 +3244,11 @@ pub fn Ui_events(ui: Ui) -> Ui {
     // Recompute `hot` from the last known pointer position. Done here rather
     // than in the move handler so it is also correct after a widget moves or is
     // added, without waiting for the next mouse motion.
+    //
+    // Clipped and visibility-filtered: `hot` drives the hover highlight, and a
+    // control that lights up while the part under the pointer is clipped away, or
+    // while its tab page is hidden, is drawing feedback for a click that will
+    // never be delivered.
     u.hot = -1
     var h = 0
     while h < u.widgets.len() {
@@ -1359,13 +3256,23 @@ pub fn Ui_events(ui: Ui) -> Ui {
         if hw.enabled == 1 {
             if hw.kind != KIND_LABEL {
                 if hw.kind != KIND_PANEL {
-                    if Ui_hit(hw, u.mouse_x, u.mouse_y) == 1 { u.hot = hw.id }
+                    if hw.kind != KIND_GROUPBOX {
+                        if hw.kind != KIND_PROGRESS {
+                            if hit_clipped(u, h, u.mouse_x, u.mouse_y) == 1 {
+                                u.hot = hw.id
+                            }
+                        }
+                    }
                 }
             }
         }
         h = h + 1
     }
-    return u
+    // Hover stamps follow the pointer even when no motion event arrived this
+    // frame (a widget can move under a stationary pointer), which is what makes
+    // the tooltip dwell measure "the pointer is resting HERE" rather than "a
+    // motion event happened recently".
+    return refresh_hover(u, topmost_at(u, u.mouse_x, u.mouse_y))
 }
 
 // ---- drawing -------------------------------------------------------------
@@ -1559,6 +3466,506 @@ fn draw_widget(ui: Ui, w: Widget) {
         }
         return
     }
+
+    // ---- the expanded widget set ----
+    //
+    // All nine share the six above's palette exactly - 18,18,22 for a sunken
+    // field, 45..50 for a raised surface, 120,120,140 for a border, the theme
+    // accent for focus and for a filled indicator, and 110,110,120 for anything
+    // disabled. A new widget that picks its own greys reads as a different
+    // toolkit pasted into the form, which is the failure mode of adding kinds one
+    // at a time.
+    //
+    // Nothing in here draws an OVERLAY. A dropdown's list and a menu's body are
+    // drawn by draw_overlay, in a later pass, because they must appear above
+    // widgets declared after them - see Ui_draw_at.
+
+    if w.kind == KIND_RADIO {
+        // A square with an inset square, not a circle: the backend has rects and
+        // lines, and a hand-rasterised circle at 16px is a grey blob. The inset
+        // square reads unambiguously as "chosen".
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 45, 45, 54)
+        var rr = 120
+        var rg = 120
+        var rb = 140
+        if w.enabled == 0 {
+            rr = 70
+            rg = 70
+            rb = 78
+        } else {
+            if w.id == ui.hot {
+                rr = ui.accent_r
+                rg = ui.accent_g
+                rb = ui.accent_b
+            }
+            if w.id == ui.focus {
+                rr = ui.accent_r + 40
+                rg = ui.accent_g + 40
+                rb = ui.accent_b + 40
+            }
+        }
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, rr, rg, rb)
+        if w.checked == 1 {
+            var dr = ui.accent_r + 40
+            var dg = ui.accent_g + 40
+            var db = ui.accent_b + 40
+            if w.enabled == 0 {
+                dr = 110
+                dg = 110
+                db = 120
+            }
+            gui.Win_rect(win, w.x + 4, w.y + 4, w.w - 8, w.h - 8, dr, dg, db)
+        }
+        var rh2 = gui.Win_font_height(font)
+        var tlr = ui.fg_r
+        var tlg = ui.fg_g
+        var tlb = ui.fg_b
+        if w.enabled == 0 {
+            tlr = 110
+            tlg = 110
+            tlb = 120
+        }
+        gui.Win_text(win, font, w.label, w.x + w.w + 8,
+                     w.y + (w.h - rh2) / 2, tlr, tlg, tlb)
+        return
+    }
+
+    if w.kind == KIND_DROPDOWN {
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 18, 18, 22)
+        var dr2 = 120
+        var dg2 = 120
+        var db2 = 140
+        if w.enabled == 0 {
+            dr2 = 70
+            dg2 = 70
+            db2 = 78
+        } else {
+            if w.id == ui.focus {
+                dr2 = ui.accent_r
+                dg2 = ui.accent_g
+                db2 = ui.accent_b
+            }
+        }
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, dr2, dg2, db2)
+        var fr = ui.fg_r
+        var fg2 = ui.fg_g
+        var fb = ui.fg_b
+        if w.enabled == 0 {
+            fr = 110
+            fg2 = 110
+            fb = 120
+        }
+        // The current choice, clipped to the box less the arrow gutter, so a long
+        // item stops before the arrow instead of painting through it.
+        gui.Win_clip_push(win, w.x + 1, w.y + 1, w.w - BTN_W - 2, w.h - 2)
+        var dh2 = gui.Win_font_height(font)
+        if w.sel >= 0 {
+            if w.sel < w.items.len() {
+                gui.Win_text(win, font, w.items[w.sel], w.x + 5,
+                             w.y + (w.h - dh2) / 2, fr, fg2, fb)
+            }
+        }
+        gui.Win_clip_pop(win)
+        // A downward chevron from three shortening rules. Two lines would need a
+        // diagonal-aware renderer; three rects are exact at any size.
+        var ax = w.x + w.w - BTN_W
+        var ay = w.y + w.h / 2 - 2
+        gui.Win_rect(win, ax + 2, ay, 8, 2, fr, fg2, fb)
+        gui.Win_rect(win, ax + 3, ay + 2, 6, 2, fr, fg2, fb)
+        gui.Win_rect(win, ax + 5, ay + 4, 2, 2, fr, fg2, fb)
+        return
+    }
+
+    if w.kind == KIND_SLIDER {
+        // The track is a thin rule down the middle, not the widget's full height:
+        // the widget's height is the DRAGGABLE area (a 6px-tall hit target is
+        // unusable), while the track is what the value is read off.
+        var ty2 = w.y + w.h / 2 - 2
+        var tx = w.x + BTN_W / 2
+        var tw2 = w.w - BTN_W
+        if tw2 < 0 { tw2 = 0 }
+        gui.Win_rect(win, tx, ty2, tw2, 4, 30, 30, 38)
+        gui.Win_rect_outline(win, tx, ty2, tw2, 4, 70, 70, 82)
+
+        var thumb = tx
+        var srng = w.vmax - w.vmin
+        if srng > 0 { thumb = tx + (tw2 * (w.val - w.vmin)) / srng }
+
+        // The filled part left of the thumb. Without it the two ends of the track
+        // look identical and there is no cue which way is "more".
+        var pr = ui.accent_r
+        var pg = ui.accent_g
+        var pb = ui.accent_b
+        if w.enabled == 0 {
+            pr = 80
+            pg = 80
+            pb = 88
+        }
+        gui.Win_rect(win, tx, ty2, thumb - tx, 4, pr, pg, pb)
+
+        var hr = 150
+        var hg = 150
+        var hb = 170
+        if w.enabled == 0 {
+            hr = 90
+            hg = 90
+            hb = 98
+        } else {
+            if w.id == ui.drag {
+                hr = ui.accent_r + 60
+                hg = ui.accent_g + 60
+                hb = ui.accent_b + 60
+            } else {
+                if w.id == ui.hot {
+                    hr = 190
+                    hg = 190
+                    hb = 210
+                }
+            }
+        }
+        gui.Win_rect(win, thumb - BTN_W / 2, w.y + 2, BTN_W, w.h - 4, hr, hg, hb)
+        var or2 = 90
+        var og = 90
+        var ob = 110
+        if w.id == ui.focus {
+            or2 = ui.accent_r + 40
+            og = ui.accent_g + 40
+            ob = ui.accent_b + 40
+        }
+        gui.Win_rect_outline(win, thumb - BTN_W / 2, w.y + 2, BTN_W, w.h - 4,
+                             or2, og, ob)
+        return
+    }
+
+    if w.kind == KIND_PROGRESS {
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 18, 18, 22)
+        var fill = 0
+        if w.w > 2 { fill = ((w.w - 2) * w.val) / 1000 }
+        var gr = ui.accent_r + 30
+        var gg = ui.accent_g + 30
+        var gb = ui.accent_b + 30
+        if w.enabled == 0 {
+            gr = 80
+            gg = 80
+            gb = 88
+        }
+        gui.Win_rect(win, w.x + 1, w.y + 1, fill, w.h - 2, gr, gg, gb)
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, 120, 120, 140)
+        return
+    }
+
+    if w.kind == KIND_LISTBOX {
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 18, 18, 22)
+        var lbr = 120
+        var lbg = 120
+        var lbb = 140
+        if w.enabled == 0 {
+            lbr = 70
+            lbg = 70
+            lbb = 78
+        } else {
+            if w.id == ui.focus {
+                lbr = ui.accent_r
+                lbg = ui.accent_g
+                lbb = ui.accent_b
+            }
+        }
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, lbr, lbg, lbb)
+
+        gui.Win_clip_push(win, w.x + 1, w.y + 1, w.w - 2, w.h - 2)
+        var rh3 = gui.Win_font_height(font) + 6
+        var vis = (w.h - 4) / rh3
+        if vis < 1 { vis = 1 }
+        var lfr = ui.fg_r
+        var lfg = ui.fg_g
+        var lfb = ui.fg_b
+        if w.enabled == 0 {
+            lfr = 110
+            lfg = 110
+            lfb = 120
+        }
+        var k2 = 0
+        while k2 < vis {
+            var idx = w.scroll + k2
+            if idx < w.items.len() {
+                var ry = w.y + 2 + k2 * rh3
+                if idx == w.sel {
+                    // The selection band spans the full row width, not just the
+                    // text: a highlight sized to the string makes a short item
+                    // look like a different kind of thing from a long one.
+                    var sr = ui.accent_r
+                    var sg = ui.accent_g
+                    var sb = ui.accent_b
+                    if w.enabled == 0 {
+                        sr = 60
+                        sg = 60
+                        sb = 68
+                    }
+                    gui.Win_rect(win, w.x + 1, ry, w.w - 2, rh3, sr, sg, sb)
+                }
+                gui.Win_text(win, font, w.items[idx], w.x + 5, ry + 3,
+                             lfr, lfg, lfb)
+            }
+            k2 = k2 + 1
+        }
+        gui.Win_clip_pop(win)
+
+        // The same overflow thumb the textarea draws, for the same reason: in a
+        // box showing 4 of 40 items nothing else says there is more.
+        var cnt = w.items.len()
+        if cnt > vis {
+            var trh = w.h - 4
+            var thh = (trh * vis) / cnt
+            if thh < 8 { thh = 8 }
+            var sp = cnt - vis
+            var sty = w.y + 2
+            if sp > 0 { sty = w.y + 2 + ((trh - thh) * w.scroll) / sp }
+            gui.Win_rect(win, w.x + w.w - 6, sty, 4, thh, 90, 90, 110)
+        }
+        return
+    }
+
+    if w.kind == KIND_TABS {
+        // A rule along the bottom of the strip, broken by the selected tab, is
+        // what makes the current page look attached to its tab rather than merely
+        // highlighted.
+        gui.Win_rect(win, w.x, w.y + w.h - 2, w.w, 2, 90, 90, 110)
+        var cx2 = w.x
+        var t2 = 0
+        while t2 < w.items.len() {
+            var title = w.items[t2]
+            var tabw = gui.Win_text_width(font, title) + 20
+            if tabw < 40 { tabw = 40 }
+            var sel = 0
+            if t2 == w.sel { sel = 1 }
+            var br3 = 40
+            var bg3 = 40
+            var bb3 = 48
+            if sel == 1 {
+                br3 = 55
+                bg3 = 55
+                bb3 = 66
+            }
+            if w.enabled == 0 {
+                br3 = 34
+                bg3 = 34
+                bb3 = 40
+            }
+            gui.Win_rect(win, cx2, w.y, tabw, w.h - 2, br3, bg3, bb3)
+            gui.Win_rect_outline(win, cx2, w.y, tabw, w.h - 2, 90, 90, 110)
+            if sel == 1 {
+                // Paint over the bottom rule to join the tab to its page.
+                gui.Win_rect(win, cx2 + 1, w.y + w.h - 2, tabw - 2, 2,
+                             br3, bg3, bb3)
+                gui.Win_rect(win, cx2, w.y, tabw, 2,
+                             ui.accent_r, ui.accent_g, ui.accent_b)
+            }
+            var ttr = ui.fg_r
+            var ttg = ui.fg_g
+            var ttb = ui.fg_b
+            if w.enabled == 0 {
+                ttr = 110
+                ttg = 110
+                ttb = 120
+            } else {
+                if sel == 0 {
+                    ttr = 170
+                    ttg = 170
+                    ttb = 180
+                }
+            }
+            var tth = gui.Win_font_height(font)
+            var ttw = gui.Win_text_width(font, title)
+            gui.Win_text(win, font, title, cx2 + (tabw - ttw) / 2,
+                         w.y + (w.h - tth) / 2, ttr, ttg, ttb)
+            cx2 = cx2 + tabw
+            t2 = t2 + 1
+        }
+        return
+    }
+
+    if w.kind == KIND_GROUPBOX {
+        var ch2 = gui.Win_font_height(font) + 4
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 34, 34, 42)
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, 70, 70, 84)
+        // The caption band is filled and ruled off rather than the classic
+        // border-gap style: a gap in a 1px rect outline needs three draw calls
+        // per side, and the band also gives content_y something exact to be.
+        gui.Win_rect(win, w.x + 1, w.y + 1, w.w - 2, ch2 - 2, 44, 44, 54)
+        gui.Win_rect(win, w.x + 1, w.y + ch2 - 1, w.w - 2, 1, 70, 70, 84)
+        var glr = ui.fg_r
+        var glg = ui.fg_g
+        var glb = ui.fg_b
+        if w.enabled == 0 {
+            glr = 110
+            glg = 110
+            glb = 120
+        }
+        gui.Win_clip_push(win, w.x + 1, w.y + 1, w.w - 2, ch2 - 2)
+        gui.Win_text(win, font, w.label, w.x + 6, w.y + 2, glr, glg, glb)
+        gui.Win_clip_pop(win)
+        return
+    }
+
+    if w.kind == KIND_SPINNER {
+        var fldw = w.w - BTN_W
+        if fldw < 0 { fldw = 0 }
+        gui.Win_rect(win, w.x, w.y, fldw, w.h, 18, 18, 22)
+        var spr = 120
+        var spg = 120
+        var spb = 140
+        if w.enabled == 0 {
+            spr = 70
+            spg = 70
+            spb = 78
+        } else {
+            if w.id == ui.focus {
+                spr = ui.accent_r
+                spg = ui.accent_g
+                spb = ui.accent_b
+            }
+        }
+        gui.Win_rect_outline(win, w.x, w.y, fldw, w.h, spr, spg, spb)
+        var sfr = ui.fg_r
+        var sfg = ui.fg_g
+        var sfb = ui.fg_b
+        if w.enabled == 0 {
+            sfr = 110
+            sfg = 110
+            sfb = 120
+        }
+        // The TYPED text, not val.to_string(): they differ mid-edit and showing
+        // the value would erase the digit the user just pressed.
+        gui.Win_clip_push(win, w.x + 1, w.y + 1, fldw - 2, w.h - 2)
+        var sth = gui.Win_font_height(font)
+        gui.Win_text(win, font, w.text, w.x + 5, w.y + (w.h - sth) / 2,
+                     sfr, sfg, sfb)
+        if w.id == ui.focus {
+            var scw = gui.Win_text_width(font, w.text)
+            gui.Win_rect(win, w.x + 6 + scw, w.y + 4, 2, w.h - 8,
+                         sfr, sfg, sfb)
+        }
+        gui.Win_clip_pop(win)
+
+        var bx = w.x + fldw
+        var half = w.h / 2
+        gui.Win_rect(win, bx, w.y, BTN_W, half, 50, 50, 60)
+        gui.Win_rect(win, bx, w.y + half, BTN_W, w.h - half, 50, 50, 60)
+        gui.Win_rect_outline(win, bx, w.y, BTN_W, half, 100, 100, 120)
+        gui.Win_rect_outline(win, bx, w.y + half, BTN_W, w.h - half,
+                             100, 100, 120)
+        // Up and down chevrons, three rules each, mirrored.
+        var uy = w.y + half / 2 - 2
+        gui.Win_rect(win, bx + 7, uy, 2, 2, sfr, sfg, sfb)
+        gui.Win_rect(win, bx + 5, uy + 2, 6, 2, sfr, sfg, sfb)
+        gui.Win_rect(win, bx + 4, uy + 4, 8, 2, sfr, sfg, sfb)
+        var dy2 = w.y + half + (w.h - half) / 2 - 2
+        gui.Win_rect(win, bx + 4, dy2, 8, 2, sfr, sfg, sfb)
+        gui.Win_rect(win, bx + 5, dy2 + 2, 6, 2, sfr, sfg, sfb)
+        gui.Win_rect(win, bx + 7, dy2 + 4, 2, 2, sfr, sfg, sfb)
+        return
+    }
+
+    if w.kind == KIND_MENUBAR {
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 44, 44, 54)
+        gui.Win_rect(win, w.x, w.y + w.h - 1, w.w, 1, 70, 70, 84)
+        var mx2 = w.x
+        var m2 = 0
+        while m2 < w.items.len() {
+            var parts = w.items[m2].split("|")
+            var mt = ""
+            if parts.len() > 0 { mt = parts[0] }
+            var mtw = gui.Win_text_width(font, mt) + 20
+            if mtw < 40 { mtw = 40 }
+            if m2 == w.open {
+                // The open title stays lit while its body is down, so the body
+                // reads as belonging to it rather than floating.
+                gui.Win_rect(win, mx2, w.y, mtw, w.h,
+                             ui.accent_r, ui.accent_g, ui.accent_b)
+            }
+            var mfr = ui.fg_r
+            var mfg = ui.fg_g
+            var mfb = ui.fg_b
+            if w.enabled == 0 {
+                mfr = 110
+                mfg = 110
+                mfb = 120
+            }
+            var mth = gui.Win_font_height(font)
+            var mtwid = gui.Win_text_width(font, mt)
+            gui.Win_text(win, font, mt, mx2 + (mtw - mtwid) / 2,
+                         w.y + (w.h - mth) / 2, mfr, mfg, mfb)
+            mx2 = mx2 + mtw
+            m2 = m2 + 1
+        }
+        return
+    }
+}
+
+// Draw one widget's OPEN overlay: a dropdown's list, or a menu's pulled-down
+// body. Nothing else draws these.
+//
+// Split from draw_widget because the overlay must be painted in a LATER pass
+// than every widget body - a list that only paints above the widgets declared
+// before it is the visual half of the hit-test bug Ui_overlay_hit prevents, and
+// the two halves have to be fixed together or the toolkit lies about what the
+// user is clicking.
+//
+// `rh` and the row geometry are passed in rather than recomputed here so that
+// exactly one function decides where row n is: draw_overlay and overlay_row_at
+// must agree or a click selects the row above the one it highlighted.
+fn draw_overlay(ui: Ui, w: Widget, ox: int, oy: int, ow: int, rows: int, rh: int) {
+    var win = ui.win
+    var font = ui.font
+    if rows <= 0 { return }
+    var oh = rows * rh
+    // Opaque, and drawn AFTER the widgets it covers, so what is underneath is
+    // hidden rather than showing through - a translucent-looking list makes it
+    // impossible to tell which row the pointer is on.
+    gui.Win_rect(win, ox, oy, ow, oh, 30, 30, 38)
+    gui.Win_rect_outline(win, ox, oy, ow, oh, 130, 130, 150)
+    gui.Win_clip_push(win, ox + 1, oy + 1, ow - 2, oh - 2)
+    var n = 0
+    while n < rows {
+        var ry = oy + n * rh
+        var label = ""
+        if w.kind == KIND_MENUBAR {
+            var parts = w.items[w.open].split("|")
+            if n + 1 < parts.len() { label = parts[n + 1] }
+        } else {
+            if n < w.items.len() { label = w.items[n] }
+        }
+        if label == "-" {
+            // A separator: a rule, no text, and (see Ui_release) not selectable.
+            gui.Win_rect(win, ox + 4, ry + rh / 2, ow - 8, 1, 90, 90, 110)
+        } else {
+            // The row under the pointer, highlighted from mouse_x/mouse_y rather
+            // than from `hot`: `hot` names a WIDGET, and every row of this list
+            // belongs to the same widget.
+            var over = 0
+            if ui.mouse_x >= ox {
+                if ui.mouse_x < ox + ow {
+                    if ui.mouse_y >= ry {
+                        if ui.mouse_y < ry + rh { over = 1 }
+                    }
+                }
+            }
+            if over == 1 {
+                gui.Win_rect(win, ox + 1, ry, ow - 2, rh,
+                             ui.accent_r, ui.accent_g, ui.accent_b)
+            } else {
+                if w.kind != KIND_MENUBAR {
+                    if n == w.sel {
+                        gui.Win_rect(win, ox + 1, ry, ow - 2, rh, 50, 50, 62)
+                    }
+                }
+            }
+            gui.Win_text(win, font, label, ox + 6, ry + 3,
+                         ui.fg_r, ui.fg_g, ui.fg_b)
+        }
+        n = n + 1
+    }
+    gui.Win_clip_pop(win)
 }
 
 // Draw every widget, in declaration order, so a panel declared first sits
@@ -1587,14 +3994,99 @@ pub fn Ui_draw_into(ui: Ui) {
 // Widgets pass by value, so shifting the copy handed to draw_widget cannot
 // disturb the list. That is this one case where by-value structs are exactly
 // what is wanted.
+//
+// THREE PASSES, and that ordering is load-bearing.
+//
+// PASS 1 draws every visible widget body in declaration order, each CLIPPED to
+// its container's content box. The clip is what makes a container a container: a
+// child dragged past the edge of its groupbox is cut off at the border instead of
+// painting over whatever is outside. That bug was found here by looking at a
+// screenshot - every clip variable was individually right and the composition was
+// wrong - which is why tests/test_widgets_new.wyn asserts it with Win_pixel_at.
+//
+// PASS 2 draws the open overlays. In a later pass, not inline, because an open
+// dropdown must cover widgets declared AFTER it: drawn inline, the list is
+// painted over by every later widget and the user sees a list with holes in it.
+// Ui_overlay_hit resolves clicks in this same order, so paint order and hit order
+// match - and if they ever stop matching, a click selects whatever is underneath
+// the list, which is the bug this widget always has.
+//
+// Also NOT clipped by a container: an overlay is allowed to escape, since a
+// dropdown at the bottom edge of a groupbox has to drop past it to be usable.
 pub fn Ui_draw_at(ui: Ui, ox: int, oy: int) {
     var i = 0
     while i < ui.widgets.len() {
-        var w = ui.widgets[i]
-        w.x = w.x + ox
-        w.y = w.y + oy
-        draw_widget(ui, w)
+        if is_visible(ui, i) == 1 {
+            var w = ui.widgets[i]
+            w.x = w.x + ox
+            w.y = w.y + oy
+            var clipped = 0
+            var owi = -1
+            if w.owner != -1 { owi = Ui_index_of(ui, w.owner) }
+            if owi != -1 {
+                if clips_children(ui.widgets[owi].kind) == 0 { owi = -1 }
+            }
+            if owi != -1 {
+                var cw = content_w(ui, owi)
+                var chh = content_h(ui, owi)
+                if cw > 0 {
+                    if chh > 0 {
+                        gui.Win_clip_push(ui.win, content_x(ui, owi) + ox,
+                                          content_y(ui, owi) + oy, cw, chh)
+                        clipped = 1
+                    }
+                }
+            }
+            draw_widget(ui, w)
+            // An unbalanced push leaks the clip into the next frame, after which
+            // everything drawn is invisible for reasons that look nothing like a
+            // clip bug - so the pop is unconditional on the flag, not on the
+            // geometry that produced it.
+            if clipped == 1 { gui.Win_clip_pop(ui.win) }
+        }
         i = i + 1
+    }
+
+    var rh = row_h(ui)
+    var j = 0
+    while j < ui.widgets.len() {
+        if is_visible(ui, j) == 1 {
+            if ui.widgets[j].open >= 0 {
+                var ow = ui.widgets[j]
+                ow.x = ow.x + ox
+                ow.y = ow.y + oy
+                var oxx = ow.x
+                var oww = ow.w
+                if ow.kind == KIND_MENUBAR {
+                    oxx = menu_title_x(ui, j, ow.open) + ox
+                    oww = menu_body_w(ui, j, ow.open)
+                }
+                draw_overlay(ui, ow, oxx, ow.y + ow.h, oww,
+                             overlay_rows(ui, j), rh)
+            }
+        }
+        j = j + 1
+    }
+
+    // PASS 3: the tooltip, above everything including an open overlay - it is the
+    // topmost thing on screen by definition, and a tooltip half-hidden behind a
+    // menu is worse than none.
+    var k = 0
+    while k < ui.widgets.len() {
+        if Ui_tooltip_visible(ui, ui.widgets[k].id) == 1 {
+            var tw = ui.widgets[k]
+            var th = gui.Win_font_height(ui.font)
+            var tww = gui.Win_text_width(ui.font, tw.tooltip) + 10
+            // Below and slightly right of the widget, offset so it cannot sit
+            // under the pointer itself - a tip the cursor covers is unreadable.
+            var tx2 = tw.x + ox + 8
+            var ty3 = tw.y + oy + tw.h + 4
+            gui.Win_rect(ui.win, tx2, ty3, tww, th + 6, 60, 60, 40)
+            gui.Win_rect_outline(ui.win, tx2, ty3, tww, th + 6, 150, 150, 110)
+            gui.Win_text(ui.win, ui.font, tw.tooltip, tx2 + 5, ty3 + 3,
+                         240, 240, 220)
+        }
+        k = k + 1
     }
 }
 

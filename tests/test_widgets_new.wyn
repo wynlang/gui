@@ -1,0 +1,1180 @@
+// test_widgets_new - the nine widget kinds added after the original six:
+// radio, dropdown, slider, progress, listbox, tabs, groupbox, spinner, menubar.
+//
+//   SDL_VIDEODRIVER=dummy WYN_ROOT=/path/to/wyn  wyn run tests/test_widgets_new.wyn
+//
+// WHAT THIS ASSERTS, AND WHAT IT REFUSES TO ASSERT
+//
+// Every check below is a STATE or a PIXEL after a coordinate-computed click.
+// "It did not crash" is not a test: nine widgets that record their properties and
+// respond to nothing pass that, and passing it is exactly the state this file was
+// written to get out of.
+//
+// So each widget is driven at a coordinate the TOOLKIT computed (Ui_tab_cx,
+// Ui_overlay_row_cy, Ui_listbox_item_cy, Ui_spinner_up_cy, ...) rather than a
+// pixel this file guessed. A guessed pixel is a second copy of the widget's
+// layout formula, and a test holding its own copy of the formula passes whether
+// or not the widget agrees with it - and every one of these formulas depends on
+// Win_font_height, so a hardcoded row offset silently tests a different row on a
+// machine with a different default font.
+//
+// Two things cannot be proved by state assertions at all, and both are done with
+// Win_pixel_at:
+//
+//  - DROPDOWN OVERLAY ORDERING. That the open list is drawn ABOVE a widget
+//    declared after it. Geometry says nothing about paint order; only the pixel
+//    where the two rectangles overlap does.
+//  - CONTAINER CLIPPING. That a child hanging over its groupbox's edge is cut
+//    off. This repo already had that bug once and it was found by looking at a
+//    screenshot, not by an assertion.
+//
+// Both are paired with the matching STATE assertion (the click resolves to the
+// list, not the button underneath; the clipped-away part does not hit-test), so a
+// regression in either half is caught.
+
+import gui
+import widgets
+
+var fails = 0
+
+fn check(label: string, got: string, want: string) {
+    if got == want {
+        print("  ok   ${label} = [${got}]")
+    } else {
+        print("  FAIL ${label}: got [${got}] want [${want}]")
+        fails = fails + 1
+    }
+}
+
+fn check_int(label: string, got: int, want: int) {
+    check(label, got.to_string(), want.to_string())
+}
+
+// Handler-fired evidence. A click test that only asserts the widget's own state
+// cannot tell "the toolkit updated sel" from "the toolkit also told the program",
+// and a widget that changes silently is useless in a form.
+var fired_id = 0
+var fired_count = 0
+
+fn on_fire(id: int) {
+    fired_id = id
+    fired_count = fired_count + 1
+}
+
+fn reset_fired() {
+    fired_id = 0
+    fired_count = 0
+}
+
+// A press + release at one point: the shape of a real click, and the shape that
+// matters - a press alone proves nothing about the release, and Ui_release is
+// where the handler fires and where a radio's exclusivity is applied.
+fn click(ui: Ui, x: int, y: int) -> Ui {
+    var u = widgets.Ui_press(ui, x, y)
+    return widgets.Ui_release(u, x, y)
+}
+
+// ---------------------------------------------------------------- RADIO
+
+fn radio_tests() {
+    print("=== RADIO: exactly one per group, groups independent ===")
+    var ui = widgets.Ui_new(0 - 1, 0 - 1)
+    // Two groups interleaved in declaration order, deliberately: exclusivity is
+    // a query over the whole list, so a bug that clears "every radio after this
+    // one" or "every radio in the list" would pass if the groups were contiguous.
+    ui = widgets.Ui_radio(ui, "Red", "color", 10, 10, 1, on_fire)
+    var red = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_radio(ui, "Small", "size", 10, 40, 1, on_fire)
+    var small = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_radio(ui, "Green", "color", 10, 70, 0, on_fire)
+    var green = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_radio(ui, "Large", "size", 10, 100, 0, on_fire)
+    var large = widgets.Ui_last_id(ui)
+
+    check_int("red starts checked", widgets.Ui_checked(ui, red), 1)
+    check_int("green starts clear", widgets.Ui_checked(ui, green), 0)
+
+    print("-- a click INSIDE the box selects it and clears its group --")
+    reset_fired()
+    // x + 4, y + 4: inside a 16x16 box whichever way the default size changes.
+    ui = click(ui, widgets.Ui_x_of(ui, green) + 4,
+               widgets.Ui_y_of(ui, green) + 4)
+    check_int("green now checked", widgets.Ui_checked(ui, green), 1)
+    check_int("red was cleared", widgets.Ui_checked(ui, red), 0)
+    check_int("the handler was told which widget", fired_id, green)
+    print("-- ...and does NOT touch the other group --")
+    check_int("small still checked", widgets.Ui_checked(ui, small), 1)
+    check_int("large still clear", widgets.Ui_checked(ui, large), 0)
+
+    print("-- a click just OUTSIDE the box changes nothing --")
+    reset_fired()
+    // One pixel past the right edge. The off-by-one boundary is where a hit test
+    // with <= instead of < goes wrong, and it is invisible to a click at the
+    // centre.
+    var ox = widgets.Ui_x_of(ui, large) + widgets.Ui_w_of(ui, large)
+    ui = click(ui, ox, widgets.Ui_y_of(ui, large) + 4)
+    check_int("large still clear", widgets.Ui_checked(ui, large), 0)
+    check_int("small untouched", widgets.Ui_checked(ui, small), 1)
+    check_int("no handler fired", fired_count, 0)
+
+    print("-- one pixel INSIDE the same edge does select --")
+    ui = click(ui, ox - 1, widgets.Ui_y_of(ui, large) + 4)
+    check_int("large checked", widgets.Ui_checked(ui, large), 1)
+    check_int("small cleared", widgets.Ui_checked(ui, small), 0)
+
+    print("-- a DISABLED radio ignores a click --")
+    ui = widgets.Ui_radio(ui, "Blue", "color", 10, 130, 0, on_fire)
+    var blue = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_enabled(ui, blue, 0)
+    reset_fired()
+    ui = click(ui, widgets.Ui_x_of(ui, blue) + 4, widgets.Ui_y_of(ui, blue) + 4)
+    check_int("blue still clear", widgets.Ui_checked(ui, blue), 0)
+    check_int("green NOT cleared by the refused click",
+              widgets.Ui_checked(ui, green), 1)
+    check_int("no handler fired", fired_count, 0)
+    check_int("a disabled widget is not focusable either",
+              widgets.Ui_focusable(ui, blue), 0)
+
+    print("-- moving a radio between groups is a string edit --")
+    // The whole reason the group lives on the widget: retyping the group name in
+    // a property inspector must move it, with no side table to rebuild.
+    ui = widgets.Ui_set_group(ui, green, "size")
+    ui = widgets.Ui_radio_select(ui, green)
+    check_int("green checked", widgets.Ui_checked(ui, green), 1)
+    check_int("large (now the same group) cleared",
+              widgets.Ui_checked(ui, large), 0)
+    check_int("red (the old group) unaffected", widgets.Ui_checked(ui, red), 0)
+    print("")
+}
+
+// ---------------------------------------------------------------- SLIDER
+
+fn slider_tests() {
+    print("=== SLIDER: track position maps to value at both ends AND the middle ===")
+    var ui = widgets.Ui_new(0 - 1, 0 - 1)
+    // 0..100 over a 200px control, so the middle is an exact value and a
+    // rounding error of one step is visible rather than absorbed.
+    ui = widgets.Ui_slider(ui, 20, 20, 200, 24, 0, 100, 1, 0, on_fire)
+    var sid = widgets.Ui_last_id(ui)
+    check_int("starts at vmin", widgets.Ui_val(ui, sid), 0)
+
+    print("-- the pure mapping, at both ends and the middle --")
+    // Ui_slider_value_at is the mapping; asserting it separately from the click
+    // means a failure says whether the ARITHMETIC or the DISPATCH is wrong.
+    var lo_x = widgets.Ui_slider_thumb_x(ui, sid)
+    ui = widgets.Ui_set_val(ui, sid, 100)
+    var hi_x = widgets.Ui_slider_thumb_x(ui, sid)
+    ui = widgets.Ui_set_val(ui, sid, 50)
+    var mid_x = widgets.Ui_slider_thumb_x(ui, sid)
+    check_int("value at the left end", widgets.Ui_slider_value_at(ui, sid, lo_x), 0)
+    check_int("value at the right end", widgets.Ui_slider_value_at(ui, sid, hi_x), 100)
+    check_int("value at the middle", widgets.Ui_slider_value_at(ui, sid, mid_x), 50)
+    // The thumb must stay INSIDE the control at both extremes, which is the
+    // reason the track is inset by half a thumb.
+    check_int("thumb centre at vmin is inside the left edge",
+              lo_x > widgets.Ui_x_of(ui, sid), 1)
+    check_int("thumb centre at vmax is inside the right edge",
+              hi_x < widgets.Ui_x_of(ui, sid) + widgets.Ui_w_of(ui, sid), 1)
+    print("-- past either end CLAMPS, it does not wrap or overflow --")
+    check_int("far left", widgets.Ui_slider_value_at(ui, sid, 0 - 5000), 0)
+    check_int("far right", widgets.Ui_slider_value_at(ui, sid, 5000), 100)
+
+    print("-- a real click on the track sets the value --")
+    ui = widgets.Ui_set_val(ui, sid, 0)
+    reset_fired()
+    ui = click(ui, mid_x, widgets.Ui_y_of(ui, sid) + 12)
+    check_int("clicked the middle -> 50", widgets.Ui_val(ui, sid), 50)
+    check_int("handler fired once on release", fired_count, 1)
+    check_int("...with the slider's id", fired_id, sid)
+
+    print("-- a click just BELOW the track does nothing --")
+    reset_fired()
+    var below = widgets.Ui_y_of(ui, sid) + widgets.Ui_h_of(ui, sid)
+    ui = click(ui, hi_x, below)
+    check_int("value unchanged", widgets.Ui_val(ui, sid), 50)
+    check_int("no handler fired", fired_count, 0)
+
+    print("-- a drag tracks the pointer, and fires ONCE on release --")
+    reset_fired()
+    ui = widgets.Ui_press(ui, lo_x, widgets.Ui_y_of(ui, sid) + 12)
+    check_int("press jumped to the pressed position", widgets.Ui_val(ui, sid), 0)
+    ui = widgets.Ui_motion(ui, mid_x, widgets.Ui_y_of(ui, sid) + 12)
+    check_int("motion tracked to the middle", widgets.Ui_val(ui, sid), 50)
+    check_int("no handler yet - a drag must not fire per pixel", fired_count, 0)
+    // A drag that leaves the widget vertically must keep tracking horizontally
+    // and pin at the end, not freeze at whatever it had when it crossed out.
+    ui = widgets.Ui_motion(ui, 5000, 0 - 400)
+    check_int("drag off the widget pins at vmax", widgets.Ui_val(ui, sid), 100)
+    ui = widgets.Ui_release(ui, mid_x, widgets.Ui_y_of(ui, sid) + 12)
+    check_int("release takes the final position", widgets.Ui_val(ui, sid), 50)
+    check_int("fired exactly once", fired_count, 1)
+
+    print("-- STEP is respected: only multiples from vmin are reachable --")
+    var u2 = widgets.Ui_new(0 - 1, 0 - 1)
+    // vmin 10, step 5: the grid is 10,15,...,50, counted FROM vmin. A snap
+    // implemented as `v - v % step` would make a 12-based range unable to
+    // produce its own minimum.
+    u2 = widgets.Ui_slider(u2, 0, 0, 200, 24, 10, 50, 5, 10, on_fire)
+    var s2 = widgets.Ui_last_id(u2)
+    u2 = widgets.Ui_set_val(u2, s2, 22)
+    check_int("22 snaps to the nearest multiple of 5 from 10",
+              widgets.Ui_val(u2, s2), 20)
+    u2 = widgets.Ui_set_val(u2, s2, 23)
+    check_int("23 snaps up to 25", widgets.Ui_val(u2, s2), 25)
+    u2 = widgets.Ui_set_val(u2, s2, 10)
+    check_int("the minimum itself is reachable", widgets.Ui_val(u2, s2), 10)
+    u2 = widgets.Ui_set_val(u2, s2, 0 - 99)
+    check_int("below the range clamps to vmin", widgets.Ui_val(u2, s2), 10)
+    u2 = widgets.Ui_set_val(u2, s2, 999)
+    check_int("above clamps to vmax", widgets.Ui_val(u2, s2), 50)
+    print("-- an off-grid vmax is still reachable: endpoints beat the grid --")
+    // A slider whose thumb cannot reach the right edge reads as broken, so 53
+    // must be attainable even though it is not on the 5-grid from 10.
+    var u3 = widgets.Ui_new(0 - 1, 0 - 1)
+    u3 = widgets.Ui_slider(u3, 0, 0, 200, 24, 10, 53, 5, 10, on_fire)
+    var s3 = widgets.Ui_last_id(u3)
+    u3 = widgets.Ui_set_val(u3, s3, 53)
+    check_int("vmax reachable off-grid", widgets.Ui_val(u3, s3), 53)
+
+    print("-- a DISABLED slider ignores a click --")
+    ui = widgets.Ui_set_val(ui, sid, 50)
+    ui = widgets.Ui_set_enabled(ui, sid, 0)
+    reset_fired()
+    ui = click(ui, hi_x, widgets.Ui_y_of(ui, sid) + 12)
+    check_int("value unchanged", widgets.Ui_val(ui, sid), 50)
+    check_int("no handler fired", fired_count, 0)
+    // And no drag was started - a press that both refuses and arms the drag is
+    // the version of this bug where the value changes on the next mouse move.
+    ui = widgets.Ui_motion(ui, lo_x, widgets.Ui_y_of(ui, sid) + 12)
+    check_int("a later motion does not move it either",
+              widgets.Ui_val(ui, sid), 50)
+    print("")
+}
+
+// ---------------------------------------------------------------- PROGRESS
+
+fn progress_tests() {
+    print("=== PROGRESS: 0..1 in, clamped, and never focusable ===")
+    var ui = widgets.Ui_new(0 - 1, 0 - 1)
+    ui = widgets.Ui_progress(ui, 10, 10, 200, 16, 0.35)
+    var pid = widgets.Ui_last_id(ui)
+    check_int("0.35 stored as 350 of 1000", widgets.Ui_val(ui, pid), 350)
+    ui = widgets.Ui_set_progress(ui, pid, 1.5)
+    check_int("out-of-range high clamps to full", widgets.Ui_val(ui, pid), 1000)
+    ui = widgets.Ui_set_progress(ui, pid, 0 - 0.5)
+    check_int("out-of-range low clamps to empty", widgets.Ui_val(ui, pid), 0)
+    // A progress bar in the Tab order stops the keyboard on something with
+    // nothing to do, which makes the whole keyboard path feel broken.
+    check_int("never focusable", widgets.Ui_focusable(ui, pid), 0)
+    print("")
+}
+
+// ---------------------------------------------------------------- SPINNER
+
+fn spinner_tests() {
+    print("=== SPINNER: clamps to its range, and commits typed text ===")
+    var ui = widgets.Ui_new(0 - 1, 0 - 1)
+    ui = widgets.Ui_spinner(ui, 20, 20, 80, 24, 10, 90, 5, 10, on_fire)
+    var sp = widgets.Ui_last_id(ui)
+    check_int("starts at the given value", widgets.Ui_val(ui, sp), 10)
+    check("the field shows it", widgets.Ui_text(ui, sp), "10")
+
+    print("-- the up button steps up; the down button steps down --")
+    var bx = widgets.Ui_spinner_btn_cx(ui, sp)
+    reset_fired()
+    ui = click(ui, bx, widgets.Ui_spinner_up_cy(ui, sp))
+    check_int("stepped up by vstep", widgets.Ui_val(ui, sp), 15)
+    check("the field followed", widgets.Ui_text(ui, sp), "15")
+    ui = click(ui, bx, widgets.Ui_spinner_down_cy(ui, sp))
+    check_int("stepped back down", widgets.Ui_val(ui, sp), 10)
+
+    print("-- stepping CLAMPS at both ends --")
+    var k = 0
+    while k < 40 {
+        ui = click(ui, bx, widgets.Ui_spinner_up_cy(ui, sp))
+        k = k + 1
+    }
+    check_int("cannot exceed vmax", widgets.Ui_val(ui, sp), 90)
+    var m = 0
+    while m < 40 {
+        ui = click(ui, bx, widgets.Ui_spinner_down_cy(ui, sp))
+        m = m + 1
+    }
+    check_int("cannot fall below vmin", widgets.Ui_val(ui, sp), 10)
+
+    print("-- THE TYPED-TEXT COMMIT PATH --")
+    // The whole reason `text` and `val` are separate fields. While typing "4" on
+    // the way to "40" the buffer is not a valid value for a 10..90 range, and
+    // clamping per keystroke makes the field impossible to type into.
+    ui = widgets.Ui_spinner_type(ui, sp, "9")
+    check("the buffer takes the keystroke", widgets.Ui_text(ui, sp), "109")
+    check_int("...and the VALUE has not moved yet", widgets.Ui_val(ui, sp), 10)
+    ui = widgets.Ui_spinner_commit(ui, sp)
+    check_int("commit parses 109 and clamps to vmax", widgets.Ui_val(ui, sp), 90)
+    // The write-back is the point: without it the field reads "109" while the
+    // value is 90, and the next commit re-parses the stale text.
+    check("...and rewrites the field with the clamped number",
+          widgets.Ui_text(ui, sp), "90")
+
+    print("-- lenient parsing: junk, empty, and a bare minus --")
+    ui = widgets.Ui_set_text(ui, sp, "42x")
+    ui = widgets.Ui_spinner_commit(ui, sp)
+    check_int("trailing junk stops the parse, 42 is taken",
+              widgets.Ui_val(ui, sp), 40)
+    ui = widgets.Ui_set_text(ui, sp, "")
+    ui = widgets.Ui_spinner_commit(ui, sp)
+    check_int("an empty field keeps the current value",
+              widgets.Ui_val(ui, sp), 40)
+    ui = widgets.Ui_set_text(ui, sp, "-")
+    ui = widgets.Ui_spinner_commit(ui, sp)
+    check_int("a bare minus keeps it too", widgets.Ui_val(ui, sp), 40)
+    ui = widgets.Ui_set_text(ui, sp, "-5")
+    ui = widgets.Ui_spinner_commit(ui, sp)
+    check_int("a negative below vmin clamps up", widgets.Ui_val(ui, sp), 10)
+
+    print("-- a button press commits the buffer BEFORE stepping --")
+    // Stepping from the old value would silently discard what the user typed.
+    ui = widgets.Ui_set_val(ui, sp, 10)
+    ui = widgets.Ui_set_text(ui, sp, "50")
+    ui = click(ui, bx, widgets.Ui_spinner_up_cy(ui, sp))
+    check_int("committed 50, then stepped to 55", widgets.Ui_val(ui, sp), 55)
+
+    print("-- BLUR commits: clicking away must not lose the typed number --")
+    ui = widgets.Ui_press(ui, widgets.Ui_x_of(ui, sp) + 4,
+                          widgets.Ui_y_of(ui, sp) + 12)
+    check_int("the field has focus", widgets.Ui_focus(ui), sp)
+    ui = widgets.Ui_spinner_type(ui, sp, "0")
+    check("typed", widgets.Ui_text(ui, sp), "550")
+    check_int("value not yet moved", widgets.Ui_val(ui, sp), 55)
+    // A press on empty space: the focus leaves, and the buffer must commit.
+    ui = widgets.Ui_press(ui, 600, 400)
+    check_int("focus dropped", widgets.Ui_focus(ui), 0 - 1)
+    check_int("the typed 550 was committed and clamped",
+              widgets.Ui_val(ui, sp), 90)
+
+    print("-- a click just OUTSIDE the buttons does not step --")
+    ui = widgets.Ui_set_val(ui, sp, 50)
+    var right = widgets.Ui_x_of(ui, sp) + widgets.Ui_w_of(ui, sp)
+    ui = click(ui, right, widgets.Ui_spinner_up_cy(ui, sp))
+    check_int("value unchanged", widgets.Ui_val(ui, sp), 50)
+    // ...and a click in the TEXT field only focuses; it must not step.
+    ui = click(ui, widgets.Ui_x_of(ui, sp) + 3, widgets.Ui_spinner_up_cy(ui, sp))
+    check_int("a click in the field does not step", widgets.Ui_val(ui, sp), 50)
+
+    print("-- a DISABLED spinner ignores a click --")
+    ui = widgets.Ui_set_enabled(ui, sp, 0)
+    ui = click(ui, bx, widgets.Ui_spinner_up_cy(ui, sp))
+    check_int("value unchanged", widgets.Ui_val(ui, sp), 50)
+    ui = widgets.Ui_spinner_type(ui, sp, "7")
+    check("typing refused too", widgets.Ui_text(ui, sp), "50")
+    print("")
+}
+
+// ---------------------------------------------------------------- DROPDOWN
+//
+// The state half of the overlay-ordering test. The pixel half is in
+// overlay_pixel_tests; both are needed, and they check different failures:
+//
+//  - state only: the click could resolve to the list while the list is drawn
+//    UNDER the button, so the user clicks something invisible.
+//  - pixels only: the list could be drawn on top and the click still fall
+//    through to the button, which is the classic version of this bug.
+
+fn dropdown_tests(win: int, font: int) {
+    print("=== DROPDOWN: the overlay wins the hit test against what is beneath ===")
+    var ui = widgets.Ui_new(win, font)
+    // The button is declared AFTER the dropdown and placed where the open list
+    // will fall. Declaration order is what a naive hit test walks, so this is the
+    // arrangement in which "last match wins" gives the WRONG answer.
+    ui = widgets.Ui_dropdown(ui, "Alpha\nBeta\nGamma\nDelta", 20, 20, 140, 26,
+                             0, on_fire)
+    var dd = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_button(ui, "DANGER", 20, 46, 140, 90, on_fire)
+    var btn = widgets.Ui_last_id(ui)
+
+    check_int("4 items parsed from the newline list",
+              widgets.Ui_item_count(ui, dd), 4)
+    check("item 2", widgets.Ui_item(ui, dd, 2), "Gamma")
+    check_int("starts closed", widgets.Ui_is_open(ui, dd), 0)
+
+    print("-- while CLOSED, a click in that area reaches the button --")
+    // The control: without this, "the overlay wins" could be passing because the
+    // button is simply never reachable.
+    reset_fired()
+    var row1y = widgets.Ui_overlay_row_cy(ui, dd, 1)
+    check_int("the button covers where row 1 will be",
+              widgets.Ui_hit_test_top(ui, 60, row1y), btn)
+    ui = click(ui, 60, row1y)
+    check_int("the button fired", fired_id, btn)
+
+    print("-- open it by clicking the box --")
+    ui = click(ui, 60, widgets.Ui_y_of(ui, dd) + 13)
+    check_int("open", widgets.Ui_is_open(ui, dd), 1)
+    check_int("the overlay hangs directly below the box",
+              widgets.Ui_overlay_y(ui, dd),
+              widgets.Ui_y_of(ui, dd) + widgets.Ui_h_of(ui, dd))
+    check_int("...as tall as its 4 rows",
+              widgets.Ui_overlay_h(ui, dd), 4 * widgets.Ui_row_h(ui))
+
+    print("-- THE ONE THAT MATTERS: the open list wins the hit test --")
+    reset_fired()
+    row1y = widgets.Ui_overlay_row_cy(ui, dd, 1)
+    // Same coordinate as the control click above, which reached the button. With
+    // the list open it must resolve to the DROPDOWN.
+    check_int("the point resolves to the dropdown, not the button",
+              widgets.Ui_hit_test_top(ui, 60, row1y), dd)
+    check_int("Ui_overlay_hit names it", widgets.Ui_overlay_hit(ui, 60, row1y), dd)
+    ui = click(ui, 60, row1y)
+    check_int("row 1 was selected", widgets.Ui_sel(ui, dd), 1)
+    check("...which is Beta", widgets.Ui_item(ui, dd, widgets.Ui_sel(ui, dd)),
+          "Beta")
+    check_int("the DROPDOWN's handler fired", fired_id, dd)
+    check_int("...exactly once - the button did NOT also fire", fired_count, 1)
+    check_int("choosing closes the list", widgets.Ui_is_open(ui, dd), 0)
+
+    print("-- the LAST row is inside the overlay; one row past it is not --")
+    ui = widgets.Ui_set_open(ui, dd, 0)
+    var lasty = widgets.Ui_overlay_row_cy(ui, dd, 3)
+    check_int("row 3 hits the overlay", widgets.Ui_overlay_hit(ui, 60, lasty), dd)
+    var pasty = widgets.Ui_overlay_row_cy(ui, dd, 4)
+    check_int("row 4 does not exist", widgets.Ui_overlay_hit(ui, 60, pasty), 0 - 1)
+    // Nor does a point beside the list: the overlay is the box's width, so a
+    // click to its right belongs to whatever is there.
+    var rightx = widgets.Ui_x_of(ui, dd) + widgets.Ui_w_of(ui, dd) + 5
+    check_int("beside the list is not the overlay",
+              widgets.Ui_overlay_hit(ui, rightx, row1y), 0 - 1)
+
+    print("-- a click OUTSIDE an open list dismisses it and is SWALLOWED --")
+    // Swallowed deliberately: that is what a platform menu does, and it means
+    // "click away to cancel" cannot activate whatever was behind the list.
+    ui = widgets.Ui_set_open(ui, dd, 0)
+    ui = widgets.Ui_set_sel(ui, dd, 1)
+    reset_fired()
+    ui = click(ui, 400, 300)
+    check_int("closed", widgets.Ui_is_open(ui, dd), 0)
+    check_int("selection unchanged", widgets.Ui_sel(ui, dd), 1)
+    check_int("nothing fired", fired_count, 0)
+
+    print("-- a second click on the box TOGGLES it closed --")
+    ui = click(ui, 60, widgets.Ui_y_of(ui, dd) + 13)
+    check_int("open", widgets.Ui_is_open(ui, dd), 1)
+    ui = click(ui, 60, widgets.Ui_y_of(ui, dd) + 13)
+    check_int("closed again", widgets.Ui_is_open(ui, dd), 0)
+
+    print("-- Escape closes an open list; it does NOT quit the program --")
+    ui = widgets.Ui_set_open(ui, dd, 0)
+    check_int("running before", widgets.Ui_running(ui), 1)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_ESCAPE)
+    check_int("list closed", widgets.Ui_is_open(ui, dd), 0)
+    check_int("still running", widgets.Ui_running(ui), 1)
+    // With nothing open, Escape means quit again.
+    ui = widgets.Ui_key(ui, gui.SCANCODE_ESCAPE)
+    check_int("now it quits", widgets.Ui_running(ui), 0)
+
+    print("-- a DISABLED dropdown will not open, by click OR by call --")
+    var u2 = widgets.Ui_new(win, font)
+    u2 = widgets.Ui_dropdown(u2, "A\nB", 20, 20, 100, 26, 0, on_fire)
+    var d2 = widgets.Ui_last_id(u2)
+    u2 = widgets.Ui_set_enabled(u2, d2, 0)
+    reset_fired()
+    u2 = click(u2, 60, 30)
+    check_int("click refused", widgets.Ui_is_open(u2, d2), 0)
+    // Programmatic too: if "disabled" only meant "ignores the mouse", every
+    // other caller would have to re-check it.
+    u2 = widgets.Ui_set_open(u2, d2, 0)
+    check_int("Ui_set_open refused as well", widgets.Ui_is_open(u2, d2), 0)
+    check_int("no handler fired", fired_count, 0)
+    print("")
+}
+
+// ---------------------------------------------------------------- LISTBOX
+
+fn listbox_tests(win: int, font: int) {
+    print("=== LISTBOX: keyboard selection, clamped at both ends ===")
+    var ui = widgets.Ui_new(win, font)
+    // 12 items in a box that shows fewer, so the scroll-follow is exercised
+    // rather than accidentally satisfied.
+    var body = "i0"
+    var k = 1
+    while k < 12 {
+        body = body + "\n" + "i" + k.to_string()
+        k = k + 1
+    }
+    ui = widgets.Ui_listbox(ui, body, 20, 20, 160, 90, 0, on_fire)
+    var lb = widgets.Ui_last_id(ui)
+    var rows = widgets.Ui_listbox_rows(ui, lb)
+    print("   rows visible in a 90px box = ${rows}")
+    check_int("12 items", widgets.Ui_item_count(ui, lb), 12)
+    check_int("selection starts at 0", widgets.Ui_sel(ui, lb), 0)
+
+    print("-- a click selects the row it landed on --")
+    reset_fired()
+    ui = click(ui, 60, widgets.Ui_listbox_item_cy(ui, lb, 2))
+    check_int("row 2 selected", widgets.Ui_sel(ui, lb), 2)
+    check_int("handler fired", fired_id, lb)
+    check_int("...and it took focus", widgets.Ui_focus(ui), lb)
+
+    print("-- a click just ABOVE the box does not select --")
+    reset_fired()
+    ui = click(ui, 60, widgets.Ui_y_of(ui, lb) - 1)
+    check_int("selection unchanged", widgets.Ui_sel(ui, lb), 2)
+    check_int("nothing fired", fired_count, 0)
+
+    print("-- Down/Up move the selection, THROUGH Ui_key --")
+    // Through Ui_key, not Ui_listbox_move: a focused list has to OWN the arrow
+    // keys, and a test that called the mover directly would pass even if Down
+    // never reached it.
+    ui = widgets.Ui_set_focus(ui, lb)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_DOWN)
+    check_int("down", widgets.Ui_sel(ui, lb), 3)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_UP)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_UP)
+    check_int("up twice", widgets.Ui_sel(ui, lb), 1)
+
+    print("-- and CLAMP at both ends: no wrap --")
+    // Wrapping is the behaviour every user reads as a glitch, and a list that
+    // wraps cannot be driven to "the last item" by holding a key.
+    var d = 0
+    while d < 30 {
+        ui = widgets.Ui_key(ui, gui.SCANCODE_DOWN)
+        d = d + 1
+    }
+    check_int("stops at the last item", widgets.Ui_sel(ui, lb), 11)
+    check_int("...and scrolled to keep it visible",
+              widgets.Ui_scroll(ui, lb), 12 - rows)
+    var u = 0
+    while u < 30 {
+        ui = widgets.Ui_key(ui, gui.SCANCODE_UP)
+        u = u + 1
+    }
+    check_int("stops at the first item", widgets.Ui_sel(ui, lb), 0)
+    check_int("...and scrolled back to the top", widgets.Ui_scroll(ui, lb), 0)
+
+    print("-- a scrolled list still selects the row you clicked --")
+    // The click maps through `scroll`, so a list scrolled to the bottom must not
+    // select the item that WAS at that pixel before the scroll.
+    ui = widgets.Ui_listbox_scroll(ui, lb, 5)
+    check_int("scrolled", widgets.Ui_scroll(ui, lb), 5)
+    ui = click(ui, 60, widgets.Ui_listbox_item_cy(ui, lb, 6))
+    check_int("clicked item 6, not item 1", widgets.Ui_sel(ui, lb), 6)
+
+    print("-- scrolling CLAMPS so the last page cannot scroll off --")
+    ui = widgets.Ui_listbox_scroll(ui, lb, 9999)
+    check_int("clamped to the last full page",
+              widgets.Ui_scroll(ui, lb), 12 - rows)
+    ui = widgets.Ui_listbox_scroll(ui, lb, 0 - 9999)
+    check_int("and back to the top", widgets.Ui_scroll(ui, lb), 0)
+
+    print("-- a DISABLED listbox ignores clicks AND keys --")
+    ui = widgets.Ui_set_sel(ui, lb, 3)
+    ui = widgets.Ui_set_enabled(ui, lb, 0)
+    reset_fired()
+    ui = click(ui, 60, widgets.Ui_listbox_item_cy(ui, lb, 0))
+    check_int("click refused", widgets.Ui_sel(ui, lb), 3)
+    ui = widgets.Ui_set_focus(ui, lb)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_DOWN)
+    check_int("key refused", widgets.Ui_sel(ui, lb), 3)
+    check_int("no handler fired", fired_count, 0)
+    print("")
+}
+
+// ---------------------------------------------------------------- TABS
+
+fn tabs_tests(win: int, font: int) {
+    print("=== TABS: swapping the visible child group ===")
+    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_tabs(ui, "General\nAdvanced", 20, 20, 300, 26, 0, on_fire)
+    var tb = widgets.Ui_last_id(ui)
+    // One control per page, both in the same flat list - which is the point of
+    // the page model: the designer can select and move a control on a hidden tab.
+    ui = widgets.Ui_button(ui, "on page 0", 30, 60, 120, 26, on_fire)
+    var p0 = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_owner(ui, p0, tb)
+    ui = widgets.Ui_set_page(ui, p0, 0)
+    ui = widgets.Ui_button(ui, "on page 1", 30, 60, 120, 26, on_fire)
+    var p1 = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_owner(ui, p1, tb)
+    ui = widgets.Ui_set_page(ui, p1, 1)
+    // A control with no page is always shown, whatever tab is current.
+    ui = widgets.Ui_button(ui, "always", 30, 200, 120, 26, on_fire)
+    var always = widgets.Ui_last_id(ui)
+
+    check_int("page 0's control is visible", widgets.Ui_visible(ui, p0), 1)
+    check_int("page 1's is not", widgets.Ui_visible(ui, p1), 0)
+    check_int("the pageless one always is", widgets.Ui_visible(ui, always), 1)
+
+    print("-- the two tabs are at DIFFERENT measured x positions --")
+    // Widths come from the titles, so "General" and "Advanced" differ; a test
+    // with a hardcoded tab width would be checking its own guess.
+    check_int("tab 0 starts at the strip's x",
+              widgets.Ui_tab_x(ui, tb, 0), widgets.Ui_x_of(ui, tb))
+    check_int("tab 1 starts after tab 0",
+              widgets.Ui_tab_x(ui, tb, 1),
+              widgets.Ui_tab_x(ui, tb, 0) + widgets.Ui_tab_w(ui, tb, 0))
+
+    print("-- clicking tab 1 swaps which child group is visible --")
+    reset_fired()
+    ui = click(ui, widgets.Ui_tab_cx(ui, tb, 1), widgets.Ui_y_of(ui, tb) + 13)
+    check_int("selection is tab 1", widgets.Ui_sel(ui, tb), 1)
+    check_int("page 1's control appeared", widgets.Ui_visible(ui, p1), 1)
+    check_int("page 0's disappeared", widgets.Ui_visible(ui, p0), 0)
+    check_int("the pageless one is unaffected", widgets.Ui_visible(ui, always), 1)
+
+    print("-- a HIDDEN control cannot be clicked or focused --")
+    // Both buttons sit at the same coordinates, so the hit test has to pick the
+    // visible one - a hidden control that still responds is worse than a missing
+    // one, because the user cannot see what they hit.
+    reset_fired()
+    ui = click(ui, 60, 72)
+    check_int("the click reached page 1's control", fired_id, p1)
+    check_int("...once", fired_count, 1)
+    check_int("page 0's control is not focusable while hidden",
+              widgets.Ui_focusable(ui, p0), 0)
+
+    print("-- clicking back restores page 0 --")
+    ui = click(ui, widgets.Ui_tab_cx(ui, tb, 0), widgets.Ui_y_of(ui, tb) + 13)
+    check_int("selection is tab 0", widgets.Ui_sel(ui, tb), 0)
+    reset_fired()
+    ui = click(ui, 60, 72)
+    check_int("now the click reaches page 0's control", fired_id, p0)
+
+    print("-- a click in the empty strip past the last tab selects nothing --")
+    // An unchecked -1 tab index would select tab 0 here, which looks like the
+    // strip randomly resetting itself.
+    ui = widgets.Ui_set_sel(ui, tb, 1)
+    var pastx = widgets.Ui_tab_x(ui, tb, 1) + widgets.Ui_tab_w(ui, tb, 1) + 10
+    check_int("no tab at that x", widgets.Ui_tab_at(ui, tb, pastx), 0 - 1)
+    ui = click(ui, pastx, widgets.Ui_y_of(ui, tb) + 13)
+    check_int("selection unchanged", widgets.Ui_sel(ui, tb), 1)
+
+    print("-- Left/Right move pages when the strip has focus --")
+    ui = widgets.Ui_set_focus(ui, tb)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_LEFT)
+    check_int("left", widgets.Ui_sel(ui, tb), 0)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_LEFT)
+    // A tab strip with NO current page would hide every page at once, so 0 is
+    // the floor rather than -1.
+    check_int("left again stays on 0, never -1", widgets.Ui_sel(ui, tb), 0)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_RIGHT)
+    check_int("right", widgets.Ui_sel(ui, tb), 1)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_RIGHT)
+    check_int("right past the last stays on it", widgets.Ui_sel(ui, tb), 1)
+
+    print("-- a DISABLED strip does not switch pages --")
+    ui = widgets.Ui_set_sel(ui, tb, 0)
+    ui = widgets.Ui_set_enabled(ui, tb, 0)
+    ui = click(ui, widgets.Ui_tab_cx(ui, tb, 1), widgets.Ui_y_of(ui, tb) + 13)
+    check_int("still on tab 0", widgets.Ui_sel(ui, tb), 0)
+    print("")
+}
+
+// ---------------------------------------------------------------- MENUBAR
+
+fn menubar_tests(win: int, font: int) {
+    print("=== MENUBAR: two levels out of one packed [string] ===")
+    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_menubar(ui, "File|New|Open|-|Quit\nEdit|Undo|Cut",
+                            0, 0, 400, 24, on_fire)
+    var mb = widgets.Ui_last_id(ui)
+    // A widget UNDER the pulled-down body, to prove the menu owns the click - the
+    // same failure as the dropdown, in the kind that has the most rows.
+    ui = widgets.Ui_button(ui, "BENEATH", 0, 24, 200, 200, on_fire)
+    var under = widgets.Ui_last_id(ui)
+
+    check_int("2 top-level menus", widgets.Ui_menu_count(ui, mb), 2)
+    check("title 0", widgets.Ui_menu_title(ui, mb, 0), "File")
+    check("title 1", widgets.Ui_menu_title(ui, mb, 1), "Edit")
+    check_int("File has 4 entries", widgets.Ui_menu_entry_count(ui, mb, 0), 4)
+    check("entry 0", widgets.Ui_menu_entry(ui, mb, 0, 0), "New")
+    check("entry 2 is the separator", widgets.Ui_menu_entry(ui, mb, 0, 2), "-")
+    check("entry 3", widgets.Ui_menu_entry(ui, mb, 0, 3), "Quit")
+    check_int("Edit has 2", widgets.Ui_menu_entry_count(ui, mb, 1), 2)
+    check("an out-of-range entry is empty, not a trap",
+          widgets.Ui_menu_entry(ui, mb, 0, 99), "")
+
+    print("-- clicking a title pulls its menu down --")
+    ui = click(ui, widgets.Ui_menu_title_cx(ui, mb, 0), 12)
+    check_int("File is open", widgets.Ui_open(ui, mb), 0)
+    check_int("...4 rows tall", widgets.Ui_overlay_h(ui, mb),
+              4 * widgets.Ui_row_h(ui))
+
+    print("-- the body wins the hit test against the widget beneath --")
+    reset_fired()
+    var e0y = widgets.Ui_overlay_row_cy(ui, mb, 0)
+    var e0x = widgets.Ui_menu_title_cx(ui, mb, 0)
+    check_int("the point resolves to the menubar",
+              widgets.Ui_hit_test_top(ui, e0x, e0y), mb)
+    ui = click(ui, e0x, e0y)
+    check_int("entry 0 was chosen", widgets.Ui_sel(ui, mb), 0)
+    check_int("the menubar's handler fired", fired_id, mb)
+    check_int("...and the button beneath did not", fired_count, 1)
+    check_int("choosing closes the menu", widgets.Ui_open(ui, mb), 0 - 1)
+
+    print("-- a SEPARATOR is inert: it chooses nothing and closes nothing --")
+    ui = widgets.Ui_set_open(ui, mb, 0)
+    ui = widgets.Ui_set_sel(ui, mb, 0)
+    reset_fired()
+    ui = click(ui, e0x, widgets.Ui_overlay_row_cy(ui, mb, 2))
+    check_int("selection unchanged", widgets.Ui_sel(ui, mb), 0)
+    check_int("no handler fired", fired_count, 0)
+    check_int("still open", widgets.Ui_open(ui, mb), 0)
+
+    print("-- opening the SECOND menu closes the first --")
+    // Two overlays open at once would make "which one owns this click"
+    // ambiguous, so opening one closes the other.
+    ui = click(ui, widgets.Ui_menu_title_cx(ui, mb, 1), 12)
+    check_int("Edit is open", widgets.Ui_open(ui, mb), 1)
+    check_int("Edit's body is only 2 rows", widgets.Ui_overlay_h(ui, mb),
+              2 * widgets.Ui_row_h(ui))
+    // Edit hangs off Edit's title, not off the menubar's left edge.
+    check_int("the body hangs under Edit's title",
+              widgets.Ui_overlay_x(ui, mb), widgets.Ui_menu_title_x(ui, mb, 1))
+
+    print("-- a DISABLED menubar does not open --")
+    ui = widgets.Ui_close_overlays(ui)
+    ui = widgets.Ui_set_enabled(ui, mb, 0)
+    reset_fired()
+    ui = click(ui, widgets.Ui_menu_title_cx(ui, mb, 0), 12)
+    check_int("still closed", widgets.Ui_open(ui, mb), 0 - 1)
+    // ...and the button beneath is now reachable again, so the refusal is not
+    // "the menubar swallowed the click".
+    check_int("the button under the strip is unaffected",
+              widgets.Ui_enabled(ui, under), 1)
+    print("")
+}
+
+// ---------------------------------------------------------------- GROUPBOX
+
+fn groupbox_tests(win: int, font: int) {
+    print("=== GROUPBOX: a child that overhangs is CLIPPED, in paint AND in hits ===")
+    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_groupbox(ui, "Options", 20, 20, 200, 120)
+    var gb = widgets.Ui_last_id(ui)
+    // A child wider than its container, deliberately: this is the shape that had
+    // the real bug - the overhang painted over whatever lay outside the box.
+    ui = widgets.Ui_button(ui, "wide", 30, 60, 400, 26, on_fire)
+    var kid = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_owner(ui, kid, gb)
+
+    var cx = widgets.Ui_content_x_of(ui, gb)
+    var cw = widgets.Ui_content_w_of(ui, gb)
+    var cy = widgets.Ui_content_y_of(ui, gb)
+    print("   content box = ${cx},${cy} ${cw}x${widgets.Ui_content_h_of(ui, gb)}")
+    // The caption band is reserved: a child at the groupbox's own y would be
+    // drawn over the title.
+    check_int("content starts below the caption",
+              cy > widgets.Ui_y_of(ui, gb), 1)
+    check_int("content is narrower than the box",
+              cw < widgets.Ui_w_of(ui, gb), 1)
+
+    print("-- the visible part of the child hit-tests --")
+    // The child's OWN x, not the content box's: the child starts inside the
+    // container, so cx is left of it and a probe there is outside the child.
+    var inside = widgets.Ui_x_of(ui, kid) + 5
+    check_int("inside both", widgets.Ui_hit_clipped(ui, kid, inside, 70), 1)
+    print("-- the CLIPPED-AWAY part does not --")
+    // Inside the child's own rect, outside the container's content box. A hit
+    // here means the user can press something they cannot see.
+    var beyond = cx + cw + 10
+    check_int("beyond the container, inside the child's rect",
+              widgets.Ui_hit_clipped(ui, kid, beyond, 70), 1 - 1)
+    check_int("...and Ui_hit alone would have said yes",
+              widgets.Ui_hit_test(ui, beyond, 70), kid)
+    reset_fired()
+    ui = click(ui, beyond, 70)
+    check_int("so a click there fires nothing", fired_count, 0)
+    print("-- and a click on the visible part DOES fire --")
+    ui = click(ui, inside, 70)
+    check_int("fired", fired_id, kid)
+
+    print("-- a GROUPBOX is decoration: never hot, never focusable --")
+    check_int("not focusable", widgets.Ui_focusable(ui, gb), 0)
+
+    print("-- deleting the container leaves the child usable, not lost --")
+    // Degrade to "the child floats free", never to "the child vanishes and
+    // cannot be selected to be fixed".
+    ui = widgets.Ui_delete(ui, gb)
+    check_int("still visible", widgets.Ui_visible(ui, kid), 1)
+    reset_fired()
+    ui = click(ui, beyond, 70)
+    check_int("and now unclipped, so the overhang is clickable", fired_id, kid)
+    print("")
+}
+
+// ---------------------------------------------------------------- TOOLTIP
+
+fn tooltip_tests(win: int, font: int) {
+    print("=== TOOLTIP: appears only after the DWELL time ===")
+    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_button(ui, "Save", 20, 20, 100, 30, on_fire)
+    var b = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_button(ui, "Load", 20, 60, 100, 30, on_fire)
+    var b2 = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_tooltip(ui, b, "Write the file to disk")
+    check("the text round-trips", widgets.Ui_tooltip_of(ui, b),
+          "Write the file to disk")
+    check_int("the default delay", widgets.Ui_tooltip_delay(ui), 600)
+
+    // The injected clock, not a sleep. A sleeping test would take longer than the
+    // whole rest of the suite and would STILL be a flaky assertion about
+    // scheduling rather than a claim about the dwell logic.
+    ui = widgets.Ui_set_fake_now(ui, 10000)
+    check_int("the clock is the injected one", widgets.Ui_now(ui), 10000)
+
+    print("-- not hovering: no tooltip --")
+    check_int("no hover stamp yet", widgets.Ui_hover_since(ui, b), 0)
+    check_int("not visible", widgets.Ui_tooltip_visible(ui, b), 0)
+
+    print("-- hover starts the clock but shows nothing yet --")
+    ui = widgets.Ui_motion(ui, 60, 30)
+    check_int("stamped at the current time", widgets.Ui_hover_since(ui, b), 10000)
+    check_int("still not visible - 0ms elapsed",
+              widgets.Ui_tooltip_visible(ui, b), 0)
+
+    print("-- one millisecond short of the delay: still nothing --")
+    // The boundary. An off-by-one here is the difference between a tooltip and a
+    // flicker, and it is invisible to a test that only checks "eventually".
+    ui = widgets.Ui_set_fake_now(ui, 10000 + 599)
+    check_int("599ms of a 600ms dwell", widgets.Ui_tooltip_visible(ui, b), 0)
+
+    print("-- at exactly the delay: it appears --")
+    ui = widgets.Ui_set_fake_now(ui, 10000 + 600)
+    check_int("600ms", widgets.Ui_tooltip_visible(ui, b), 1)
+    ui = widgets.Ui_set_fake_now(ui, 10000 + 5000)
+    check_int("and stays", widgets.Ui_tooltip_visible(ui, b), 1)
+
+    print("-- the stamp is NOT refreshed while the pointer rests --")
+    // Re-stamping every frame is the bug that makes a tooltip never appear at
+    // all, and nothing but an advancing clock can see it.
+    ui = widgets.Ui_motion(ui, 61, 31)
+    check_int("stamp unchanged by a move WITHIN the widget",
+              widgets.Ui_hover_since(ui, b), 10000)
+    check_int("so it is still visible", widgets.Ui_tooltip_visible(ui, b), 1)
+
+    print("-- moving away clears it, and the dwell restarts --")
+    ui = widgets.Ui_motion(ui, 400, 400)
+    check_int("stamp cleared", widgets.Ui_hover_since(ui, b), 0)
+    check_int("hidden", widgets.Ui_tooltip_visible(ui, b), 0)
+    ui = widgets.Ui_motion(ui, 60, 30)
+    check_int("re-stamped at the NEW time",
+              widgets.Ui_hover_since(ui, b), 10000 + 5000)
+    check_int("so it must dwell again", widgets.Ui_tooltip_visible(ui, b), 0)
+
+    print("-- a widget with no tooltip text never shows one --")
+    ui = widgets.Ui_motion(ui, 60, 70)
+    check_int("b2 is hovered", widgets.Ui_hover_since(ui, b2) > 0, 1)
+    ui = widgets.Ui_set_fake_now(ui, 99000)
+    check_int("but has no text, so nothing appears",
+              widgets.Ui_tooltip_visible(ui, b2), 0)
+
+    print("-- a DISABLED control still explains itself --")
+    // Deliberate: "why is this greyed out" is the question a tooltip exists to
+    // answer, so `enabled` is the one condition Ui_tooltip_visible ignores.
+    ui = widgets.Ui_set_enabled(ui, b, 0)
+    ui = widgets.Ui_set_fake_now(ui, 100000)
+    ui = widgets.Ui_motion(ui, 60, 30)
+    ui = widgets.Ui_set_fake_now(ui, 100000 + 700)
+    check_int("visible on a disabled widget",
+              widgets.Ui_tooltip_visible(ui, b), 1)
+
+    print("-- delay 0 shows immediately, rather than never --")
+    var u2 = widgets.Ui_new(win, font)
+    u2 = widgets.Ui_button(u2, "X", 0, 0, 40, 20, on_fire)
+    var b3 = widgets.Ui_last_id(u2)
+    u2 = widgets.Ui_set_tooltip(u2, b3, "tip")
+    u2 = widgets.Ui_set_tooltip_delay(u2, 0)
+    u2 = widgets.Ui_set_fake_now(u2, 500)
+    u2 = widgets.Ui_motion(u2, 10, 10)
+    check_int("immediate", widgets.Ui_tooltip_visible(u2, b3), 1)
+    print("")
+}
+
+// ---------------------------------------------------------------- FOCUS ORDER
+
+fn focus_tests(win: int, font: int) {
+    print("=== Tab order: skips what cannot be typed into ===")
+    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_label(ui, "Name", 10, 10)
+    ui = widgets.Ui_entry(ui, "", 10, 30, 120, 24)
+    var e = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_progress(ui, 10, 60, 120, 12, 0.5)
+    ui = widgets.Ui_slider(ui, 10, 80, 120, 20, 0, 10, 1, 0, on_fire)
+    var s = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_button(ui, "Go", 10, 110, 60, 24, on_fire)
+    var b = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_enabled(ui, b, 0)
+
+    ui = widgets.Ui_set_focus(ui, 0 - 1)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_TAB)
+    check_int("Tab lands on the entry, skipping the label", widgets.Ui_focus(ui), e)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_TAB)
+    check_int("then the slider, skipping the progress bar",
+              widgets.Ui_focus(ui), s)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_TAB)
+    // The disabled button is skipped, so the order WRAPS back to the entry. A
+    // disabled control left in the Tab order is the bug where it cannot be
+    // clicked but can still be typed into.
+    check_int("wraps past the disabled button back to the entry",
+              widgets.Ui_focus(ui), e)
+
+    print("-- a focused slider owns Left/Right; the form still owns Tab --")
+    ui = widgets.Ui_set_focus(ui, s)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_RIGHT)
+    check_int("right stepped the value", widgets.Ui_val(ui, s), 1)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_LEFT)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_LEFT)
+    check_int("left clamps at vmin", widgets.Ui_val(ui, s), 0)
+    ui = widgets.Ui_key(ui, gui.SCANCODE_TAB)
+    check_int("Tab still moves the focus off it",
+              widgets.Ui_focus(ui) != s, 1)
+    print("")
+}
+
+// ------------------------------------------------------- PIXELS: the two
+//                                                          unprovable-by-state
+//
+// Geometry assertions cannot prove either of these, and both have failed here
+// before. Win_pixel_at reads the rendered frame, so a headless run asserts what
+// the user would actually SEE.
+
+// 1 if the pixel at (x,y) is the loud test colour rather than the toolkit's.
+fn is_marker(win: int, x: int, y: int) -> int {
+    if gui.Win_pixel_at(win, x, y, 0) < 200 { return 0 }
+    if gui.Win_pixel_at(win, x, y, 1) > 60 { return 0 }
+    if gui.Win_pixel_at(win, x, y, 2) > 60 { return 0 }
+    return 1
+}
+
+fn overlay_pixel_tests(win: int, font: int) {
+    print("=== PIXELS: the open list is DRAWN above the widget beneath it ===")
+    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_dropdown(ui, "Alpha\nBeta\nGamma", 20, 20, 140, 26, 0, on_fire)
+    var dd = widgets.Ui_last_id(ui)
+    // A PANEL declared after the dropdown, so it is painted later. The panel is
+    // where the open list falls.
+    ui = widgets.Ui_panel(ui, 20, 46, 140, 120)
+
+    var probe_x = 60
+    var probe_y = widgets.Ui_overlay_row_cy(ui, dd, 1)
+
+    print("-- with the list CLOSED, that pixel is the panel --")
+    // A marker rect under everything, in a colour the toolkit never uses, so
+    // "the list was drawn" is distinguishable from "nothing was drawn at all".
+    gui.Win_clear(win, 0, 0, 0)
+    gui.Win_rect(win, 0, 0, 400, 300, 255, 30, 30)
+    widgets.Ui_draw_into(ui)
+    check_int("the panel covered the marker", is_marker(win, probe_x, probe_y), 0)
+    var closed_r = gui.Win_pixel_at(win, probe_x, probe_y, 0)
+    var closed_g = gui.Win_pixel_at(win, probe_x, probe_y, 1)
+    print("   closed: pixel = ${closed_r},${closed_g}")
+
+    print("-- open it and redraw: the pixel must CHANGE --")
+    // THE ASSERTION. The list is declared BEFORE the panel, so an overlay drawn
+    // inline with its widget would be painted over by the panel and this pixel
+    // would be identical. It differs only because the overlay is a later pass.
+    ui = widgets.Ui_set_open(ui, dd, 0)
+    gui.Win_clear(win, 0, 0, 0)
+    gui.Win_rect(win, 0, 0, 400, 300, 255, 30, 30)
+    widgets.Ui_draw_into(ui)
+    var open_r = gui.Win_pixel_at(win, probe_x, probe_y, 0)
+    var open_g = gui.Win_pixel_at(win, probe_x, probe_y, 1)
+    print("   open:   pixel = ${open_r},${open_g}")
+    var changed = 0
+    if open_r != closed_r { changed = 1 }
+    if open_g != closed_g { changed = 1 }
+    check_int("the overlay painted over the later-declared panel", changed, 1)
+    check_int("...and it is not the marker showing through, so something drew",
+              is_marker(win, probe_x, probe_y), 0)
+
+    print("-- the same pixel HIT-TESTS to the dropdown, not the panel --")
+    // Paired with the pixel check on purpose: drawn-on-top with the click falling
+    // through is the classic form of this bug, and drawn-underneath with the
+    // click captured is the other. Only both assertions together exclude both.
+    check_int("hit test", widgets.Ui_hit_test_top(ui, probe_x, probe_y), dd)
+
+    print("-- a pixel one row BELOW the list is the panel again --")
+    var past_y = widgets.Ui_overlay_row_cy(ui, dd, 3)
+    check_int("no overlay there", widgets.Ui_overlay_hit(ui, probe_x, past_y),
+              0 - 1)
+    check_int("...and the panel is still painted there",
+              is_marker(win, probe_x, past_y), 0)
+
+    print("-- the draw left the clip stack balanced --")
+    // An unbalanced push leaks the clip into the NEXT frame, after which
+    // everything is invisible for reasons that look nothing like a clip bug.
+    check_int("depth", gui.Win_clip_depth(win), 0)
+    print("")
+}
+
+fn clip_pixel_tests(win: int, font: int) {
+    print("=== PIXELS: a child that overhangs its groupbox is CUT OFF ===")
+    // The bug this covers was found by looking at a screenshot: every clip
+    // variable was individually right and the COMPOSITION was wrong, so a widget
+    // painted over the area outside its container. No assertion about clip state
+    // would have caught it.
+    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_groupbox(ui, "Box", 20, 20, 120, 100)
+    var gb = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_panel(ui, 30, 50, 300, 30)
+    var kid = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_owner(ui, kid, gb)
+
+    var cx = widgets.Ui_content_x_of(ui, gb)
+    var cw = widgets.Ui_content_w_of(ui, gb)
+
+    gui.Win_clear(win, 0, 0, 0)
+    // The marker fills everything, so any pixel the toolkit did NOT paint reads
+    // as the marker. That is the only way to assert "nothing was drawn HERE".
+    gui.Win_rect(win, 0, 0, 400, 300, 255, 30, 30)
+    widgets.Ui_draw_into(ui)
+
+    print("-- inside the container the child IS painted --")
+    check_int("the child covered the marker", is_marker(win, cx + 5, 60), 0)
+
+    print("-- past the container's right edge it is NOT --")
+    // The child's own rect extends to x = 330; the container's content ends at
+    // cx + cw. Everything between must still be the marker.
+    var outside = cx + cw + 20
+    check_int("the marker still shows through just past the edge",
+              is_marker(win, outside, 60), 1)
+    check_int("...and far past it", is_marker(win, cx + cw + 100, 60), 1)
+    // Immediately INSIDE the edge, the child is there - so the clip is at the
+    // border and not somewhere arbitrary.
+    check_int("one pixel inside the edge is painted",
+              is_marker(win, cx + cw - 2, 60), 0)
+
+    print("-- a child on a HIDDEN tab page paints nothing at all --")
+    var u2 = widgets.Ui_new(win, font)
+    u2 = widgets.Ui_tabs(u2, "A\nB", 20, 20, 200, 24, 0, on_fire)
+    var tb = widgets.Ui_last_id(u2)
+    u2 = widgets.Ui_panel(u2, 30, 60, 100, 40)
+    var pg1 = widgets.Ui_last_id(u2)
+    u2 = widgets.Ui_set_owner(u2, pg1, tb)
+    u2 = widgets.Ui_set_page(u2, pg1, 1)
+    gui.Win_clear(win, 0, 0, 0)
+    gui.Win_rect(win, 0, 0, 400, 300, 255, 30, 30)
+    widgets.Ui_draw_into(u2)
+    check_int("page 1's panel is not drawn while page 0 is current",
+              is_marker(win, 60, 75), 1)
+    // Switch to page 1 and it appears - so the absence above is the page model
+    // and not a mis-placed panel.
+    u2 = widgets.Ui_set_sel(u2, tb, 1)
+    gui.Win_clear(win, 0, 0, 0)
+    gui.Win_rect(win, 0, 0, 400, 300, 255, 30, 30)
+    widgets.Ui_draw_into(u2)
+    check_int("...and IS drawn once its page is current",
+              is_marker(win, 60, 75), 0)
+
+    check_int("clip depth balanced", gui.Win_clip_depth(win), 0)
+    print("")
+}
+
+// A full frame through the SHIPPING event path, with real platform events.
+//
+// Everything above drives Ui_press / Ui_release / Ui_key directly, which is the
+// same code Ui_events calls - but "the same code" is a claim, and this is the
+// assertion for it. Under SDL_VIDEODRIVER=dummy the window is real to SDL and
+// invisible, so the dispatch under test is the shipping one.
+fn real_event_tests(win: int, font: int) {
+    print("=== through REAL platform events (Win_push_* -> Ui_events) ===")
+    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_dropdown(ui, "One\nTwo\nThree", 20, 20, 140, 26, 0, on_fire)
+    var dd = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_button(ui, "UNDER", 20, 46, 140, 100, on_fire)
+    var btn = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_radio(ui, "R", "g", 220, 20, 0, on_fire)
+    var r = widgets.Ui_last_id(ui)
+
+    print("-- a real click opens the list --")
+    gui.Win_push_mouse_down(win, 60, 33, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, 60, 33, gui.MOUSE_LEFT)
+    ui = widgets.Ui_events(ui)
+    check_int("open", widgets.Ui_is_open(ui, dd), 1)
+
+    print("-- a real click on row 2 selects it, NOT the button beneath --")
+    reset_fired()
+    var ry = widgets.Ui_overlay_row_cy(ui, dd, 2)
+    gui.Win_push_mouse_down(win, 60, ry, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, 60, ry, gui.MOUSE_LEFT)
+    ui = widgets.Ui_events(ui)
+    check_int("row 2 chosen", widgets.Ui_sel(ui, dd), 2)
+    check("...which is Three", widgets.Ui_item(ui, dd, widgets.Ui_sel(ui, dd)),
+          "Three")
+    check_int("the dropdown fired", fired_id, dd)
+    check_int("the button beneath did not", fired_count, 1)
+    check_int("and the button is still enabled, so it COULD have",
+              widgets.Ui_enabled(ui, btn), 1)
+
+    print("-- a real click on the radio checks it --")
+    reset_fired()
+    gui.Win_push_mouse_down(win, 224, 24, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, 224, 24, gui.MOUSE_LEFT)
+    ui = widgets.Ui_events(ui)
+    check_int("checked", widgets.Ui_checked(ui, r), 1)
+    check_int("fired", fired_id, r)
+
+    print("-- a real Tab key moves the focus --")
+    ui = widgets.Ui_set_focus(ui, 0 - 1)
+    gui.Win_push_key_down(win, gui.SCANCODE_TAB)
+    ui = widgets.Ui_events(ui)
+    check_int("something has focus now", widgets.Ui_focus(ui) != 0 - 1, 1)
+
+    print("-- a real mouse-move stamps the hover clock --")
+    ui = widgets.Ui_set_tooltip(ui, btn, "the button beneath")
+    ui = widgets.Ui_set_fake_now(ui, 7000)
+    gui.Win_push_mouse_move(win, 60, 100)
+    ui = widgets.Ui_events(ui)
+    check_int("stamped", widgets.Ui_hover_since(ui, btn), 7000)
+    check_int("not yet shown", widgets.Ui_tooltip_visible(ui, btn), 0)
+    ui = widgets.Ui_set_fake_now(ui, 7000 + 600)
+    check_int("shown after the dwell", widgets.Ui_tooltip_visible(ui, btn), 1)
+
+    print("-- a full Ui_frame leaves the clip stack balanced --")
+    check_int("depth before", gui.Win_clip_depth(win), 0)
+    ui = widgets.Ui_set_open(ui, dd, 0)
+    widgets.Ui_draw(ui)
+    check_int("depth after, with an overlay AND a tooltip up",
+              gui.Win_clip_depth(win), 0)
+    print("")
+}
+
+fn main() {
+    radio_tests()
+    slider_tests()
+    progress_tests()
+    spinner_tests()
+
+    if gui.Win_available() == 0 {
+        print("no display: skipping every test that needs font metrics or pixels")
+        print("(run with SDL_VIDEODRIVER=dummy)")
+    } else {
+        var win = gui.Win_window("new widgets test", 400, 300)
+        if win < 0 {
+            print("could not open a window: skipping the windowed half")
+        } else {
+            var font = gui.Win_font_default(15)
+            if font < 0 {
+                print("no font: skipping the windowed half")
+            } else {
+                dropdown_tests(win, font)
+                listbox_tests(win, font)
+                tabs_tests(win, font)
+                menubar_tests(win, font)
+                groupbox_tests(win, font)
+                tooltip_tests(win, font)
+                focus_tests(win, font)
+                overlay_pixel_tests(win, font)
+                clip_pixel_tests(win, font)
+                real_event_tests(win, font)
+                gui.Win_font_free(font)
+            }
+            gui.Win_close(win)
+        }
+    }
+
+    if fails == 0 {
+        print("=== ALL NEW-WIDGET TESTS PASSED ===")
+    } else {
+        print("=== ${fails} NEW-WIDGET TEST(S) FAILED ===")
+    }
+}
