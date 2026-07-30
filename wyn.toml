@@ -1,7 +1,8 @@
 [project]
 name = "gui"
-version = "0.1.0"
-description = "Cross-platform desktop GUI for Wyn (wraps SDL2)"
+version = "0.2.0"
+description = "Cross-platform desktop GUI for Wyn (SDL3 backend, texture + text)"
 
 [build]
-requires = ["sdl2"]  # brew install sdl2 / apt install libsdl2-dev
+requires = ["sdl3"]  # brew install sdl3 / apt install libsdl3-dev
+# Text needs no extra dependency: stb_truetype is vendored in src/.

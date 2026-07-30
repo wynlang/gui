@@ -1,3 +1,9 @@
+# Build artifact of csrc/build.sh - regenerate with ./csrc/build.sh
+libgui/
+# Scratch file the wyn compiler drops in cwd when invoking the C compiler
+wyn_cc_err.txt
 *.wyn.c
-tests/test_*
-!tests/test_*.wyn
+*.wyn.out
+*.out
+*.dSYM/
+.DS_Store
