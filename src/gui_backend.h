@@ -63,7 +63,22 @@ void Win_present(long long win);
 
 // Restrict drawing to a rectangle. Needed by any scrolling or clipped widget;
 // pass w or h <= 0 to clear the clip.
+//
+// ABSOLUTE, and that is a trap for nested drawing: clearing the clip clears
+// EVERY enclosing one, not just the innermost. A widget that clips itself and
+// then clears (a text entry does) therefore escapes the region its container
+// established, and paints over whatever is outside. Use the stack below whenever
+// clipped drawing can nest.
 void Win_clip(long long win, long long x, long long y, long long w, long long h);
+
+// Nesting clips: push INTERSECTS with the region already in force, pop restores
+// the enclosing one. A child can only shrink its parent's visible area, never
+// escape it. Max depth 16; push returns 0 if it would overflow and pop returns 0
+// if the stack is empty, so an unbalanced caller is detectable rather than
+// silently wrong. Win_clip_depth exists for exactly that assertion.
+long long Win_clip_push(long long win, long long x, long long y, long long w, long long h);
+long long Win_clip_pop(long long win);
+long long Win_clip_depth(long long win);
 
 // ---- textures ------------------------------------------------------------
 //
@@ -114,6 +129,21 @@ long long  Win_font_height(long long font);
 
 void Win_font_free(long long font);
 
+// Save the current frame to a BMP. Exists because no assertion can tell you the
+// UI LOOKED right - a text renderer passes a width test whether it draws letters
+// or mojibake. With this, CI can render headless and diff the pixels.
+// Returns 1 on success. Call after drawing, before or after Win_present.
+long long Win_screenshot(long long win, const char* path);
+
+// Read one channel of one pixel off the rendered frame. 0..255, or -1 if the
+// point is outside the window. channel: 0=red, 1=green, 2=blue, 3=alpha.
+//
+// A screenshot proves a file was written; only this proves the right thing was
+// drawn. It is the only way a headless test can tell "the texture blitted" from
+// "the upload failed and the background shows through", and channel-order bugs
+// (red where blue belongs) are invisible to every other kind of assertion.
+long long Win_pixel_at(long long win, long long x, long long y, long long channel);
+
 // ---- input: polled state -------------------------------------------------
 // Kept for immediate-mode callers and for the existing published API.
 
@@ -163,5 +193,29 @@ const char* Win_event_text(void); // WIN_EV_TEXT: the typed UTF-8, valid until t
 // show an IME candidate window and will send TEXT events instead of raw keys.
 // A text field enables it on focus and disables it on blur.
 void Win_text_input(long long win, long long enable);
+
+// ---- input: synthetic events (automated testing) -------------------------
+//
+// WHY THIS IS IN THE BACKEND AND NOT IN THE TEST.
+//
+// A GUI's interesting behaviour is the part a human triggers: hover, press,
+// release-over-the-same-control, focus, typing. A test that instead calls the
+// toolkit's internal state-setters proves only that assignment works - it
+// bypasses the dispatch logic, which is the only part that can be wrong.
+//
+// These functions push a real event into the platform queue, so
+// Win_poll_event() returns it exactly as it would return a human's. The code
+// under test is the SHIPPING path: same queue, same decoding, same handler
+// dispatch. The only synthetic thing is who moved the mouse.
+//
+// They work under the dummy video driver, so this is also how a GUI gets tested
+// in CI over ssh with no display attached.
+//
+// Return 1 if the event was queued, 0 if it was not.
+long long Win_push_mouse_move(long long win, long long x, long long y);
+long long Win_push_mouse_down(long long win, long long x, long long y, long long button);
+long long Win_push_mouse_up(long long win, long long x, long long y, long long button);
+long long Win_push_key_down(long long win, long long scancode);
+long long Win_push_text(long long win, const char* utf8);
 
 #endif // WYN_WIN_BACKEND_H

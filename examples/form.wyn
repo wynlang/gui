@@ -18,52 +18,52 @@ import widgets
 // mutable reference to the surrounding state, so a design that required one
 // would not work.
 fn on_save(id: int) {
-    println("Save clicked (widget " + id.to_string() + ")")
+    print("Save clicked (widget ${id})")
 }
 
 fn on_load(id: int) {
-    println("Load clicked (widget " + id.to_string() + ")")
+    print("Load clicked (widget ${id})")
 }
 
 fn on_toggle(id: int) {
-    println("Checkbox " + id.to_string() + " toggled")
+    print("Checkbox ${id} toggled")
 }
 
 fn main() {
     if gui.Win_available() == 0 {
-        println("no display available - skipping")
+        print("no display available - skipping")
         return
     }
 
-    var win = gui.Win_window("Wyn widgets - a form", 520, 380)
+    win = gui.Win_window("Wyn widgets - a form", 520, 380)
     if win < 0 {
-        println("could not open a window")
+        print("could not open a window")
         return
     }
-    var font = gui.Win_font_default(15)
+    font = gui.Win_font_default(15)
     if font < 0 {
-        println("no font found")
+        print("no font found")
         gui.Win_close(win)
         return
     }
 
     // --- declare the form, once -------------------------------------------
-    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_new(win, font)
 
     ui = widgets.Ui_label(ui, "A retained-mode form in Wyn", 24, 20)
     ui = widgets.Ui_panel(ui, 20, 50, 480, 120)
     ui = widgets.Ui_label(ui, "Name:", 36, 70)
     ui = widgets.Ui_entry(ui, "", 100, 64, 240, 28)
-    var name_id = widgets.Ui_last_id(ui)
+    name_id = widgets.Ui_last_id(ui)
 
     ui = widgets.Ui_checkbox(ui, "Remember me", 36, 110, 1, on_toggle)
-    var remember_id = widgets.Ui_last_id(ui)
+    remember_id = widgets.Ui_last_id(ui)
 
     ui = widgets.Ui_button(ui, "Save", 36, 200, 100, 34, on_save)
     ui = widgets.Ui_button(ui, "Load", 150, 200, 100, 34, on_load)
 
     ui = widgets.Ui_button(ui, "Disabled", 264, 200, 100, 34, on_save)
-    var disabled_id = widgets.Ui_last_id(ui)
+    disabled_id = widgets.Ui_last_id(ui)
     ui = widgets.Ui_set_enabled(ui, disabled_id, 0)
 
     ui = widgets.Ui_label(ui, "Click a field and type. Esc to quit.", 24, 320)
@@ -74,8 +74,8 @@ fn main() {
     }
 
     // The form is data, so reading the result back is just a query.
-    println("name entered: '" + widgets.Ui_text(ui, name_id) + "'")
-    println("remember me:  " + widgets.Ui_checked(ui, remember_id).to_string())
+    print("name entered: '${widgets.Ui_text(ui, name_id)}'")
+    print("remember me:  ${widgets.Ui_checked(ui, remember_id)}")
 
     gui.Win_font_free(font)
     gui.Win_close(win)

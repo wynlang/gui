@@ -1,0 +1,951 @@
+// designer - a Visual-Basic-style visual form designer for Wyn, written in Wyn.
+//
+//   WYN_ROOT=/path/to/wyn  wyn run examples/designer.wyn
+//   WYN_ROOT=/path/to/wyn  wyn build examples/designer.wyn && ./designer --selftest
+//
+// Build the backend first: ./csrc/build.sh
+//
+// Pick a tool from the palette on the left, click on the canvas to place it,
+// click a widget to select it, drag to move it, Delete to remove it, and G to
+// print the .wyn source that recreates the form.
+//
+// WHY THIS PROGRAM IS THE POINT
+//
+// The toolkit is retained: a form is a LIST OF CONTROLS WITH PROPERTIES, which
+// is a data structure. So "generate the code" is a fold over that list, and
+// round-tripping is possible at all. An immediate-mode UI has no such list - the
+// interface exists only as the side effect of running the draw loop - so there
+// is nothing to walk and nothing to emit. Everything below is downstream of that
+// one design decision.
+//
+// TWO Ui VALUES, DELIBERATELY
+//
+// `form` is the user's document. `chrome` is the designer's own palette and
+// buttons. They are separate Ui values because they have separate event models:
+// a click on the chrome runs a command, a click on the form SELECTS rather than
+// activates. Feeding both to one Ui_events would make the form's buttons
+// clickable while you are trying to move them, which is exactly the bug that
+// makes a designer unusable.
+//
+// The chrome therefore does NOT use Ui_events either. Its buttons are hit-tested
+// by hand against the raw pointer, because a handler cannot reach the form: a
+// Wyn closure cannot capture a mutable reference to surrounding state, so
+// `on_click` could never do `form = Ui_delete(form, sel)`. Dispatching in the
+// loop, where both values are in scope, is not a workaround for a missing
+// feature - it is the only shape that can work, and it keeps every mutation on
+// one code path.
+
+import gui
+import widgets
+
+// ---- layout ---------------------------------------------------------------
+
+var WIN_W = 980
+var WIN_H = 660
+
+var PAL_X = 12
+var PAL_Y = 44
+var PAL_W = 150
+var PAL_ITEM_H = 30
+
+var CANVAS_X = 180
+var CANVAS_Y = 44
+var CANVAS_W = 780
+var CANVAS_H = 520
+
+var STATUS_Y = 604
+
+// Snap placement and dragging to a grid. Not decoration: without it every
+// hand-placed control is off by a pixel or two and the generated source is full
+// of numbers like 187 and 213 that no human would have written.
+var GRID = 8
+
+// ---- designer state -------------------------------------------------------
+//
+// Module-level, because the click handlers and the code generator both need it
+// and neither can be handed a mutable reference.
+
+// COMPILER BUG WORKAROUND: a module-level var may not be INITIALISED from an
+// imported module's constant. `var g_tool = widgets.KIND_BUTTON` passes
+// `wyn check` and then fails the C compile with "use of undeclared identifier
+// 'widgets_KIND_BUTTON'" - the global initialiser is emitted above the imported
+// module's definitions. Assigning the same expression inside a function is fine,
+// so main() sets the real default; -1 here means "not yet initialised" and is
+// never a valid kind.
+var g_tool = -1                    // palette selection: which kind to place
+var g_sel = -1                     // selected widget id on the canvas, or -1
+var g_dragging = 0
+var g_drag_dx = 0                  // pointer-to-origin offset, so the widget
+var g_drag_dy = 0                  // does not jump to the cursor on grab
+var g_press_x = 0
+var g_press_y = 0
+var g_counter = 0                  // for generated default captions
+var g_status = "ready - pick a tool, click the canvas"
+var g_running = 1                  // cleared by Esc and by the window close box
+
+fn snap(v: int) -> int {
+    return (v / GRID) * GRID
+}
+
+// ---- the palette ----------------------------------------------------------
+//
+// A table, not five hand-written blocks, so adding a widget kind touches one
+// place. Order is the display order.
+
+fn pal_count() -> int {
+    return 5
+}
+
+fn pal_kind(i: int) -> int {
+    if i == 0 { return widgets.KIND_LABEL }
+    if i == 1 { return widgets.KIND_BUTTON }
+    if i == 2 { return widgets.KIND_CHECKBOX }
+    if i == 3 { return widgets.KIND_ENTRY }
+    return widgets.KIND_PANEL
+}
+
+fn pal_y(i: int) -> int {
+    return PAL_Y + 30 + i * PAL_ITEM_H
+}
+
+// Which palette row is at this point, or -1.
+fn pal_at(mx: int, my: int) -> int {
+    if mx < PAL_X { return -1 }
+    if mx >= PAL_X + PAL_W { return -1 }
+    var i = 0
+    while i < pal_count() {
+        var y = pal_y(i)
+        if my >= y {
+            if my < y + PAL_ITEM_H - 4 { return i }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ---- default geometry per kind -------------------------------------------
+//
+// A placed control must be usable immediately, so each kind gets the size it
+// would have been given by hand. A label has w=h=0 in the toolkit (it is sized
+// by its text), and a designer still needs a rectangle to hit-test and drag, so
+// the label's box is synthesised at draw/hit time rather than stored - see
+// box_w/box_h. Storing a fake size would leak into the generated source as an
+// argument Ui_label does not take.
+
+fn def_w(kind: int) -> int {
+    if kind == widgets.KIND_BUTTON { return 96 }
+    if kind == widgets.KIND_ENTRY { return 180 }
+    if kind == widgets.KIND_PANEL { return 240 }
+    if kind == widgets.KIND_CHECKBOX { return 18 }
+    return 0
+}
+
+fn def_h(kind: int) -> int {
+    if kind == widgets.KIND_BUTTON { return 32 }
+    if kind == widgets.KIND_ENTRY { return 28 }
+    if kind == widgets.KIND_PANEL { return 140 }
+    if kind == widgets.KIND_CHECKBOX { return 18 }
+    return 0
+}
+
+// The rectangle a designer treats as the widget, which is not always the
+// widget's own w/h. A label reports 0x0; a zero-area target cannot be clicked or
+// dragged, so give it a measured box.
+fn box_w(ui: Ui, id: int) -> int {
+    var w = widgets.Ui_w_of(ui, id)
+    if w > 0 { return w }
+    // A label: 8px per character rather than Win_text_width, because --selftest
+    // runs with no window and no font, and a hit-test that only works once a
+    // font is loaded cannot be tested headless.
+    var n = widgets.Ui_label_of(ui, id).len()
+    if n < 1 { n = 1 }
+    return n * 8 + 4
+}
+
+fn box_h(ui: Ui, id: int) -> int {
+    var h = widgets.Ui_h_of(ui, id)
+    if h > 0 { return h }
+    return 18
+}
+
+// Topmost widget whose designer-box contains the point, or -1. Cannot reuse
+// Ui_hit_test: that uses the stored w/h, which is 0x0 for a label, so labels
+// would be unselectable. Last match wins, matching paint order.
+fn pick(ui: Ui, mx: int, my: int) -> int {
+    var found = -1
+    var i = 0
+    while i < widgets.Ui_count(ui) {
+        var id = widgets.Ui_id_at(ui, i)
+        var x = widgets.Ui_x_of(ui, id)
+        var y = widgets.Ui_y_of(ui, id)
+        var w = box_w(ui, id)
+        var h = box_h(ui, id)
+        if mx >= x {
+            if my >= y {
+                if mx < x + w {
+                    if my < y + h { found = id }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return found
+}
+
+// ---- placing --------------------------------------------------------------
+
+fn noop(id: int) { }
+
+// Add a widget of `kind` with its top-left at (x,y) and select it.
+//
+// Returns the new form. The caller must assign - structs pass by value, so a
+// version that "modified" the form in place would modify a copy.
+fn place(form: Ui, kind: int, x: int, y: int) -> Ui {
+    var f = form
+    g_counter = g_counter + 1
+    var n = g_counter.to_string()
+
+    if kind == widgets.KIND_LABEL {
+        f = widgets.Ui_label(f, "Label" + n, x, y)
+    }
+    if kind == widgets.KIND_BUTTON {
+        f = widgets.Ui_button(f, "Button" + n, x, y, def_w(kind), def_h(kind), noop)
+    }
+    if kind == widgets.KIND_CHECKBOX {
+        f = widgets.Ui_checkbox(f, "Check" + n, x, y, 0, noop)
+    }
+    if kind == widgets.KIND_ENTRY {
+        f = widgets.Ui_entry(f, "", x, y, def_w(kind), def_h(kind))
+    }
+    if kind == widgets.KIND_PANEL {
+        f = widgets.Ui_panel(f, x, y, def_w(kind), def_h(kind))
+    }
+
+    g_sel = widgets.Ui_last_id(f)
+    g_status = "placed " + widgets.Ui_kind_name(kind) + " #" + g_sel.to_string()
+        + " at " + x.to_string() + "," + y.to_string()
+    return f
+}
+
+// ---- CODE GENERATION ------------------------------------------------------
+//
+// The reason the whole program exists. The form is a list of controls with
+// properties, so this is a fold over that list into text.
+//
+// It emits source that COMPILES, which means three things that are easy to get
+// wrong:
+//   1. Every control gets a handler that EXISTS. Buttons and checkboxes take
+//      `fn(int) -> void`; emitting a name with no definition produces source
+//      that a designer claims to have generated and a compiler rejects. So the
+//      stubs are emitted too, one per control that takes one, named after the
+//      control.
+//   2. Captions are ESCAPED. A caption containing a quote or a backslash would
+//      otherwise close the string literal early and the output would not parse.
+//   3. Only the arguments each constructor actually takes are emitted. A label
+//      has no w/h in Ui_label's signature; passing its synthesised designer box
+//      would not compile.
+
+// Escape a caption for a Wyn double-quoted literal. `\` first - reversing the
+// order would re-escape the backslashes introduced by the quote pass.
+fn esc(s: string) -> string {
+    var out = ""
+    var cs = s.chars()
+    var i = 0
+    while i < cs.len() {
+        var c = cs[i]
+        if c == "\\" { out = out + "\\\\" }
+        else {
+            if c == "\"" { out = out + "\\\"" }
+            else {
+                if c == "\n" { out = out + "\\n" }
+                else {
+                    if c == "\t" { out = out + "\\t" }
+                    else { out = out + c }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn q(s: string) -> string {
+    return "\"" + esc(s) + "\""
+}
+
+// A legal Wyn identifier derived from a caption, for handler names. Anything
+// that is not [A-Za-z0-9_] becomes '_', and a leading digit is prefixed,
+// because `fn on_2fast(...)` does not parse.
+fn ident(s: string) -> string {
+    var out = ""
+    var cs = s.chars()
+    var i = 0
+    while i < cs.len() {
+        var c = cs[i]
+        var okc = 0
+        if c >= "a" { if c <= "z" { okc = 1 } }
+        if c >= "A" { if c <= "Z" { okc = 1 } }
+        if c >= "0" { if c <= "9" { okc = 1 } }
+        if c == "_" { okc = 1 }
+        if okc == 1 { out = out + c } else { out = out + "_" }
+        i = i + 1
+    }
+    if out.len() == 0 { return "ctl" }
+    var f = out.chars()[0]
+    if f >= "0" { if f <= "9" { return "n" + out } }
+    return out
+}
+
+// Does this kind take a handler in its constructor?
+fn takes_handler(kind: int) -> int {
+    if kind == widgets.KIND_BUTTON { return 1 }
+    if kind == widgets.KIND_CHECKBOX { return 1 }
+    return 0
+}
+
+// Handler name for widget i - unique per widget (the id is in the name), so two
+// buttons both captioned "OK" do not collide into one duplicated definition.
+fn handler_name(form: Ui, i: int) -> string {
+    return "on_" + ident(widgets.Ui_label_at(form, i)).lower()
+        + "_" + widgets.Ui_id_at(form, i).to_string()
+}
+
+// One `ui = widgets.Ui_<kind>(...)` line. Only the arguments the constructor
+// really takes.
+fn gen_ctor(form: Ui, i: int) -> string {
+    var kind = widgets.Ui_kind_at(form, i)
+    var x = widgets.Ui_x_at(form, i).to_string()
+    var y = widgets.Ui_y_at(form, i).to_string()
+    var w = widgets.Ui_w_at(form, i).to_string()
+    var h = widgets.Ui_h_at(form, i).to_string()
+    var label = q(widgets.Ui_label_at(form, i))
+
+    if kind == widgets.KIND_LABEL {
+        return "    ui = widgets.Ui_label(ui, " + label + ", " + x + ", " + y + ")\n"
+    }
+    if kind == widgets.KIND_BUTTON {
+        return "    ui = widgets.Ui_button(ui, " + label + ", " + x + ", " + y
+            + ", " + w + ", " + h + ", " + handler_name(form, i) + ")\n"
+    }
+    if kind == widgets.KIND_CHECKBOX {
+        return "    ui = widgets.Ui_checkbox(ui, " + label + ", " + x + ", " + y
+            + ", " + widgets.Ui_checked_at(form, i).to_string()
+            + ", " + handler_name(form, i) + ")\n"
+    }
+    if kind == widgets.KIND_ENTRY {
+        return "    ui = widgets.Ui_entry(ui, " + q(widgets.Ui_text_at(form, i))
+            + ", " + x + ", " + y + ", " + w + ", " + h + ")\n"
+    }
+    if kind == widgets.KIND_PANEL {
+        return "    ui = widgets.Ui_panel(ui, " + x + ", " + y
+            + ", " + w + ", " + h + ")\n"
+    }
+    return "    // unknown kind " + kind.to_string() + "\n"
+}
+
+// The whole .wyn file, as a string.
+pub fn gen_source(form: Ui, title: string) -> string {
+    var n = widgets.Ui_count(form)
+    var src = ""
+
+    src = src + "// Generated by the Wyn visual designer (examples/designer.wyn).\n"
+    src = src + "// " + n.to_string() + " control"
+    if n == 1 { src = src + ".\n" } else { src = src + "s.\n" }
+    src = src + "//\n"
+    src = src + "//   WYN_ROOT=/path/to/wyn  wyn run thisfile.wyn\n"
+    src = src + "// Build the gui backend first: ./csrc/build.sh\n\n"
+    src = src + "import gui\n"
+    src = src + "import widgets\n\n"
+
+    // Handler stubs FIRST: a name must be defined before the constructor line
+    // that references it can compile.
+    src = src + "// ---- handlers ----\n"
+    var stubs = 0
+    var i = 0
+    while i < n {
+        if takes_handler(widgets.Ui_kind_at(form, i)) == 1 {
+            src = src + "fn " + handler_name(form, i) + "(id: int) {\n"
+            src = src + "    println(" + q(widgets.Ui_label_at(form, i))
+                + " + \" clicked (widget \" + id.to_string() + \")\")\n"
+            src = src + "}\n\n"
+            stubs = stubs + 1
+        }
+        i = i + 1
+    }
+    if stubs == 0 {
+        src = src + "// (no control on this form takes a handler)\n\n"
+    }
+
+    src = src + "fn main() {\n"
+    src = src + "    if gui.Win_available() == 0 {\n"
+    src = src + "        println(\"no display available - skipping\")\n"
+    src = src + "        return\n"
+    src = src + "    }\n"
+    src = src + "    var win = gui.Win_window(" + q(title) + ", "
+        + CANVAS_W.to_string() + ", " + CANVAS_H.to_string() + ")\n"
+    src = src + "    if win < 0 {\n"
+    src = src + "        println(\"could not open a window\")\n"
+    src = src + "        return\n"
+    src = src + "    }\n"
+    src = src + "    var font = gui.Win_font_default(15)\n"
+    src = src + "    if font < 0 {\n"
+    src = src + "        println(\"no font found\")\n"
+    src = src + "        gui.Win_close(win)\n"
+    src = src + "        return\n"
+    src = src + "    }\n\n"
+
+    src = src + "    // ---- the form, declared once ----\n"
+    src = src + "    var ui = widgets.Ui_new(win, font)\n"
+    var j = 0
+    while j < n {
+        src = src + gen_ctor(form, j)
+        // enabled is not a constructor argument, so a disabled control needs a
+        // follow-up call or the generated form would come up clickable.
+        if widgets.Ui_enabled_at(form, j) == 0 {
+            src = src + "    ui = widgets.Ui_set_enabled(ui, widgets.Ui_last_id(ui), 0)\n"
+        }
+        j = j + 1
+    }
+
+    src = src + "\n    // ---- run ----\n"
+    src = src + "    while widgets.Ui_running(ui) == 1 {\n"
+    src = src + "        ui = widgets.Ui_frame(ui)\n"
+    src = src + "    }\n\n"
+    src = src + "    gui.Win_font_free(font)\n"
+    src = src + "    gui.Win_close(win)\n"
+    src = src + "}\n"
+    return src
+}
+
+// ---- designer chrome drawing ---------------------------------------------
+
+fn draw_palette(win: int, font: int) {
+    gui.Win_rect(win, PAL_X, PAL_Y, PAL_W, 30 + pal_count() * PAL_ITEM_H + 8,
+                 38, 38, 46)
+    gui.Win_rect_outline(win, PAL_X, PAL_Y, PAL_W,
+                         30 + pal_count() * PAL_ITEM_H + 8, 70, 70, 84)
+    gui.Win_text(win, font, "TOOLBOX", PAL_X + 10, PAL_Y + 8, 150, 150, 170)
+
+    var i = 0
+    while i < pal_count() {
+        var kind = pal_kind(i)
+        var y = pal_y(i)
+        var r = 50
+        var g = 50
+        var b = 62
+        if kind == g_tool {
+            r = 70
+            g = 110
+            b = 170
+        }
+        gui.Win_rect(win, PAL_X + 6, y, PAL_W - 12, PAL_ITEM_H - 4, r, g, b)
+        gui.Win_rect_outline(win, PAL_X + 6, y, PAL_W - 12, PAL_ITEM_H - 4,
+                             100, 100, 120)
+        gui.Win_text(win, font, widgets.Ui_kind_name(kind),
+                     PAL_X + 16, y + 5, 235, 235, 240)
+        i = i + 1
+    }
+}
+
+// Selection handles: a highlight box plus corner marks. The marks matter -
+// a plain outline is indistinguishable from a panel's own border, so you cannot
+// tell what is selected on a form made of panels.
+fn draw_selection(win: int, form: Ui, id: int) {
+    if id == -1 { return }
+    var x = CANVAS_X + widgets.Ui_x_of(form, id)
+    var y = CANVAS_Y + widgets.Ui_y_of(form, id)
+    var w = box_w(form, id)
+    var h = box_h(form, id)
+    gui.Win_rect_outline(win, x - 2, y - 2, w + 4, h + 4, 90, 200, 255)
+    gui.Win_rect(win, x - 4, y - 4, 6, 6, 90, 200, 255)
+    gui.Win_rect(win, x + w - 2, y - 4, 6, 6, 90, 200, 255)
+    gui.Win_rect(win, x - 4, y + h - 2, 6, 6, 90, 200, 255)
+    gui.Win_rect(win, x + w - 2, y + h - 2, 6, 6, 90, 200, 255)
+}
+
+fn draw_grid(win: int) {
+    var x = CANVAS_X
+    while x < CANVAS_X + CANVAS_W {
+        var y = CANVAS_Y
+        while y < CANVAS_Y + CANVAS_H {
+            gui.Win_rect(win, x, y, 1, 1, 52, 52, 62)
+            y = y + 32
+        }
+        x = x + 32
+    }
+}
+
+fn status_text(form: Ui) -> string {
+    var s = "tool: " + widgets.Ui_kind_name(g_tool)
+    if g_sel == -1 {
+        s = s + "   |   selected: none"
+    } else {
+        s = s + "   |   selected: #" + g_sel.to_string() + " "
+            + widgets.Ui_kind_name(widgets.Ui_kind_of(form, g_sel))
+            + " at " + widgets.Ui_x_of(form, g_sel).to_string() + ","
+            + widgets.Ui_y_of(form, g_sel).to_string()
+    }
+    s = s + "   |   widgets: " + widgets.Ui_count(form).to_string()
+    return s
+}
+
+fn draw_all(win: int, font: int, form: Ui) {
+    gui.Win_clear(win, 24, 24, 30)
+
+    gui.Win_text(win, font, "Wyn Visual Designer", 14, 14, 235, 235, 245)
+    gui.Win_text(win, font,
+        "click canvas = place    click widget = select    drag = move    "
+        + "Del/Backspace = delete    G = generate code    Esc = quit",
+        260, 16, 140, 140, 160)
+
+    draw_palette(win, font)
+
+    // The canvas is the form's own window, previewed. Draw its background and
+    // frame, then the form's widgets translated into it.
+    gui.Win_rect(win, CANVAS_X, CANVAS_Y, CANVAS_W, CANVAS_H, 28, 28, 34)
+    draw_grid(win)
+    gui.Win_rect_outline(win, CANVAS_X, CANVAS_Y, CANVAS_W, CANVAS_H, 80, 80, 96)
+
+    // Clip so a widget dragged past the edge is cropped at the form boundary
+    // instead of painting over the toolbox. push/pop, because a text entry
+    // clips itself inside this region - with the absolute Win_clip the entry's
+    // clear would discard this clip and every later widget would escape.
+    gui.Win_clip_push(win, CANVAS_X + 1, CANVAS_Y + 1, CANVAS_W - 2, CANVAS_H - 2)
+    // Draw at the canvas origin WITHOUT moving the widgets: their stored x/y is
+    // form-relative, and that is what gets written into the generated source.
+    widgets.Ui_draw_at(form, CANVAS_X, CANVAS_Y)
+    gui.Win_clip_pop(win)
+
+    draw_selection(win, form, g_sel)
+
+    gui.Win_rect(win, 0, STATUS_Y, WIN_W, WIN_H - STATUS_Y, 34, 34, 42)
+    gui.Win_rect_outline(win, 0, STATUS_Y, WIN_W, WIN_H - STATUS_Y, 60, 60, 74)
+    gui.Win_text(win, font, status_text(form), 14, STATUS_Y + 8, 210, 210, 225)
+    gui.Win_text(win, font, g_status, 14, STATUS_Y + 30, 150, 190, 150)
+
+    gui.Win_present(win)
+}
+
+// ---- the interactive loop -------------------------------------------------
+//
+// One event pump, one place where the form is mutated. The form is NOT given to
+// Ui_events: inside a designer a click on a button must select it, not press it.
+
+// Drain the queue and apply every pending event to the form. Returns the form.
+//
+// SEPARATE FROM THE LOOP ON PURPOSE. This is the only place a click becomes a
+// placement, a selection, a drag or a delete, and it is reachable without a
+// window loop - so the synthetic events in selftest_events() exercise exactly
+// the dispatch a human's mouse exercises. A test that instead poked g_sel and
+// called Ui_move directly would prove that assignment works and skip the only
+// part that can be wrong: which branch a click at (x,y) takes.
+pub fn pump(form: Ui) -> Ui {
+    var f = form
+    var ev = gui.Win_poll_event()
+    while ev != gui.EV_NONE {
+        if ev == gui.EV_QUIT { g_running = 0 }
+
+        if ev == gui.EV_MOUSE_DOWN {
+            var mx = gui.Win_event_x()
+            var my = gui.Win_event_y()
+            g_press_x = mx
+            g_press_y = my
+
+            var p = pal_at(mx, my)
+            if p != -1 {
+                g_tool = pal_kind(p)
+                g_status = "tool: " + widgets.Ui_kind_name(g_tool)
+            } else {
+                if in_canvas(mx, my) == 1 {
+                    // Canvas coordinates are form coordinates.
+                    var fx = mx - CANVAS_X
+                    var fy = my - CANVAS_Y
+                    var hitid = pick(f, fx, fy)
+                    if hitid == -1 {
+                        f = place(f, g_tool, snap(fx), snap(fy))
+                    } else {
+                        g_sel = hitid
+                        g_dragging = 1
+                        // Grab OFFSET, not the raw pointer: without it the
+                        // widget's corner jumps to the cursor the instant you
+                        // press, which reads as the widget teleporting.
+                        g_drag_dx = fx - widgets.Ui_x_of(f, hitid)
+                        g_drag_dy = fy - widgets.Ui_y_of(f, hitid)
+                        g_status = "selected #" + hitid.to_string()
+                    }
+                }
+            }
+        }
+
+        if ev == gui.EV_MOUSE_MOVE {
+            if g_dragging == 1 {
+                if g_sel != -1 {
+                    var nx = snap(gui.Win_event_x() - CANVAS_X - g_drag_dx)
+                    var ny = snap(gui.Win_event_y() - CANVAS_Y - g_drag_dy)
+                    f = widgets.Ui_move(f, g_sel, nx, ny)
+                    g_status = "moved #" + g_sel.to_string() + " to "
+                        + nx.to_string() + "," + ny.to_string()
+                }
+            }
+        }
+
+        if ev == gui.EV_MOUSE_UP { g_dragging = 0 }
+
+        if ev == gui.EV_KEY_DOWN {
+            var key = gui.Win_event_key()
+            if key == gui.SCANCODE_ESCAPE { g_running = 0 }
+            if key == gui.SCANCODE_DELETE { f = do_delete(f) }
+            if key == gui.SCANCODE_BACKSPACE { f = do_delete(f) }
+            if key == gui.SCANCODE_G {
+                println(gen_source(f, "My Form"))
+                g_status = "generated " + widgets.Ui_count(f).to_string()
+                    + " controls to stdout"
+            }
+        }
+        ev = gui.Win_poll_event()
+    }
+    return f
+}
+
+fn in_canvas(mx: int, my: int) -> int {
+    if mx < CANVAS_X { return 0 }
+    if my < CANVAS_Y { return 0 }
+    if mx >= CANVAS_X + CANVAS_W { return 0 }
+    if my >= CANVAS_Y + CANVAS_H { return 0 }
+    return 1
+}
+
+fn run_designer(win: int, font: int) {
+    var form = widgets.Ui_new(win, font)
+    g_running = 1
+    while g_running == 1 {
+        form = pump(form)
+        draw_all(win, font, form)
+        gui.Win_delay(16)
+    }
+}
+
+// Delete the selection. Separate because two keys reach it and the selection
+// must be cleared with it - g_sel pointing at a removed widget would draw
+// handles around nothing and the next drag would move a widget that is gone.
+fn do_delete(form: Ui) -> Ui {
+    if g_sel == -1 {
+        g_status = "nothing selected"
+        return form
+    }
+    var f = widgets.Ui_delete(form, g_sel)
+    g_status = "deleted #" + g_sel.to_string()
+    g_sel = -1
+    g_dragging = 0
+    return f
+}
+
+// ---- self-test: SYNTHETIC EVENTS through the real dispatch ----------------
+//
+// The strongest test available without a human. Win_push_* queues a REAL
+// platform event, so Win_poll_event inside pump() returns it exactly as it
+// returns a mouse's, and the branch a click takes is decided by the shipping
+// code rather than by the test. This is what proves "clicking the palette
+// changes the tool" and "pressing on a widget and moving relocates it", as
+// opposed to proving that Ui_move can move things.
+//
+// Needs a window, because events are addressed to one. Under
+// SDL_VIDEODRIVER=dummy that window is real to SDL and invisible, so this runs
+// in CI.
+
+fn ev_selftest(win: int, font: int) {
+    println("=== designer selftest: SYNTHETIC EVENTS through pump() ===")
+    var form = widgets.Ui_new(win, font)
+    g_tool = widgets.KIND_BUTTON
+    g_sel = -1
+    g_counter = 0
+
+    println("-- click the 'panel' row in the toolbox (tool should change) --")
+    println("   tool before = " + widgets.Ui_kind_name(g_tool))
+    gui.Win_push_mouse_down(win, PAL_X + 40, pal_y(4) + 8, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, PAL_X + 40, pal_y(4) + 8, gui.MOUSE_LEFT)
+    form = pump(form)
+    println("   tool after  = " + widgets.Ui_kind_name(g_tool)
+        + "   (expect panel; count still " + widgets.Ui_count(form).to_string()
+        + " - a toolbox click must NOT place anything)")
+
+    println("-- click empty canvas (should PLACE a panel) --")
+    gui.Win_push_mouse_down(win, CANVAS_X + 60, CANVAS_Y + 60, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, CANVAS_X + 60, CANVAS_Y + 60, gui.MOUSE_LEFT)
+    form = pump(form)
+    var panel = g_sel
+    println("   " + g_status)
+    println("   count = " + widgets.Ui_count(form).to_string()
+        + ", selected = #" + g_sel.to_string())
+
+    println("-- pick the 'button' tool, then click INSIDE the panel --")
+    gui.Win_push_mouse_down(win, PAL_X + 40, pal_y(1) + 8, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, PAL_X + 40, pal_y(1) + 8, gui.MOUSE_LEFT)
+    form = pump(form)
+    println("   tool = " + widgets.Ui_kind_name(g_tool))
+    // A click on the panel SELECTS the panel - it does not place a button on it.
+    // That is the honest behaviour of this MVP and worth showing rather than
+    // hiding: parenting is not implemented, so the panel is just a widget that
+    // happens to be big, and clicking it selects it like any other.
+    gui.Win_push_mouse_down(win, CANVAS_X + 100, CANVAS_Y + 100, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, CANVAS_X + 100, CANVAS_Y + 100, gui.MOUSE_LEFT)
+    form = pump(form)
+    println("   " + g_status + "   (selects the panel: this MVP has no parenting,"
+        + " so a click inside a panel hits the panel)")
+    println("   count = " + widgets.Ui_count(form).to_string() + " (unchanged)")
+
+    println("-- click EMPTY canvas below the panel (places the button) --")
+    gui.Win_push_mouse_down(win, CANVAS_X + 60, CANVAS_Y + 260, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, CANVAS_X + 60, CANVAS_Y + 260, gui.MOUSE_LEFT)
+    form = pump(form)
+    var btn = g_sel
+    println("   " + g_status)
+
+    println("-- DRAG the button: press on it, move, release --")
+    println("   before: " + widgets.Ui_x_of(form, btn).to_string() + ","
+        + widgets.Ui_y_of(form, btn).to_string())
+    // Press 20px into the button, so the grab offset is non-zero and a bug that
+    // ignores it shows up as a 20px jump rather than being invisible.
+    gui.Win_push_mouse_down(win, CANVAS_X + 80, CANVAS_Y + 272, gui.MOUSE_LEFT)
+    form = pump(form)
+    println("   press -> " + g_status + ", dragging = " + g_dragging.to_string()
+        + ", grab offset = " + g_drag_dx.to_string() + ","
+        + g_drag_dy.to_string())
+    gui.Win_push_mouse_move(win, CANVAS_X + 400, CANVAS_Y + 400)
+    form = pump(form)
+    println("   move  -> " + g_status)
+    gui.Win_push_mouse_up(win, CANVAS_X + 400, CANVAS_Y + 400, gui.MOUSE_LEFT)
+    form = pump(form)
+    // The press was 24,16 into the button (80,272 on a widget at 56,256), so a
+    // pointer at form 400,400 must put the CORNER at 376,384 - not at 400,400.
+    // Those 24,16 are the whole point of the grab offset.
+    println("   after : " + widgets.Ui_x_of(form, btn).to_string() + ","
+        + widgets.Ui_y_of(form, btn).to_string()
+        + "   (pointer at form 400,400 minus the 24,16 grab offset = 376,384;"
+        + " NOT 400,400, which is what ignoring the offset would give)")
+    println("   released, dragging = " + g_dragging.to_string())
+
+    println("-- a move with the button NOT held must not relocate anything --")
+    var bx = widgets.Ui_x_of(form, btn)
+    gui.Win_push_mouse_move(win, CANVAS_X + 700, CANVAS_Y + 500)
+    form = pump(form)
+    println("   x still " + widgets.Ui_x_of(form, btn).to_string()
+        + " (was " + bx.to_string() + ") - a drag needs a press first")
+
+    println("-- press DELETE (the real key) --")
+    println("   selected = #" + g_sel.to_string() + ", count = "
+        + widgets.Ui_count(form).to_string())
+    g_sel = btn
+    gui.Win_push_key_down(win, gui.SCANCODE_DELETE)
+    form = pump(form)
+    println("   " + g_status + ", count = " + widgets.Ui_count(form).to_string()
+        + ", selection = " + g_sel.to_string())
+    println("   Ui_exists(deleted) = " + widgets.Ui_exists(form, btn).to_string()
+        + ", panel survives = " + widgets.Ui_exists(form, panel).to_string())
+
+    println("-- press ESCAPE (should ask the loop to quit) --")
+    g_running = 1
+    gui.Win_push_key_down(win, gui.SCANCODE_ESCAPE)
+    form = pump(form)
+    println("   g_running = " + g_running.to_string() + " (expect 0)")
+    g_running = 1
+
+    println("-- clip stack is balanced after a full frame --")
+    println("   depth before draw = " + gui.Win_clip_depth(win).to_string())
+    draw_all(win, font, form)
+    println("   depth after  draw = " + gui.Win_clip_depth(win).to_string()
+        + " (must be 0: an unbalanced push leaks the clip into the next frame)")
+
+    println("-- press G: generate from the event-driven form --")
+    gui.Win_push_key_down(win, gui.SCANCODE_G)
+    form = pump(form)
+    println("")
+}
+
+// ---- self-test: the model, with no window at all --------------------------
+//
+// Complements ev_selftest: this needs no display whatsoever, because every
+// accessor is total and a Ui with win = -1 is a legitimate document. That is
+// worth having - it means the designer's model and its code generator are
+// testable where SDL cannot even open a dummy window.
+
+fn selftest() {
+    println("=== designer selftest ===")
+    // win/font -1: nothing here draws, and every accessor is total, so a Ui
+    // with no window is a legitimate document. That is worth having: it means
+    // the designer's model is testable with no display at all.
+    var form = widgets.Ui_new(-1, -1)
+
+    println("-- place 3 widgets --")
+    form = place(form, widgets.KIND_PANEL, 24, 24)
+    println("   " + g_status)
+    form = place(form, widgets.KIND_LABEL, 40, 48)
+    println("   " + g_status)
+    form = place(form, widgets.KIND_BUTTON, 40, 96)
+    println("   " + g_status)
+    var btn = g_sel
+    form = place(form, widgets.KIND_ENTRY, 152, 44)
+    println("   " + g_status)
+    var entry = g_sel
+    form = place(form, widgets.KIND_CHECKBOX, 40, 152)
+    println("   " + g_status)
+    var chk = g_sel
+    println("   count = " + widgets.Ui_count(form).to_string())
+
+    println("-- selection by hit-test (what a click does) --")
+    g_sel = pick(form, 44, 100)
+    println("   pick(44,100) -> #" + g_sel.to_string() + " "
+        + widgets.Ui_kind_name(widgets.Ui_kind_of(form, g_sel))
+        + "  (expect the button, #" + btn.to_string() + ")")
+    println("   pick(700,480) -> " + pick(form, 700, 480).to_string()
+        + "  (expect -1: empty canvas, so a click there PLACES)")
+    println("   pick(41,49) -> #" + pick(form, 41, 49).to_string()
+        + "  (expect the label: labels are 0x0 in the toolkit and would be "
+        + "unclickable without box_w/box_h)")
+
+    println("-- move (drag) --")
+    println("   before: " + widgets.Ui_x_of(form, btn).to_string() + ","
+        + widgets.Ui_y_of(form, btn).to_string())
+    g_sel = btn
+    form = widgets.Ui_move(form, btn, snap(203), snap(251))
+    println("   after : " + widgets.Ui_x_of(form, btn).to_string() + ","
+        + widgets.Ui_y_of(form, btn).to_string()
+        + "   (203,251 snapped to the " + GRID.to_string() + "px grid)")
+
+    println("-- edit properties --")
+    form = widgets.Ui_set_text(form, entry, "ada@example.com")
+    form = widgets.Ui_set_checked(form, chk, 1)
+    form = widgets.Ui_set_label(form, chk, "Remember \"me\"")
+    println("   entry text = '" + widgets.Ui_text(form, entry) + "'")
+    println("   check      = " + widgets.Ui_checked(form, chk).to_string()
+        + ", label = '" + widgets.Ui_label_of(form, chk) + "'")
+    println("   (the quotes in that caption must come back ESCAPED below, or "
+        + "the generated source will not parse)")
+
+    println("-- delete --")
+    form = place(form, widgets.KIND_BUTTON, 400, 400)
+    var doomed = g_sel
+    println("   placed #" + doomed.to_string() + ", count = "
+        + widgets.Ui_count(form).to_string())
+    g_sel = doomed
+    form = do_delete(form)
+    println("   " + g_status + ", count = " + widgets.Ui_count(form).to_string()
+        + ", selection = " + g_sel.to_string())
+    println("   Ui_exists(deleted) = " + widgets.Ui_exists(form, doomed).to_string())
+
+    println("-- a disabled control --")
+    // `enabled` is not a constructor argument, so the generator has to emit a
+    // follow-up Ui_set_enabled or the generated form comes up clickable. Covered
+    // here so that line is exercised rather than assumed.
+    form = place(form, widgets.KIND_BUTTON, 200, 320)
+    form = widgets.Ui_set_enabled(form, g_sel, 0)
+    println("   placed #" + g_sel.to_string() + ", enabled = "
+        + widgets.Ui_enabled(form, g_sel).to_string()
+        + " -> the generator must emit Ui_set_enabled for it")
+
+    println("-- status line --")
+    g_sel = btn
+    println("   " + status_text(form))
+
+    println("")
+    println("=== GENERATED SOURCE ===")
+    print(gen_source(form, "My Form"))
+    println("=== END GENERATED SOURCE ===")
+
+    // Write it out so the claim "this would compile" is checkable rather than
+    // asserted: `wyn check` the file the designer actually produced.
+    var out = "/tmp/wyn_designer_out.wyn"
+    if File::write(out, gen_source(form, "My Form")) == 1 {
+        println("wrote " + out + " - verify with: wyn check " + out)
+    }
+}
+
+// Render one frame of a representative session and save it to a BMP.
+//
+// No assertion can say the UI LOOKED right, and the dummy video driver delivers
+// no input, so this is the only way to see the designer's own chrome - toolbox
+// highlight, grid, selection handles, status line - without a human at a mouse.
+fn screenshot(win: int, font: int, path: string) {
+    var form = widgets.Ui_new(win, font)
+    g_tool = widgets.KIND_ENTRY
+    form = place(form, widgets.KIND_PANEL, 40, 40)
+    form = place(form, widgets.KIND_LABEL, 64, 64)
+    form = place(form, widgets.KIND_ENTRY, 160, 56)
+    form = widgets.Ui_set_text(form, g_sel, "ada@example.com")
+    form = place(form, widgets.KIND_CHECKBOX, 64, 112)
+    form = widgets.Ui_set_checked(form, g_sel, 1)
+    form = place(form, widgets.KIND_BUTTON, 64, 216)
+    g_status = "selection handles are drawn around the selected widget"
+    draw_all(win, font, form)
+    println("screenshot(" + path + ") = "
+        + gui.Win_screenshot(win, path).to_string())
+    println("chrome frame: " + status_text(form))
+}
+
+fn main() {
+    // The default tool. Here rather than at the var, see the note on g_tool.
+    g_tool = widgets.KIND_BUTTON
+
+    var args = System::args()
+    var want_selftest = 0
+    var want_shot = 0
+    var i = 1
+    while i < args.len() {
+        if args[i] == "--selftest" { want_selftest = 1 }
+        if args[i] == "--screenshot" { want_shot = 1 }
+        i = i + 1
+    }
+    // Env fallbacks as well as the flags: `wyn run` does not forward argv to the
+    // program (verified - args.len() is 1 under `wyn run`), so without these the
+    // non-interactive modes would only be reachable from a built binary.
+    if Env::get("WYN_DESIGNER_SELFTEST") == "1" { want_selftest = 1 }
+    var shot_path = Env::get("WYN_DESIGNER_SCREENSHOT")
+    if shot_path.len() > 0 { want_shot = 1 }
+    if shot_path.len() == 0 { shot_path = "designer.bmp" }
+
+    // The model test needs no display at all, so run it even where SDL cannot
+    // open a dummy window. Order matters: it prints the generated source last,
+    // which is what a reader is looking for.
+    if want_selftest == 1 {
+        if gui.Win_available() == 1 {
+            var w2 = gui.Win_window("selftest", WIN_W, WIN_H)
+            if w2 >= 0 {
+                var f2 = gui.Win_font_default(15)
+                ev_selftest(w2, f2)
+                if f2 >= 0 { gui.Win_font_free(f2) }
+                gui.Win_close(w2)
+            }
+        } else {
+            println("(no display: skipping the synthetic-event pass, which needs"
+                + " a window to address events to)")
+            println("")
+        }
+        selftest()
+        return
+    }
+
+    if gui.Win_available() == 0 {
+        println("no display available - run with --selftest")
+        return
+    }
+    var win = gui.Win_window("Wyn Visual Designer", WIN_W, WIN_H)
+    if win < 0 {
+        println("could not open a window")
+        return
+    }
+    var font = gui.Win_font_default(15)
+    if font < 0 {
+        println("no font found")
+        gui.Win_close(win)
+        return
+    }
+
+    if want_shot == 1 {
+        screenshot(win, font, shot_path)
+    } else {
+        run_designer(win, font)
+    }
+
+    gui.Win_font_free(font)
+    gui.Win_close(win)
+}

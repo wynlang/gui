@@ -1,0 +1,706 @@
+// showcase - every part of Visual Wyn in one window, and a self-test that
+// proves the interactive parts without a human.
+//
+//   ./csrc/build.sh                                  # build the native backend
+//   WYN_ROOT=/path/to/wyn wyn run examples/showcase.wyn             # interactive
+//   WYN_GUI_SELFTEST=1 SDL_VIDEODRIVER=dummy \
+//       WYN_ROOT=/path/to/wyn wyn run examples/showcase.wyn         # headless proof
+//
+// WHY THERE IS A SELF-TEST, AND WHY IT IS NOT A UNIT TEST
+//
+// The claim "the GUI works" is a claim about behaviour a human triggers: hover,
+// press, release-over-the-same-control, focus, typing. A test that instead calls
+// the toolkit's state-setters proves only that assignment works - it bypasses
+// dispatch, which is the sole place the logic can be wrong.
+//
+// So --selftest pushes REAL events onto the platform queue
+// (gui.Win_push_mouse_down and friends). Win_poll_event cannot tell them from a
+// human's, and the code under test is the shipping path: same queue, same
+// decode, same handler dispatch. The only synthetic thing is who moved the
+// mouse. It runs under SDL_VIDEODRIVER=dummy, so this is CI-able over ssh.
+
+import gui
+import widgets
+
+// ---- state the handlers act through --------------------------------------
+//
+// A Wyn closure cannot capture a mutable reference to the surrounding state, so
+// a handler cannot hold the Ui. Handlers therefore write module-level state, and
+// the frame loop reads it back and pushes it into the widgets. That indirection
+// is the price of the constraint; it is also, usefully, exactly how a VB form's
+// event handlers relate to its controls.
+
+var clicks = 0            // total button presses - the live counter
+var last_action = "ready" // what the most recent click did
+var dirty = 1             // 1 when the widgets need re-syncing from the above
+
+// Ids, filled in during construction. Module-level so the handlers can name the
+// widget they affect.
+var id_counter_lbl = -1
+var id_status_lbl = -1
+var id_target_btn = -1
+var id_check = -1
+var id_entry = -1
+var id_check_lbl = -1
+var id_enable_btn = -1
+var id_disable_btn = -1
+var id_save_btn = -1
+var id_load_btn = -1
+var id_reset_btn = -1
+
+// The enable/disable request a handler leaves for the frame loop. -1 = nothing,
+// 0 = disable the target, 1 = enable it. A handler cannot touch the Ui itself,
+// so it records the intent and the loop performs it.
+var want_target_enabled = -1
+
+// ---- handlers ------------------------------------------------------------
+
+fn on_save(id: int) {
+    clicks = clicks + 1
+    last_action = "Save pressed (widget " + id.to_string() + ")"
+    dirty = 1
+    println("[click] Save   -> " + last_action)
+}
+
+fn on_load(id: int) {
+    clicks = clicks + 1
+    last_action = "Load pressed (widget " + id.to_string() + ")"
+    dirty = 1
+    println("[click] Load   -> " + last_action)
+}
+
+fn on_reset(id: int) {
+    clicks = clicks + 1
+    last_action = "counter reset"
+    clicks = 0
+    dirty = 1
+    println("[click] Reset  -> counter back to 0")
+}
+
+// The two buttons that reach across and change ANOTHER widget at runtime. This
+// is the thing an immediate-mode UI cannot do from a callback: there is no
+// widget to change, only a draw call that will or will not happen next frame.
+fn on_enable(id: int) {
+    clicks = clicks + 1
+    want_target_enabled = 1
+    last_action = "enabled the target button"
+    dirty = 1
+    println("[click] Enable -> target button enabled")
+}
+
+fn on_disable(id: int) {
+    clicks = clicks + 1
+    want_target_enabled = 0
+    last_action = "disabled the target button"
+    dirty = 1
+    println("[click] Disable-> target button disabled")
+}
+
+fn on_target(id: int) {
+    clicks = clicks + 1
+    last_action = "the target button itself fired"
+    dirty = 1
+    println("[click] Target -> fired (it was enabled)")
+}
+
+fn on_toggle(id: int) {
+    clicks = clicks + 1
+    last_action = "checkbox toggled"
+    dirty = 1
+    println("[click] Check  -> toggled")
+}
+
+// ---- the RGBA gradient ---------------------------------------------------
+//
+// Built in Wyn, byte by byte, then uploaded once and blitted - the path a real
+// app needs for an image, a chart, or a video frame. Drawing this with one
+// Win_rect per pixel would be 4096 calls a frame for a 64x64 thumbnail; a
+// 1024x768 viewport would be 786k, which is not slow but unusable.
+//
+// The pixels travel as a Wyn string. That is not a hack for lack of a byte
+// array: `Win_texture_update` takes `ptr`, and passing a Wyn array where a `ptr`
+// is expected is rejected ("Expected: struct, Got: array"), while a string
+// reaches C as the `char*` the backend wants. Encoding.hex_decode turns two hex
+// digits into one byte, so the Wyn side composes hex and hands over real bytes.
+
+var HEXDIGITS = "0123456789abcdef"
+
+fn hex_byte(v: int) -> string {
+    var n = v
+    if n < 0 { n = 0 }
+    if n > 255 { n = 255 }
+    return HEXDIGITS.char_at(n / 16) + HEXDIGITS.char_at(n % 16)
+}
+
+// A 64x64 RGBA image: red ramps left-to-right, green top-to-bottom, and a
+// lighter diagonal band so the result is obviously computed rather than a flat
+// fill. Returns the raw bytes, ready for Win_texture_update.
+fn build_gradient(size: int) -> string {
+    // Rows accumulate separately and join once. Appending to a single string per
+    // pixel is quadratic; for 64x64 that is 16k appends over a growing 32k
+    // buffer.
+    var rows: [string] = []
+    var y = 0
+    while y < size {
+        var row = ""
+        var x = 0
+        while x < size {
+            var r = x * 255 / (size - 1)
+            var g = y * 255 / (size - 1)
+            var b = 90
+            // Diagonal highlight.
+            var d = x + y
+            if d > size - 6 {
+                if d < size + 6 { b = 240 }
+            }
+            row = row + hex_byte(r) + hex_byte(g) + hex_byte(b) + "ff"
+            x = x + 1
+        }
+        rows.push(row)
+        y = y + 1
+    }
+    return Encoding.hex_decode(rows.join(""))
+}
+
+// ---- layout --------------------------------------------------------------
+
+var WIN_W = 700
+var WIN_H = 576
+
+// Where the gradient is blitted. Named constants rather than literals repeated
+// at the draw site and in the test: when these were two hard-coded pairs, moving
+// the layout by 26px left the selftest sampling the background and reporting a
+// broken texture upload. The rectangle is now stated once, so a layout change
+// cannot make the test lie in either direction.
+var TEX_X = 20
+var TEX_Y = 396
+var TEX_W = 44
+var TEX_H = 44
+
+// A section heading: the text, plus a rule under it the full width of the
+// column, so the grouping is visible rather than implied by whitespace.
+fn section(win: int, font: int, title: string, x: int, y: int, w: int) {
+    gui.Win_text(win, font, title, x, y, 150, 190, 255)
+    gui.Win_line(win, x, y + 18, x + w, y + 18, 70, 80, 100)
+}
+
+// ---- the form ------------------------------------------------------------
+
+fn build_form(win: int, font: int) -> Ui {
+    var ui = widgets.Ui_new(win, font)
+
+    // Left column: the widget gallery.
+    ui = widgets.Ui_panel(ui, 20, 104, 320, 250)
+
+    ui = widgets.Ui_label(ui, "Label: plain static text", 34, 118)
+
+    ui = widgets.Ui_button(ui, "Save", 34, 144, 88, 30, on_save)
+    id_save_btn = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_button(ui, "Load", 132, 144, 88, 30, on_load)
+    id_load_btn = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_button(ui, "Reset", 230, 144, 88, 30, on_reset)
+    id_reset_btn = widgets.Ui_last_id(ui)
+
+    ui = widgets.Ui_checkbox(ui, "Checkbox - click to toggle", 34, 190, 1, on_toggle)
+    id_check = widgets.Ui_last_id(ui)
+
+    ui = widgets.Ui_label(ui, "", 34, 216)
+    id_check_lbl = widgets.Ui_last_id(ui)
+
+    ui = widgets.Ui_label(ui, "Entry - click it and type:", 34, 244)
+    ui = widgets.Ui_entry(ui, "edit me", 34, 264, 284, 28)
+    id_entry = widgets.Ui_last_id(ui)
+
+    ui = widgets.Ui_label(ui, "Panel - the frame behind these controls", 34, 318)
+
+    // Right column: enable/disable, which only a retained model can do.
+    ui = widgets.Ui_panel(ui, 360, 104, 320, 250)
+
+    ui = widgets.Ui_button(ui, "Target button", 374, 144, 140, 30, on_target)
+    id_target_btn = widgets.Ui_last_id(ui)
+
+    ui = widgets.Ui_button(ui, "Enable it", 374, 184, 130, 28, on_enable)
+    id_enable_btn = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_button(ui, "Disable it", 514, 184, 130, 28, on_disable)
+    id_disable_btn = widgets.Ui_last_id(ui)
+
+    ui = widgets.Ui_label(ui, "Those two buttons change ANOTHER widget", 374, 226)
+    ui = widgets.Ui_label(ui, "at runtime. An immediate-mode UI cannot:", 374, 244)
+    ui = widgets.Ui_label(ui, "it has no widget to change, only a draw", 374, 262)
+    ui = widgets.Ui_label(ui, "call that will or will not happen next", 374, 280)
+    ui = widgets.Ui_label(ui, "frame.", 374, 298)
+
+    // Bottom strip: the live counter and status. Both start empty and are filled
+    // by sync() - so if the retained-state wiring were broken, this strip would
+    // be visibly blank rather than quietly stale.
+    ui = widgets.Ui_panel(ui, 20, 492, 660, 54)
+    ui = widgets.Ui_label(ui, "", 34, 502)
+    id_counter_lbl = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_label(ui, "", 34, 522)
+    id_status_lbl = widgets.Ui_last_id(ui)
+
+    return ui
+}
+
+// Push the module-level state into the widgets. Called whenever `dirty`, which
+// is the whole retained-mode story in one function: the widgets persist, so this
+// changes a few of them rather than re-describing the interface.
+fn sync(ui: Ui) -> Ui {
+    var u = ui
+    u = widgets.Ui_set_label(u, id_counter_lbl,
+        "Clicks: " + clicks.to_string() + "    (a live retained label)")
+    u = widgets.Ui_set_label(u, id_status_lbl, "Last: " + last_action)
+
+    // Read the checkbox back out and display it - proving the toolkit owns the
+    // state and a caller can query it, not just watch it draw.
+    var on = widgets.Ui_checked(u, id_check)
+    var word = "OFF"
+    if on == 1 { word = "ON" }
+    u = widgets.Ui_set_label(u, id_check_lbl, "  read back: checked = " + word)
+
+    if want_target_enabled != -1 {
+        u = widgets.Ui_set_enabled(u, id_target_btn, want_target_enabled)
+        want_target_enabled = -1
+    }
+    dirty = 0
+    return u
+}
+
+// Everything that is not a widget: title, headings, the texture, and the
+// measured caption. Drawn between the clear and the widgets, so the widgets sit
+// on top.
+fn draw_chrome(win: int, font: int, title_font: int, tex: int, size: int) {
+    gui.Win_text(win, title_font, "Visual Wyn", 20, 18, 235, 235, 245)
+    gui.Win_text(win, font, "a retained-mode GUI, written in Wyn", 20, 48, 150, 155, 175)
+    gui.Win_line(win, 20, 68, WIN_W - 20, 68, 70, 80, 100)
+
+    // Headings sit ABOVE the group they name. Below it they read as captions for
+    // whatever comes next, which is how the first draft of this looked.
+    section(win, font, "EVERY WIDGET KIND", 20, 82, 320)
+    section(win, font, "RUNTIME ENABLE / DISABLE", 360, 82, 320)
+    section(win, font, "TEXTURE + TEXT METRICS", 20, 368, 660)
+
+    // The texture: one upload (done once, at startup), one blit per frame.
+    gui.Win_blit(win, tex, TEX_X, TEX_Y, TEX_W, TEX_H)
+    gui.Win_text(win, font, "<- 64x64 RGBA gradient, computed in Wyn,",
+                 TEX_X + TEX_W + 10, TEX_Y, 190, 195, 210)
+    gui.Win_text(win, font, "   uploaded once and blitted each frame",
+                 TEX_X + TEX_W + 10, TEX_Y + 20, 190, 195, 210)
+
+    // Text metrics. The caption is centred by MEASURING it - the width is not a
+    // guess, and the measured number is printed beside it so the claim is
+    // checkable by looking.
+    var caption = "centred with Win_text_width"
+    var tw = gui.Win_text_width(font, caption)
+    var cx = (WIN_W - tw) / 2
+    gui.Win_text(win, font, caption, cx, 446, 235, 235, 245)
+    // The rule is exactly as wide as the measured text, so "centred" is visibly
+    // true rather than asserted: the gap left of the rule equals the gap right.
+    gui.Win_line(win, cx, 464, cx + tw, 464, 100, 140, 200)
+    var note = "measured " + tw.to_string() + " px wide, window " + WIN_W.to_string()
+                 + " px -> x = " + cx.to_string()
+    var nw = gui.Win_text_width(font, note)
+    gui.Win_text(win, font, note, (WIN_W - nw) / 2, 470, 140, 150, 170)
+
+    gui.Win_text(win, font, "Esc or close the window to quit.", 20, WIN_H - 18,
+                 120, 130, 150)
+    // `size` is the texture's edge length; named in the caption above so the
+    // parameter is not decorative.
+    if size != 64 {
+        gui.Win_text(win, font, "(gradient " + size.to_string() + "px)", 400,
+                     WIN_H - 22, 120, 130, 150)
+    }
+}
+
+// ---- the self-test -------------------------------------------------------
+//
+// Each step pushes real events, drains them through widgets.Ui_events (the same
+// call the frame loop makes), and prints the resulting state. Failures are
+// visible as a mismatch against the "expect" on the same line, so the output is
+// the assertion.
+
+fn expect(what: string, got: int, want: int) {
+    var verdict = "FAIL"
+    if got == want { verdict = "ok" }
+    println("  [" + verdict + "] " + what + " = " + got.to_string()
+            + "  (expect " + want.to_string() + ")")
+}
+
+fn expect_s(what: string, got: string, want: string) {
+    var verdict = "FAIL"
+    if got == want { verdict = "ok" }
+    println("  [" + verdict + "] " + what + " = '" + got + "'  (expect '" + want + "')")
+}
+
+// Press and release at one point: the full click gesture, not a poke at state.
+fn click_at(win: int, ui: Ui, x: int, y: int) -> Ui {
+    gui.Win_push_mouse_down(win, x, y, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, x, y, gui.MOUSE_LEFT)
+    return widgets.Ui_events(ui)
+}
+
+// Centre of a widget, so the test aims at the control rather than at a
+// hard-coded coordinate that a layout change would silently invalidate.
+fn centre_x(ui: Ui, id: int) -> int {
+    return widgets.Ui_x_of(ui, id) + widgets.Ui_w_of(ui, id) / 2
+}
+
+fn centre_y(ui: Ui, id: int) -> int {
+    return widgets.Ui_y_of(ui, id) + widgets.Ui_h_of(ui, id) / 2
+}
+
+fn selftest(win: int, font: int, tex: int, size: int) {
+    println("=== showcase --selftest ===")
+    println("Driving the REAL event queue: every step below pushes a platform")
+    println("event, then drains it through widgets.Ui_events - the same call the")
+    println("interactive frame loop makes. Nothing pokes toolkit state directly.")
+    println("")
+
+    var ui = build_form(win, font)
+    ui = sync(ui)
+
+    println("-- the form as data (retained: it EXISTS between frames) --")
+    println("  widgets declared: " + widgets.Ui_count(ui).to_string())
+    // Tally the kinds, which also demonstrates that a caller OUTSIDE the widgets
+    // module can walk the form as data - the thing a visual designer needs.
+    var i = 0
+    var n_label = 0
+    var n_button = 0
+    var n_check = 0
+    var n_entry = 0
+    var n_panel = 0
+    while i < widgets.Ui_count(ui) {
+        var k = widgets.Ui_kind_at(ui, i)
+        if widgets.Ui_kind_name(k) == "label" { n_label = n_label + 1 }
+        if widgets.Ui_kind_name(k) == "button" { n_button = n_button + 1 }
+        if widgets.Ui_kind_name(k) == "checkbox" { n_check = n_check + 1 }
+        if widgets.Ui_kind_name(k) == "entry" { n_entry = n_entry + 1 }
+        if widgets.Ui_kind_name(k) == "panel" { n_panel = n_panel + 1 }
+        i = i + 1
+    }
+    println("  by kind: " + n_label.to_string() + " label, "
+            + n_button.to_string() + " button, " + n_check.to_string() + " checkbox, "
+            + n_entry.to_string() + " entry, " + n_panel.to_string() + " panel")
+    // All five kinds present - the demo would be lying about "every widget kind"
+    // if any of these were 0.
+    var all_kinds = 0
+    if n_label > 0 {
+        if n_button > 0 {
+            if n_check > 0 {
+                if n_entry > 0 {
+                    if n_panel > 0 { all_kinds = 1 }
+                }
+            }
+        }
+    }
+    expect("all five widget kinds present", all_kinds, 1)
+    println("")
+
+    println("-- 1. buttons dispatch to distinct handlers --")
+    var before = clicks
+    ui = click_at(win, ui, centre_x(ui, id_save_btn), centre_y(ui, id_save_btn))
+    expect("clicks after Save", clicks, before + 1)
+    ui = click_at(win, ui, centre_x(ui, id_load_btn), centre_y(ui, id_load_btn))
+    expect("clicks after Load", clicks, before + 2)
+    // Reset has its own handler, which zeroes the counter - distinct behaviour,
+    // not just a distinct printout.
+    ui = click_at(win, ui, centre_x(ui, id_reset_btn), centre_y(ui, id_reset_btn))
+    expect("clicks after Reset (its handler zeroes it)", clicks, 0)
+    println("")
+
+    println("-- 2. the counter label updates from retained state --")
+    ui = sync(ui)
+    expect_s("counter label", widgets.Ui_label_of(ui, id_counter_lbl),
+             "Clicks: " + clicks.to_string() + "    (a live retained label)")
+    println("")
+
+    println("-- 3. a release AWAY from the press does not fire (drag = cancel) --")
+    // Two cases, because they fail differently.
+    //
+    // (a) press on Save, release over EMPTY space. Nothing should fire.
+    var b4 = clicks
+    gui.Win_push_mouse_down(win, centre_x(ui, id_save_btn),
+                            centre_y(ui, id_save_btn), gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, 5, 5, gui.MOUSE_LEFT)
+    ui = widgets.Ui_events(ui)
+    expect("clicks after release over empty space", clicks, b4)
+
+    // (b) press on Save, release over LOAD. Neither may fire: not Save (the
+    // pointer left it) and not Load (the press did not begin there).
+    //
+    // Case (b) is the one that has teeth. Releasing over empty space also passes
+    // if the toolkit fires on whatever is under the release point, so (a) alone
+    // cannot tell correct dispatch from "fire on release, wherever". Verified by
+    // mutation: replacing the `wu.id == u.active` guard with `1 == 1` leaves (a)
+    // green and turns (b) red.
+    var b4b = clicks
+    gui.Win_push_mouse_down(win, centre_x(ui, id_save_btn),
+                            centre_y(ui, id_save_btn), gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, centre_x(ui, id_load_btn),
+                          centre_y(ui, id_load_btn), gui.MOUSE_LEFT)
+    ui = widgets.Ui_events(ui)
+    expect("clicks after press-Save-release-Load", clicks, b4b)
+    println("")
+
+    println("-- 4. checkbox toggles, and the state reads back --")
+    var was = widgets.Ui_checked(ui, id_check)
+    ui = click_at(win, ui, centre_x(ui, id_check), centre_y(ui, id_check))
+    var now = widgets.Ui_checked(ui, id_check)
+    expect("checked before", was, 1)
+    expect("checked after", now, 0)
+    ui = sync(ui)
+    expect_s("read-back label", widgets.Ui_label_of(ui, id_check_lbl),
+             "  read back: checked = OFF")
+    ui = click_at(win, ui, centre_x(ui, id_check), centre_y(ui, id_check))
+    expect("checked after 2nd click", widgets.Ui_checked(ui, id_check), 1)
+    println("")
+
+    println("-- 5. focus + typing + backspace, through real text events --")
+    ui = click_at(win, ui, centre_x(ui, id_entry), centre_y(ui, id_entry))
+    expect("focus", widgets.Ui_focus(ui), id_entry)
+    ui = widgets.Ui_set_text(ui, id_entry, "")
+    gui.Win_push_text(win, "W")
+    gui.Win_push_text(win, "y")
+    gui.Win_push_text(win, "n")
+    ui = widgets.Ui_events(ui)
+    expect_s("entry after typing 'Wyn'", widgets.Ui_text(ui, id_entry), "Wyn")
+    gui.Win_push_key_down(win, gui.SCANCODE_BACKSPACE)
+    ui = widgets.Ui_events(ui)
+    expect_s("entry after backspace", widgets.Ui_text(ui, id_entry), "Wy")
+    // The caret is drawn at the measured end of the text, so its x moves with
+    // the content. Measure both to show it is computed, not assumed.
+    var cw1 = gui.Win_text_width(font, "Wy")
+    var cw2 = gui.Win_text_width(font, "Wynwyn")
+    println("  caret x offset for 'Wy' = " + cw1.to_string()
+            + " px, for 'Wynwyn' = " + cw2.to_string() + " px (caret tracks text)")
+    println("")
+
+    println("-- 6. one widget enables/disables ANOTHER from a callback --")
+    expect("target enabled initially", widgets.Ui_enabled(ui, id_target_btn), 1)
+    ui = click_at(win, ui, centre_x(ui, id_disable_btn), centre_y(ui, id_disable_btn))
+    ui = sync(ui)
+    expect("target enabled after Disable", widgets.Ui_enabled(ui, id_target_btn), 0)
+    var b5 = clicks
+    ui = click_at(win, ui, centre_x(ui, id_target_btn), centre_y(ui, id_target_btn))
+    expect("clicks after clicking a DISABLED target", clicks, b5)
+    ui = click_at(win, ui, centre_x(ui, id_enable_btn), centre_y(ui, id_enable_btn))
+    ui = sync(ui)
+    expect("target enabled after Enable", widgets.Ui_enabled(ui, id_target_btn), 1)
+    var b6 = clicks
+    ui = click_at(win, ui, centre_x(ui, id_target_btn), centre_y(ui, id_target_btn))
+    expect("clicks after clicking the RE-ENABLED target", clicks, b6 + 1)
+    println("")
+
+    println("-- 7. hover sets `hot` (so a button can show it is under the pointer) --")
+    gui.Win_push_mouse_move(win, centre_x(ui, id_enable_btn), centre_y(ui, id_enable_btn))
+    ui = widgets.Ui_events(ui)
+    expect("hot over Enable", widgets.Ui_hot(ui), id_enable_btn)
+    gui.Win_push_mouse_move(win, 2, WIN_H - 4)
+    ui = widgets.Ui_events(ui)
+    expect("hot over empty space", widgets.Ui_hot(ui), -1)
+
+    // A DISABLED widget must not become hot, or it would light up under the
+    // pointer while refusing to be pressed - the UI would look broken precisely
+    // when it is behaving correctly. Checked here because nothing else does:
+    // hovering only enabled controls cannot distinguish the two.
+    ui = widgets.Ui_set_enabled(ui, id_target_btn, 0)
+    gui.Win_push_mouse_move(win, centre_x(ui, id_target_btn), centre_y(ui, id_target_btn))
+    ui = widgets.Ui_events(ui)
+    expect("hot over a DISABLED button", widgets.Ui_hot(ui), -1)
+    ui = widgets.Ui_set_enabled(ui, id_target_btn, 1)
+    gui.Win_push_mouse_move(win, centre_x(ui, id_target_btn), centre_y(ui, id_target_btn))
+    ui = widgets.Ui_events(ui)
+    expect("hot over it once RE-enabled", widgets.Ui_hot(ui), id_target_btn)
+
+    // A label and a panel are not interactive, so they never become hot either -
+    // otherwise a label would swallow the highlight of a control beneath it.
+    gui.Win_push_mouse_move(win, widgets.Ui_x_of(ui, id_counter_lbl) + 4,
+                            widgets.Ui_y_of(ui, id_counter_lbl) + 4)
+    ui = widgets.Ui_events(ui)
+    expect("hot over a label/panel", widgets.Ui_hot(ui), -1)
+    println("")
+
+    println("-- 8. text metrics are real measurements --")
+    var caption = "centred with Win_text_width"
+    var tw = gui.Win_text_width(font, caption)
+    var narrow = gui.Win_text_width(font, "iii")
+    var wide = gui.Win_text_width(font, "WWW")
+    println("  Win_text_width('" + caption + "') = " + tw.to_string() + " px")
+    println("  centred x for a " + WIN_W.to_string() + "px window = "
+            + ((WIN_W - tw) / 2).to_string())
+    println("  proportional, not monospaced: 'iii' = " + narrow.to_string()
+            + " px vs 'WWW' = " + wide.to_string() + " px")
+    expect("empty string measures 0", gui.Win_text_width(font, ""), 0)
+    var mono = 0
+    if narrow < wide { mono = 1 }
+    expect("'iii' narrower than 'WWW'", mono, 1)
+    println("")
+
+    println("-- 9. the texture path: build, upload, blit, and read the pixels back --")
+    // Draw one real frame, then read pixels back off it. Every other check in
+    // this file inspects toolkit STATE; this is the only one that inspects what
+    // a user would SEE. A screenshot alone proves a file was written - it cannot
+    // tell "the texture blitted" from "the upload silently failed and the
+    // background showed through", and it cannot catch a red/blue channel swap.
+    gui.Win_clear(win, 28, 28, 34)
+    draw_chrome(win, font, font, tex, size)
+    widgets.Ui_draw_into(ui)
+    var shot = gui.Win_screenshot(win, "/tmp/wyn_showcase_selftest.bmp")
+    expect("screenshot written", shot, 1)
+
+    // Sample INSIDE the blit rectangle, computed from TEX_* rather than written
+    // out again - the coordinates and the drawing cannot drift apart. The
+    // gradient ramps red with x and green with y, which pins the ORIENTATION as
+    // well as the colours: a vertical flip or a channel swap fails these.
+    var inset = 2
+    var x_lo = TEX_X + inset
+    var x_hi = TEX_X + TEX_W - 1 - inset
+    var y_lo = TEX_Y + inset
+    var y_hi = TEX_Y + TEX_H - 1 - inset
+    var tl_r = gui.Win_pixel_at(win, x_lo, y_lo, 0)
+    var tl_g = gui.Win_pixel_at(win, x_lo, y_lo, 1)
+    var tr_r = gui.Win_pixel_at(win, x_hi, y_lo, 0)
+    var bl_g = gui.Win_pixel_at(win, x_lo, y_hi, 1)
+    println("  gradient top-left  rgba = ("
+            + tl_r.to_string() + "," + tl_g.to_string() + ","
+            + gui.Win_pixel_at(win, x_lo, y_lo, 2).to_string() + ","
+            + gui.Win_pixel_at(win, x_lo, y_lo, 3).to_string() + ")")
+    println("  gradient top-right red  = " + tr_r.to_string() + " (ramps with x)")
+    println("  gradient bottom-left green = " + bl_g.to_string() + " (ramps with y)")
+
+    // Thresholds, not exact values: the blit scales the source down, so which
+    // source pixel lands where depends on the renderer's sampling. The RAMP is
+    // the invariant, and it is what a channel swap or a vertical flip breaks.
+    var ramp_x = 0
+    if tr_r > tl_r + 100 { ramp_x = 1 }
+    expect("red ramps left-to-right", ramp_x, 1)
+    var ramp_y = 0
+    if bl_g > tl_g + 100 { ramp_y = 1 }
+    expect("green ramps top-to-bottom", ramp_y, 1)
+    var opaque = 0
+    if gui.Win_pixel_at(win, TEX_X + TEX_W / 2, TEX_Y + TEX_H / 2, 3) == 255 {
+        opaque = 1
+    }
+    expect("gradient is opaque", opaque, 1)
+
+    // And just OUTSIDE the blit the background is untouched, so the texture is
+    // bounded by its rectangle rather than covering the frame. Sampled one pixel
+    // past the right edge, which is the boundary an off-by-one would cross.
+    var bg_r = gui.Win_pixel_at(win, TEX_X + TEX_W + 1, TEX_Y + TEX_H / 2, 0)
+    var bg_g = gui.Win_pixel_at(win, TEX_X + TEX_W + 1, TEX_Y + TEX_H / 2, 1)
+    var bg_b = gui.Win_pixel_at(win, TEX_X + TEX_W + 1, TEX_Y + TEX_H / 2, 2)
+    println("  background away from the blit rgb = (" + bg_r.to_string() + ","
+            + bg_g.to_string() + "," + bg_b.to_string() + ")  (cleared to 28,28,34)")
+    expect("background red channel", bg_r, 28)
+    expect("background blue channel", bg_b, 34)
+    expect("off-window read is rejected", gui.Win_pixel_at(win, -5, -5, 0), -1)
+
+    gui.Win_present(win)
+    println("  frame rendered headless and saved to /tmp/wyn_showcase_selftest.bmp")
+    println("  gradient is " + size.to_string() + "x" + size.to_string()
+            + " RGBA = " + (size * size * 4).to_string() + " bytes, one upload")
+    println("")
+
+    println("-- 10. clip stack stayed balanced through a full frame --")
+    expect("clip depth after drawing", gui.Win_clip_depth(win), 0)
+    println("")
+
+    println("=== selftest complete: " + clicks.to_string()
+            + " clicks dispatched through the real event queue ===")
+}
+
+// ---- main ----------------------------------------------------------------
+
+// True when the program was asked for the self-test. Two ways in, because
+// `wyn run` does NOT forward arguments to the program (System.args() sees only
+// the binary), so the env var is the one that works under `wyn run` and the
+// flag is the one that works for a built binary.
+fn wants_selftest() -> int {
+    if Env.get("WYN_GUI_SELFTEST").len() > 0 { return 1 }
+    var args = System.args()
+    var i = 0
+    while i < args.len() {
+        if args[i] == "--selftest" { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn main() {
+    if gui.Win_available() == 0 {
+        println("no display available - skipping")
+        return
+    }
+
+    var win = gui.Win_window("Visual Wyn - showcase", WIN_W, WIN_H)
+    if win < 0 {
+        println("could not open a window")
+        return
+    }
+
+    var font = gui.Win_font_default(15)
+    var title_font = gui.Win_font_default(24)
+    if font < 0 {
+        println("no font found")
+        gui.Win_close(win)
+        return
+    }
+    if title_font < 0 { title_font = font }
+
+    // Build and upload the gradient ONCE. Rebuilding it per frame would be the
+    // classic mistake this API exists to avoid.
+    var size = 64
+    var tex = gui.Win_texture(win, size, size)
+    if tex >= 0 {
+        var pixels = build_gradient(size)
+        var uploaded = gui.Win_texture_update(tex, pixels, size, size)
+        if uploaded == 0 { println("warning: texture upload failed") }
+    }
+
+    if wants_selftest() == 1 {
+        selftest(win, font, tex, size)
+        if tex >= 0 { gui.Win_texture_free(tex) }
+        if title_font != font { gui.Win_font_free(title_font) }
+        gui.Win_font_free(font)
+        gui.Win_close(win)
+        return
+    }
+
+    var ui = build_form(win, font)
+    ui = sync(ui)
+
+    println("Visual Wyn showcase. Click the buttons, toggle the checkbox, type")
+    println("in the entry, and use Enable/Disable on the target button.")
+    println("Every click prints a line here. Esc to quit.")
+
+    while widgets.Ui_running(ui) == 1 {
+        ui = widgets.Ui_events(ui)
+        if dirty == 1 { ui = sync(ui) }
+
+        // Clear once, draw the chrome, then the widgets, then present once.
+        // Ui_draw would clear and present by itself, which would wipe the
+        // chrome - hence Ui_draw_into.
+        gui.Win_clear(win, 28, 28, 34)
+        draw_chrome(win, font, title_font, tex, size)
+        widgets.Ui_draw_into(ui)
+        gui.Win_present(win)
+
+        // Yield the CPU. Without this the loop spins a core at 100%, which on a
+        // laptop is audible within seconds.
+        gui.Win_delay(16)
+    }
+
+    // The form is data, so reading the result back is just a query.
+    println("")
+    println("final state:")
+    println("  clicks:   " + clicks.to_string())
+    println("  entry:    '" + widgets.Ui_text(ui, id_entry) + "'")
+    println("  checkbox: " + widgets.Ui_checked(ui, id_check).to_string())
+    println("  target button enabled: "
+            + widgets.Ui_enabled(ui, id_target_btn).to_string())
+
+    if tex >= 0 { gui.Win_texture_free(tex) }
+    if title_font != font { gui.Win_font_free(title_font) }
+    gui.Win_font_free(font)
+    gui.Win_close(win)
+}

@@ -28,6 +28,24 @@
 
 import gui
 
+// COMPILER WORKAROUND (upstream bug, not a design choice).
+//
+// A module-QUALIFIED call to an imported `extern fn ... -> string` is typed as
+// `int` at the call site, so the char* comes back as a stringified pointer:
+//
+//     var s = gui.Win_event_text()
+//     "abc" + s            // => "abc4345186812"
+//
+// The identical extern declared IN THIS FILE types correctly, so re-declaring
+// the two string-returning externs here is the fix. Without it, every character
+// the user types appends a pointer value to the field instead of the character -
+// live text entry produces garbage.
+//
+// Only `-> string` externs are affected; the int-returning ones are called
+// through `gui.` as normal, which keeps the workaround visibly scoped to the
+// bug. Remove these two lines when the compiler is fixed.
+extern fn Win_event_text() -> string;
+
 // Widget kinds. Plain ints, because these cross into arrays and comparisons in
 // hot paths and an enum buys nothing here.
 var KIND_LABEL = 0
@@ -203,6 +221,257 @@ pub fn Ui_running(ui: Ui) -> int {
     return ui.running
 }
 
+// ---- accessors for code OUTSIDE this module -------------------------------
+//
+// WHY THESE EXIST, and why they are not "just getters".
+//
+// Indexing an array field of a struct that arrived from an IMPORTED module
+// loses the element type: from another file, `ui.widgets[i].label` fails with
+// "Unknown method 'x' for type 'int'" / "member reference base type 'long long'
+// is not a structure". Inside THIS file the element type is known, so the
+// indexing is legal here and only here.
+//
+// So a designer, a serialiser, or a test cannot walk a Ui from outside unless
+// the walk is exposed as functions. That is the whole reason for this section:
+// `ui.widgets` stays private in practice, and every inspection goes through a
+// call that is compiled where the type information still exists.
+//
+// Every one of these is TOTAL: an out-of-range index or an unknown id yields a
+// neutral value (0 / "" / -1), never a trap. A designer routinely asks about a
+// widget the user just deleted, and a query API that crashes on a stale id
+// forces every caller to re-implement the bounds check that belongs here.
+
+// Number of widgets. The valid index range is 0 .. Ui_count(ui) - 1.
+pub fn Ui_count(ui: Ui) -> int {
+    return ui.widgets.len()
+}
+
+fn in_range(ui: Ui, i: int) -> int {
+    if i < 0 { return 0 }
+    if i >= ui.widgets.len() { return 0 }
+    return 1
+}
+
+// ---- by index ----
+
+pub fn Ui_id_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return -1 }
+    return ui.widgets[i].id
+}
+
+pub fn Ui_kind_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return -1 }
+    return ui.widgets[i].kind
+}
+
+pub fn Ui_label_at(ui: Ui, i: int) -> string {
+    if in_range(ui, i) == 0 { return "" }
+    return ui.widgets[i].label
+}
+
+pub fn Ui_text_at(ui: Ui, i: int) -> string {
+    if in_range(ui, i) == 0 { return "" }
+    return ui.widgets[i].text
+}
+
+pub fn Ui_x_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].x
+}
+
+pub fn Ui_y_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].y
+}
+
+pub fn Ui_w_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].w
+}
+
+pub fn Ui_h_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].h
+}
+
+pub fn Ui_checked_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].checked
+}
+
+pub fn Ui_enabled_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].enabled
+}
+
+// Name of a kind, for a property inspector and for error messages. Kept beside
+// the KIND_* constants so adding a kind cannot forget it.
+pub fn Ui_kind_name(kind: int) -> string {
+    if kind == KIND_LABEL { return "label" }
+    if kind == KIND_BUTTON { return "button" }
+    if kind == KIND_CHECKBOX { return "checkbox" }
+    if kind == KIND_ENTRY { return "entry" }
+    if kind == KIND_PANEL { return "panel" }
+    return "unknown"
+}
+
+// ---- by id ----
+
+// Index of the widget with this id, or -1. Every id-keyed operation below is
+// written in terms of this, so "unknown id" is decided in exactly one place.
+pub fn Ui_index_of(ui: Ui, id: int) -> int {
+    var i = 0
+    while i < ui.widgets.len() {
+        if ui.widgets[i].id == id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+pub fn Ui_exists(ui: Ui, id: int) -> int {
+    if Ui_index_of(ui, id) == -1 { return 0 }
+    return 1
+}
+
+pub fn Ui_label_of(ui: Ui, id: int) -> string {
+    return Ui_label_at(ui, Ui_index_of(ui, id))
+}
+
+pub fn Ui_kind_of(ui: Ui, id: int) -> int {
+    return Ui_kind_at(ui, Ui_index_of(ui, id))
+}
+
+pub fn Ui_x_of(ui: Ui, id: int) -> int {
+    return Ui_x_at(ui, Ui_index_of(ui, id))
+}
+
+pub fn Ui_y_of(ui: Ui, id: int) -> int {
+    return Ui_y_at(ui, Ui_index_of(ui, id))
+}
+
+pub fn Ui_w_of(ui: Ui, id: int) -> int {
+    return Ui_w_at(ui, Ui_index_of(ui, id))
+}
+
+pub fn Ui_h_of(ui: Ui, id: int) -> int {
+    return Ui_h_at(ui, Ui_index_of(ui, id))
+}
+
+pub fn Ui_enabled(ui: Ui, id: int) -> int {
+    return Ui_enabled_at(ui, Ui_index_of(ui, id))
+}
+
+// ---- interaction state ----
+
+pub fn Ui_hot(ui: Ui) -> int {
+    return ui.hot
+}
+
+pub fn Ui_active(ui: Ui) -> int {
+    return ui.active
+}
+
+pub fn Ui_focus(ui: Ui) -> int {
+    return ui.focus
+}
+
+// Give a widget the keyboard focus programmatically. Pass -1 to blur.
+//
+// A form wants to focus its first field on open, and a designer wants to focus
+// the control it just created; both are outside this module, where `ui.focus` is
+// unwritable. Unknown ids are rejected rather than stored, so `focus` can never
+// name a widget that is not in the list.
+pub fn Ui_set_focus(ui: Ui, id: int) -> Ui {
+    var u = ui
+    if id == -1 {
+        u.focus = -1
+        return u
+    }
+    if Ui_index_of(u, id) == -1 { return u }
+    u.focus = id
+    return u
+}
+
+pub fn Ui_mouse_x(ui: Ui) -> int {
+    return ui.mouse_x
+}
+
+pub fn Ui_mouse_y(ui: Ui) -> int {
+    return ui.mouse_y
+}
+
+// Id of the widget under a point, or -1.
+//
+// Deliberately unlike `hot`: this reports the TOPMOST widget of ANY kind,
+// including panels and disabled controls. `hot` is about what the user can
+// press, so it skips those; a designer must be able to select exactly the
+// things the user cannot press. Last match wins because Ui_draw paints in
+// declaration order, so the later widget is the visible one.
+pub fn Ui_hit_test(ui: Ui, mx: int, my: int) -> int {
+    var found = -1
+    var i = 0
+    while i < ui.widgets.len() {
+        if Ui_hit(ui.widgets[i], mx, my) == 1 { found = ui.widgets[i].id }
+        i = i + 1
+    }
+    return found
+}
+
+// ---- mutation by id (what a designer edits with) -------------------------
+
+pub fn Ui_move(ui: Ui, id: int, x: int, y: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].x = x
+    u.widgets[i].y = y
+    return u
+}
+
+pub fn Ui_resize(ui: Ui, id: int, w: int, h: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].w = w
+    u.widgets[i].h = h
+    return u
+}
+
+pub fn Ui_set_text(ui: Ui, id: int, s: string) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].text = s
+    return u
+}
+
+pub fn Ui_set_checked(ui: Ui, id: int, on: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets[i].checked = on
+    return u
+}
+
+// Remove a widget. Unknown id is a no-op, not an error: a designer's undo/redo
+// replays deletes, and the second replay of one must be harmless.
+//
+// hot/active/focus are cleared if they named the removed widget - otherwise the
+// next frame dispatches a click or a keystroke to an id that no longer exists,
+// which is the classic use-after-delete of a retained toolkit. Ids are never
+// recycled (next_id only grows), so a stale id can only ever be missing, never
+// silently rebound to a different control.
+pub fn Ui_delete(ui: Ui, id: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    u.widgets.remove_at(i)
+    if u.hot == id { u.hot = -1 }
+    if u.active == id { u.active = -1 }
+    if u.focus == id { u.focus = -1 }
+    return u
+}
+
 // ---- events --------------------------------------------------------------
 
 // Drain the queue and update hot/active/focus, firing handlers on click.
@@ -266,7 +535,9 @@ pub fn Ui_events(ui: Ui) -> Ui {
         }
         if ev == gui.EV_TEXT {
             if u.focus != -1 {
-                var typed = gui.Win_event_text()
+                // NB: the file-local extern, not gui.Win_event_text() - see the
+                // COMPILER WORKAROUND note at the top of this file.
+                var typed = Win_event_text()
                 var k = 0
                 while k < u.widgets.len() {
                     if u.widgets[k].id == u.focus {
@@ -422,7 +693,12 @@ fn draw_widget(ui: Ui, w: Widget) {
 
         // Clip, so long text stops at the border instead of painting across the
         // rest of the form.
-        gui.Win_clip(win, w.x + 1, w.y + 1, w.w - 2, w.h - 2)
+        //
+        // push/pop, not clip-then-clear: a container may already have clipped
+        // (a designer's canvas does), and clearing an absolute clip discards the
+        // container's region too, so every widget drawn after this entry would
+        // paint outside the form. push intersects, pop restores.
+        gui.Win_clip_push(win, w.x + 1, w.y + 1, w.w - 2, w.h - 2)
         var eh = gui.Win_font_height(font)
         gui.Win_text(win, font, w.text, w.x + 5, w.y + (w.h - eh) / 2,
                      ui.fg_r, ui.fg_g, ui.fg_b)
@@ -431,20 +707,52 @@ fn draw_widget(ui: Ui, w: Widget) {
             gui.Win_rect(win, w.x + 6 + cw, w.y + 4, 2, w.h - 8,
                          ui.fg_r, ui.fg_g, ui.fg_b)
         }
-        gui.Win_clip(win, 0, 0, 0, 0)
+        gui.Win_clip_pop(win)
         return
     }
 }
 
 // Draw every widget, in declaration order, so a panel declared first sits
-// behind the controls placed on it.
-pub fn Ui_draw(ui: Ui) {
-    gui.Win_clear(ui.win, ui.bg_r, ui.bg_g, ui.bg_b)
+// behind the controls placed on it. No clear and no present: this paints into
+// whatever is already on the back buffer.
+//
+// Ui_draw does clear + this + present, which is right for a form that OWNS the
+// window and wrong for anything that composites. A visual designer draws a
+// palette, a grid and selection handles around the form, so it must clear once
+// itself, call this, and present once. Calling Ui_draw and then drawing more
+// would need a second Win_present, and the buffer contents after a present are
+// undefined in SDL3 - the chrome would flicker or vanish.
+pub fn Ui_draw_into(ui: Ui) {
+    Ui_draw_at(ui, 0, 0)
+}
+
+// Draw every widget translated by (ox, oy), without touching the stored
+// coordinates.
+//
+// A designer previews a form inside a sub-rectangle of a bigger window, so the
+// form must PAINT at an offset while its widgets keep the coordinates that will
+// be written into the generated source. Baking the offset into x/y instead would
+// emit a form whose controls are all displaced by the designer's own layout -
+// the canvas origin would leak into the user's program.
+//
+// Widgets pass by value, so shifting the copy handed to draw_widget cannot
+// disturb the list. That is this one case where by-value structs are exactly
+// what is wanted.
+pub fn Ui_draw_at(ui: Ui, ox: int, oy: int) {
     var i = 0
     while i < ui.widgets.len() {
-        draw_widget(ui, ui.widgets[i])
+        var w = ui.widgets[i]
+        w.x = w.x + ox
+        w.y = w.y + oy
+        draw_widget(ui, w)
         i = i + 1
     }
+}
+
+// Clear, draw every widget, present. What a form that owns its window wants.
+pub fn Ui_draw(ui: Ui) {
+    gui.Win_clear(ui.win, ui.bg_r, ui.bg_g, ui.bg_b)
+    Ui_draw_into(ui)
     gui.Win_present(ui.win)
 }
 

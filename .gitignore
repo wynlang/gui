@@ -7,3 +7,9 @@ wyn_cc_err.txt
 *.out
 *.dSYM/
 .DS_Store
+# Screenshots written by --screenshot and by the headless render tests
+*.bmp
+# Compiled example binaries (no extension, so they must be named)
+examples/form
+examples/designer
+examples/showcase

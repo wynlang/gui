@@ -1,0 +1,148 @@
+// Pixel-level regression tests for the NESTING clip stack.
+//
+//   WYN_ROOT=/path/to/wyn  SDL_VIDEODRIVER=dummy  wyn run tests/test_clip_stack.wyn
+//
+// WHY THESE ARE PIXEL TESTS AND NOT STATE TESTS
+//
+// The bug these cover was found by looking at a screenshot, and no assertion
+// about clip state would have caught it. A designer's canvas clipped itself, a
+// text entry inside it clipped itself and then CLEARED the clip - and because
+// Win_clip is absolute, that cleared the canvas's clip too. Every widget drawn
+// afterwards escaped the canvas and painted over the toolbox. The clip variables
+// were all "correct" at each individual call; the composition was wrong.
+//
+// So the only honest assertion is: read the pixel that must not have been
+// painted. Win_pixel_at makes that possible headless, which is why the tests can
+// run in CI with no display.
+
+import gui
+
+// Draw a red rect over the whole window with a clip in force, then report
+// whether the pixel at (x,y) turned red. 1 = painted, 0 = clipped away.
+fn painted(win: int, x: int, y: int) -> int {
+    if gui.Win_pixel_at(win, x, y, 0) > 200 { return 1 }
+    return 0
+}
+
+test "clip_push clips, clip_pop restores" {
+    if gui.Win_available() == 0 { return }
+    var win = gui.Win_window("clip test", 200, 200)
+    if win < 0 { return }
+
+    // Depth starts at 0 and tracks push/pop, so an unbalanced caller is
+    // detectable rather than silently leaking a clip into the next frame.
+    assert_eq(gui.Win_clip_depth(win), 0)
+    gui.Win_clip_push(win, 0, 0, 100, 100)
+    assert_eq(gui.Win_clip_depth(win), 1)
+    gui.Win_clip_pop(win)
+    assert_eq(gui.Win_clip_depth(win), 0)
+
+    // Popping an empty stack must report failure, not corrupt the depth.
+    assert_eq(gui.Win_clip_pop(win), 0)
+    assert_eq(gui.Win_clip_depth(win), 0)
+
+    gui.Win_close(win)
+}
+
+test "a push actually clips the pixels" {
+    if gui.Win_available() == 0 { return }
+    var win = gui.Win_window("clip test", 200, 200)
+    if win < 0 { return }
+
+    gui.Win_clear(win, 0, 0, 0)
+    gui.Win_clip_push(win, 0, 0, 100, 100)
+    gui.Win_rect(win, 0, 0, 200, 200, 255, 0, 0)   // ask to paint everything
+    gui.Win_clip_pop(win)
+
+    assert_eq(painted(win, 50, 50), 1)     // inside the clip
+    assert_eq(painted(win, 150, 150), 0)   // outside it: must stay black
+
+    gui.Win_close(win)
+}
+
+test "nested push INTERSECTS - a child cannot escape its parent" {
+    if gui.Win_available() == 0 { return }
+    var win = gui.Win_window("clip test", 200, 200)
+    if win < 0 { return }
+
+    gui.Win_clear(win, 0, 0, 0)
+    gui.Win_clip_push(win, 0, 0, 100, 100)      // parent: top-left quadrant
+    gui.Win_clip_push(win, 50, 50, 200, 200)    // child asks for far more
+    gui.Win_rect(win, 0, 0, 200, 200, 255, 0, 0)
+    gui.Win_clip_pop(win)
+    gui.Win_clip_pop(win)
+
+    // The visible area is the INTERSECTION, 50,50..100,100. If push replaced
+    // rather than intersected, (150,150) would be red - a child would be able to
+    // paint outside its container, which is what "inside" must forbid.
+    assert_eq(painted(win, 75, 75), 1)
+    assert_eq(painted(win, 150, 150), 0)
+    assert_eq(painted(win, 25, 25), 0)     // above/left of the child
+
+    gui.Win_close(win)
+}
+
+test "pop restores the PARENT clip, it does not clear all clipping" {
+    if gui.Win_available() == 0 { return }
+    var win = gui.Win_window("clip test", 200, 200)
+    if win < 0 { return }
+
+    gui.Win_clear(win, 0, 0, 0)
+    gui.Win_clip_push(win, 0, 0, 100, 100)      // container
+    gui.Win_clip_push(win, 0, 0, 20, 20)        // a child, e.g. a text entry
+    gui.Win_clip_pop(win)                       // child done
+    // THE REGRESSION. With the absolute Win_clip the child's "clear" left no
+    // clip at all, so this rect escaped the container. It must still be confined
+    // to the container's 100x100.
+    gui.Win_rect(win, 0, 0, 200, 200, 255, 0, 0)
+    gui.Win_clip_pop(win)
+
+    assert_eq(painted(win, 50, 50), 1)     // inside the container
+    assert_eq(painted(win, 150, 150), 0)   // outside it - was 1 before the fix
+    assert_eq(gui.Win_clip_depth(win), 0)
+
+    gui.Win_close(win)
+}
+
+test "an empty intersection paints nothing" {
+    if gui.Win_available() == 0 { return }
+    var win = gui.Win_window("clip test", 200, 200)
+    if win < 0 { return }
+
+    gui.Win_clear(win, 0, 0, 0)
+    gui.Win_clip_push(win, 0, 0, 50, 50)
+    gui.Win_clip_push(win, 100, 100, 50, 50)    // disjoint from the parent
+    gui.Win_rect(win, 0, 0, 200, 200, 255, 0, 0)
+    // Nothing may appear: a fully-occluded child must be invisible, not
+    // unclipped. SDL treats a w/h<=0 clip rect as "no clip at all", so the naive
+    // implementation of an empty intersection paints EVERYTHING.
+    assert_eq(painted(win, 25, 25), 0)
+    assert_eq(painted(win, 125, 125), 0)
+    gui.Win_clip_pop(win)
+    gui.Win_clip_pop(win)
+    assert_eq(gui.Win_clip_depth(win), 0)
+
+    gui.Win_close(win)
+}
+
+test "a widget that clips itself does not escape its container" {
+    if gui.Win_available() == 0 { return }
+    var win = gui.Win_window("clip test", 300, 300)
+    if win < 0 { return }
+
+    // The designer's shape exactly: a canvas region, an entry inside it that
+    // clips and pops, then a later widget drawn past the canvas edge.
+    gui.Win_clear(win, 0, 0, 0)
+    gui.Win_clip_push(win, 100, 0, 100, 300)        // the "canvas" column
+    gui.Win_clip_push(win, 110, 10, 40, 20)         // an "entry" inside it
+    gui.Win_rect(win, 110, 10, 40, 20, 0, 255, 0)
+    gui.Win_clip_pop(win)
+    gui.Win_rect(win, 0, 100, 300, 20, 255, 0, 0)   // a widget dragged wide
+    gui.Win_clip_pop(win)
+
+    assert_eq(painted(win, 150, 110), 1)   // the part inside the canvas column
+    assert_eq(painted(win, 20, 110), 0)    // left of it: the toolbox area
+    assert_eq(painted(win, 250, 110), 0)   // right of it
+
+    gui.Win_close(win)
+}

@@ -10,7 +10,10 @@ requires = ["sdl3"]  # brew install sdl3 / apt install libsdl3-dev
 # Links the native backend built by ./csrc/build.sh.
 # lib_dirs needs the Homebrew/system SDL3 path explicitly - it is not searched
 # by default.
+# NB: these are COMMA-SEPARATED STRINGS, not TOML arrays. An array is accepted by
+# the parser and then passed through verbatim, so `libs = ["gui"]` reaches the
+# linker as `-l[gui` and fails with `library '[gui' not found`.
 [ffi]
-libs         = ["gui", "SDL3"]
-lib_dirs     = ["libgui", "/opt/homebrew/lib"]
-include_dirs = ["src"]
+libs         = "gui, SDL3"
+lib_dirs     = "libgui, /opt/homebrew/lib"
+include_dirs = "src"

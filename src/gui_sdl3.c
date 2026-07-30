@@ -217,6 +217,66 @@ void Win_clip(long long id, long long x, long long y, long long cw, long long ch
     SDL_SetRenderClipRect(w->ren, &c);
 }
 
+// ---- nesting clips -------------------------------------------------------
+//
+// Win_clip is absolute: "clip to exactly this", and clearing it means "clip to
+// nothing". That is wrong for anything that draws a clipped widget INSIDE a
+// clipped region, which is what a designer's canvas is - the canvas clips to its
+// frame, and a text entry inside it clips to its own border and then clears.
+// With absolute clips that clear removes the CANVAS clip too, and every widget
+// drawn afterwards paints over the toolbox. Verified: the designer's first
+// screenshot had exactly that artefact.
+//
+// So the caller needs a stack: push intersects with what is already in force,
+// pop restores the enclosing region. Intersecting rather than replacing is the
+// substance - a child can only ever shrink its parent's visible area, never
+// escape it, which is what "inside" means.
+static SDL_Rect g_clip_stack[MAX_WINDOWS][16];
+static int      g_clip_depth[MAX_WINDOWS];
+
+long long Win_clip_push(long long id, long long x, long long y, long long cw, long long ch) {
+    GuiWin* w = win_at(id); if (!w) return 0;
+    if (id < 0 || id >= MAX_WINDOWS) return 0;
+    int d = g_clip_depth[id];
+    if (d >= 16) return 0;                  // refuse rather than corrupt
+    SDL_Rect want = { (int)x, (int)y, (int)(cw > 0 ? cw : 0), (int)(ch > 0 ? ch : 0) };
+    SDL_Rect eff = want;
+    if (d > 0) {
+        // Intersect with the enclosing region. An empty result is legal and
+        // means "nothing is visible" - the caller still pops, so the depth
+        // stays balanced.
+        if (!SDL_GetRectIntersection(&want, &g_clip_stack[id][d - 1], &eff)) {
+            eff.x = want.x; eff.y = want.y; eff.w = 0; eff.h = 0;
+        }
+    }
+    g_clip_stack[id][d] = eff;
+    g_clip_depth[id] = d + 1;
+    if (eff.w <= 0 || eff.h <= 0) {
+        SDL_Rect empty = { eff.x, eff.y, 1, 1 };   // SDL treats w/h<=0 as "no clip"
+        SDL_SetRenderClipRect(w->ren, &empty);     // so clip to a degenerate rect
+        return 1;
+    }
+    SDL_SetRenderClipRect(w->ren, &eff);
+    return 1;
+}
+
+long long Win_clip_pop(long long id) {
+    GuiWin* w = win_at(id); if (!w) return 0;
+    if (id < 0 || id >= MAX_WINDOWS) return 0;
+    int d = g_clip_depth[id];
+    if (d <= 0) return 0;
+    d = d - 1;
+    g_clip_depth[id] = d;
+    if (d == 0) { SDL_SetRenderClipRect(w->ren, NULL); return 1; }
+    SDL_SetRenderClipRect(w->ren, &g_clip_stack[id][d - 1]);
+    return 1;
+}
+
+long long Win_clip_depth(long long id) {
+    if (id < 0 || id >= MAX_WINDOWS) return 0;
+    return g_clip_depth[id];
+}
+
 // ---- textures ------------------------------------------------------------
 
 long long Win_texture(long long winid, long long width, long long height) {
@@ -454,6 +514,67 @@ long long Win_font_height(long long fontid) {
     return f ? f->height : 0;
 }
 
+long long Win_screenshot(long long id, const char* path) {
+    GuiWin* w = win_at(id);
+    if (!w || !path) return 0;
+    SDL_Surface* surf = SDL_RenderReadPixels(w->ren, NULL);
+    if (!surf) { fprintf(stderr, "gui: RenderReadPixels failed: %s\n", SDL_GetError()); return 0; }
+    long long ok = SDL_SaveBMP(surf, path) ? 1 : 0;
+    if (!ok) fprintf(stderr, "gui: SaveBMP failed: %s\n", SDL_GetError());
+    SDL_DestroySurface(surf);
+    return ok;
+}
+
+// Read one pixel back off the rendered frame.
+//
+// WHY: a screenshot proves a file was written, not that the right thing was
+// drawn. Only reading a pixel can distinguish "the texture blitted" from "the
+// upload silently failed and the background shows through" - and channel order
+// bugs (red where blue should be) are invisible to every other kind of
+// assertion. This is the one call that lets a headless test check what the user
+// would SEE.
+//
+// Returns the channel as 0..255, or -1 if the point is outside the window or the
+// read fails. One channel per call rather than a packed word, for the same
+// reason the drawing API takes separate channels: a packed value has to agree
+// with the backend's byte order, and getting that wrong is exactly the bug this
+// is here to catch.
+//
+// channel: 0=red, 1=green, 2=blue, 3=alpha.
+long long Win_pixel_at(long long id, long long x, long long y, long long channel) {
+    GuiWin* w = win_at(id);
+    if (!w) return -1;
+    if (channel < 0 || channel > 3) return -1;
+
+    // Read just the one pixel: a full-frame readback per call would make a
+    // several-hundred-point check quadratic in window area.
+    SDL_Rect r = { (int)x, (int)y, 1, 1 };
+    SDL_Surface* surf = SDL_RenderReadPixels(w->ren, &r);
+    if (!surf) return -1;
+
+    // Normalise to RGBA8888 so the byte order is known rather than whatever the
+    // renderer happens to use. Without this the channel index would mean
+    // something different per platform, which is the bug, not the test.
+    SDL_Surface* rgba = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(surf);
+    if (!rgba) return -1;
+
+    long long out = -1;
+    if (SDL_LockSurface(rgba)) {
+        const Uint8* px = (const Uint8*)rgba->pixels;
+        Uint8 cr, cg, cb, ca;
+        SDL_GetRGBA(*(const Uint32*)px, SDL_GetPixelFormatDetails(rgba->format),
+                    NULL, &cr, &cg, &cb, &ca);
+        if (channel == 0) out = cr;
+        if (channel == 1) out = cg;
+        if (channel == 2) out = cb;
+        if (channel == 3) out = ca;
+        SDL_UnlockSurface(rgba);
+    }
+    SDL_DestroySurface(rgba);
+    return out;
+}
+
 void Win_font_free(long long fontid) {
     GuiFont* f = font_at(fontid); if (!f) return;
     for (int i = 0; i < GLYPH_COUNT; i++)
@@ -550,4 +671,77 @@ void Win_text_input(long long winid, long long enable) {
     GuiWin* w = win_at(winid); if (!w) return;
     if (enable) SDL_StartTextInput(w->win);
     else        SDL_StopTextInput(w->win);
+}
+
+// ---- synthetic events ----------------------------------------------------
+//
+// SDL_PushEvent puts the event on the same queue the OS writes to, so
+// Win_poll_event() cannot tell the difference - which is the point: the test
+// exercises the shipping decode-and-dispatch path, not a parallel one.
+//
+// Verified to work under SDL_VIDEODRIVER=dummy, so this is usable in CI.
+//
+// Every field the poll path reads must be set, including the ones SDL3 added:
+// `down` on button/key events and `repeat` on key events. Leaving `down` false
+// on a MOUSE_BUTTON_DOWN queues an event that is internally inconsistent, and
+// SDL's own state tracking then disagrees with the event type.
+
+static long long push_mouse(long long winid, long long x, long long y,
+                            long long button, int down) {
+    GuiWin* w = win_at(winid); if (!w) return 0;
+    SDL_Event e;
+    SDL_zero(e);
+    e.type          = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+    e.button.windowID = SDL_GetWindowID(w->win);
+    e.button.x      = (float)x;      // float in SDL3, not int
+    e.button.y      = (float)y;
+    e.button.button = (Uint8)button;
+    e.button.clicks = 1;
+    e.button.down   = down ? true : false;
+    return SDL_PushEvent(&e) ? 1 : 0;
+}
+
+long long Win_push_mouse_move(long long winid, long long x, long long y) {
+    GuiWin* w = win_at(winid); if (!w) return 0;
+    SDL_Event e;
+    SDL_zero(e);
+    e.type            = SDL_EVENT_MOUSE_MOTION;
+    e.motion.windowID = SDL_GetWindowID(w->win);
+    e.motion.x        = (float)x;
+    e.motion.y        = (float)y;
+    return SDL_PushEvent(&e) ? 1 : 0;
+}
+
+long long Win_push_mouse_down(long long winid, long long x, long long y, long long button) {
+    return push_mouse(winid, x, y, button, 1);
+}
+
+long long Win_push_mouse_up(long long winid, long long x, long long y, long long button) {
+    return push_mouse(winid, x, y, button, 0);
+}
+
+long long Win_push_key_down(long long winid, long long scancode) {
+    GuiWin* w = win_at(winid); if (!w) return 0;
+    SDL_Event e;
+    SDL_zero(e);
+    e.type         = SDL_EVENT_KEY_DOWN;
+    e.key.windowID = SDL_GetWindowID(w->win);
+    e.key.scancode = (SDL_Scancode)scancode;
+    e.key.down     = true;
+    e.key.repeat   = false;
+    return SDL_PushEvent(&e) ? 1 : 0;
+}
+
+long long Win_push_text(long long winid, const char* utf8) {
+    GuiWin* w = win_at(winid); if (!w) return 0;
+    if (!utf8) return 0;
+    SDL_Event e;
+    SDL_zero(e);
+    e.type          = SDL_EVENT_TEXT_INPUT;
+    e.text.windowID = SDL_GetWindowID(w->win);
+    // e.text.text is `const char*`. SDL copies the string when the event is
+    // pushed onto the queue, so a caller's buffer need not outlive this call -
+    // but the pointer must be valid RIGHT NOW, which a Wyn string is.
+    e.text.text     = utf8;
+    return SDL_PushEvent(&e) ? 1 : 0;
 }

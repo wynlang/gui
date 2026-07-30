@@ -42,7 +42,20 @@ extern fn Win_present(win: int);
 
 // Restrict drawing to a rectangle; pass w or h <= 0 to clear the clip.
 // Any scrolling or clipped widget needs this.
+//
+// ABSOLUTE, which is a trap for nested drawing: clearing the clip clears EVERY
+// enclosing one, not just the innermost. A widget that clips itself and then
+// clears (a text entry does) escapes the region its container established and
+// paints over whatever lies outside it. Use the stack below when clips nest.
 extern fn Win_clip(win: int, x: int, y: int, w: int, h: int);
+
+// Nesting clips. Push INTERSECTS with the region already in force; pop restores
+// the enclosing one. A child can only ever shrink its parent's visible area.
+// Max depth 16; push returns 0 rather than overflowing, pop returns 0 on an
+// empty stack, and Win_clip_depth lets a test assert the two are balanced.
+extern fn Win_clip_push(win: int, x: int, y: int, w: int, h: int) -> int;
+extern fn Win_clip_pop(win: int) -> int;
+extern fn Win_clip_depth(win: int) -> int;
 
 // ---- Textures -------------------------------------------------------------
 //
@@ -80,6 +93,24 @@ extern fn Win_font_height(font: int) -> int;
 
 extern fn Win_font_free(font: int);
 
+// Save the current frame to a BMP. No assertion can tell you the UI LOOKED
+// right, so this lets a test render headless and compare pixels.
+extern fn Win_screenshot(win: int, path: string) -> int;
+
+// Read one channel of one pixel off the rendered frame: 0..255, or -1 outside
+// the window. channel 0=red, 1=green, 2=blue, 3=alpha.
+//
+// A screenshot proves a file was written; this proves the right thing was drawn.
+// It is how a headless test tells "the texture blitted" from "the upload failed
+// and the background shows through" - and channel-order bugs (red where blue
+// belongs) are invisible to every other kind of assertion.
+//
+// The parameter is `chan`, not `channel`: `channel` is a reserved keyword (the
+// concurrency primitive). Using it here does not say so - it reports "Expected
+// parameter name" and then the extern is emitted with a `void` parameter, which
+// surfaces as a C error about 'void' must be the first and only parameter.
+extern fn Win_pixel_at(win: int, x: int, y: int, chan: int) -> int;
+
 // ---- Input: polled state --------------------------------------------------
 
 extern fn Win_mouse_x() -> int;
@@ -112,6 +143,22 @@ extern fn Win_event_text() -> string;
 // enables on focus, disables on blur.
 extern fn Win_text_input(win: int, enable: int);
 
+// ---- Input: synthetic events (automated testing) --------------------------
+//
+// These push a REAL event onto the platform queue, so Win_poll_event() returns
+// it exactly as it returns a human's. That matters: a test that instead pokes
+// the toolkit's state directly proves only that assignment works, and skips the
+// dispatch logic - which is the only part that can actually be wrong.
+//
+// They work under SDL_VIDEODRIVER=dummy, so a GUI can be tested in CI with no
+// display attached. Each returns 1 if the event was queued.
+
+extern fn Win_push_mouse_move(win: int, x: int, y: int) -> int;
+extern fn Win_push_mouse_down(win: int, x: int, y: int, button: int) -> int;
+extern fn Win_push_mouse_up(win: int, x: int, y: int, button: int) -> int;
+extern fn Win_push_key_down(win: int, scancode: int) -> int;
+extern fn Win_push_text(win: int, utf8: string) -> int;
+
 // Event kinds returned by Win_poll_event()
 var EV_NONE = 0
 var EV_QUIT = 1
@@ -131,11 +178,33 @@ var MOUSE_RIGHT = 3
 
 // Scancodes for Win_key_down() and Win_event_key().
 // Physical key positions, unchanged from SDL2 (SDL3 kept the scancode table).
+//
+// The whole alphabet, not a hand-picked subset. A partial table is worse than no
+// table: a reference to a name that is missing (gui.SCANCODE_G, before this) is
+// accepted by `wyn check` and then fails in the C compiler as "use of
+// undeclared identifier 'gui_SCANCODE_G'" - so the gap surfaces as an internal
+// codegen error rather than as "no such constant".
 var SCANCODE_A = 4
 var SCANCODE_B = 5
 var SCANCODE_C = 6
 var SCANCODE_D = 7
+var SCANCODE_E = 8
+var SCANCODE_F = 9
+var SCANCODE_G = 10
+var SCANCODE_H = 11
+var SCANCODE_I = 12
+var SCANCODE_J = 13
+var SCANCODE_K = 14
+var SCANCODE_L = 15
+var SCANCODE_M = 16
+var SCANCODE_N = 17
+var SCANCODE_O = 18
+var SCANCODE_P = 19
+var SCANCODE_Q = 20
+var SCANCODE_R = 21
 var SCANCODE_S = 22
+var SCANCODE_T = 23
+var SCANCODE_U = 24
 var SCANCODE_V = 25
 var SCANCODE_W = 26
 var SCANCODE_X = 27
