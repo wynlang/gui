@@ -1,0 +1,619 @@
+// html - A WEB OUTPUT TARGET: one self-contained .html per form.
+//
+// WHY THIS IS THE CHEAP RIGHT ANSWER
+//
+// VISUAL_WYN_DESIGN.md's "Other output targets" table calls web THE REAL GAP,
+// and names exactly two ways to close it: a wasm compiler backend (a compiler
+// project - a new target triple, a new runtime, a new linker story) or an HTML
+// generator driven off the same JSON (much cheaper, and does not touch the
+// compiler at all). This file is the second one: string building in Wyn, no new
+// dependency, and not one line of repos/wyn changes.
+//
+// AND IT IS ONLY POSSIBLE BECAUSE THE FORM IS DATA.
+//
+// That is the point worth keeping in front of you. A retargetable UI is not a
+// property of this file - it is a property of `Form1.json`. If the designer's
+// output were CODE (`ui = widgets.Ui_button(ui, "Sign in", 140, 200, 110, 32,
+// h_on_submit)`), then emitting HTML would mean parsing generated Wyn and
+// re-deriving the layout from calls into an SDL toolkit: a second parser, in
+// permanent lockstep with a codegen it does not own. Because the form is a
+// document, a new target is a new READER of that document, and the desktop
+// target neither knows nor cares. src/codegen.wyn and this file are siblings
+// over one model, not layers.
+//
+// WHAT THIS FILE DELIBERATELY DOES NOT DO
+//
+// No JS framework, no external CSS, no web font, no build step. A generated page
+// is one file you can open with file:// or email to someone. That constraint is
+// what makes the output honest: everything the form needs is visible in it.
+//
+// THE ONE PLACE SELF-CONTAINMENT COSTS SOMETHING
+//
+// src/codegen.wyn gets the WinForms two-file split for free (`Form1.designer.wyn`
+// is clobbered, `Form1.wyn` is never rewritten) and its header notes the win:
+// "there is no marker comment to accidentally edit inside". A single
+// self-contained .html cannot have that. So the same contract is enforced with a
+// MARKED REGION instead: everything outside WYN-HANDLERS-BEGIN/END is machine
+// owned and regenerated in full, and the text between them is carried over
+// verbatim on regeneration - never read for meaning, never reformatted, never
+// replaced. New stubs are only ever APPENDED, exactly as codegen.wyn appends to
+// Form1.wyn. That is a strictly weaker boundary than two files, and it is the
+// price of "one file, no assets"; it is written down here rather than discovered.
+
+import widgets
+// The web and the desktop target MUST agree on handler names, or the same form
+// produces two programs with two different APIs. codegen.handler_of is the one
+// definition of "what is this widget's handler called", so it is imported rather
+// than re-derived.
+import codegen
+
+// ---- HTML escaping --------------------------------------------------------
+
+// Escape `s` for use as HTML text OR as a double-quoted attribute value.
+//
+// One function for both contexts on purpose. The two contexts need overlapping
+// but different sets (text needs & < >; an attribute needs & and the quote), and
+// a generator with two escapers is a generator that will eventually call the
+// wrong one. Escaping all five is valid in both places, so there is nothing to
+// get wrong at the call site.
+//
+// SINGLE PASS, ONE CHARACTER AT A TIME - not five sequential replaces over the
+// whole string. That shape is what makes the classic double-escape bug
+// impossible rather than merely avoided: with sequential replaces, `< -> &lt;`
+// followed by `& -> &amp;` yields `&amp;lt;` and the page displays the markup,
+// and the fix is a fragile ordering rule (& first) that the next edit breaks. A
+// per-character dispatch never revisits an emitted escape, so the five cases are
+// order-independent by construction and there is no rule to remember. Verified
+// by mutation: swapping the & and < branches changes nothing.
+//
+// This is not defence in depth, it is the feature: a label is arbitrary text
+// from a JSON document that an AI assistant may have written, so a caption of
+// "<script>alert(1)</script>" has to render as those 24 visible characters. A
+// designer that turns a caption into executable script has turned a form
+// document into a code-execution vector for anyone who opens the page.
+pub fn esc_html(s: string) -> string {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        var c = s.char_at(i)
+        if c == "&" { out = out + "&amp;" }
+        else if c == "<" { out = out + "&lt;" }
+        else if c == ">" { out = out + "&gt;" }
+        else if c == "\"" { out = out + "&quot;" }
+        else if c == "'" { out = out + "&#39;" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- anchors become CSS ---------------------------------------------------
+//
+// THIS IS THE PART WITH ACTUAL CONTENT IN IT.
+//
+// The document stores absolute pixels (x, y, w, h) against a design size, which
+// is what a designer must store - you drag a widget to a place, and the place is
+// where you dropped it. But absolute pixels alone describe a form that cannot be
+// resized, and a web page's container size is never the design size. The anchors
+// are the bridge, and they were put in the model on day one precisely so a later
+// target would not have to guess them.
+//
+// widgets.Ui_relayout defines what each combination MEANS for the desktop. The
+// mapping below is chosen so a browser window resize does the same thing SDL3
+// does, and the four cases fall out of one CSS rule:
+//
+//   an absolutely positioned box resolves width from `left`, `right` and `width`
+//   - it needs exactly two of the three, and computes the third.
+//
+//   left only    left + width          x and w fixed        (classic absolute)
+//   left + right left + right, NO WIDTH  stretches
+//   right only   right + width         w fixed, slides with the right edge
+//   neither      left as a PERCENT     scales proportionally (centred content)
+//
+// SO: OMITTING `width` IS WHAT MAKES A WIDGET STRETCH.
+// It is not an omission and it is not a default. With `left: 100px; right: 40px`
+// and no width, `width: auto` is resolved by the browser as
+// (container width - 100 - 40) - it is RECOMPUTED on every container resize, and
+// the element grows and shrinks with the window for free, with no JS and no media
+// query. Emit `width: 280px` alongside them and the box becomes over-constrained:
+// CSS resolves that by IGNORING `right` (in a left-to-right document), the widget
+// freezes at 280px, and the anchor silently does nothing. The bug would look like
+// "anchors are not implemented" while the CSS says `right:` right there in the
+// file. The same argument applies verbatim to `height` with top + bottom.
+
+fn px(v: int) -> string {
+    return v.to_string() + "px"
+}
+
+// A percentage to one decimal place, in integer arithmetic.
+//
+// Used for the free/free anchor, which Ui_relayout implements as
+// `x = (x * new_w) / old_w`. A percentage IS that ratio, so the browser applies
+// the identical rule. Rendered to one decimal rather than a whole number because
+// truncating 12.4% to 12% moves a control 2px at 500px wide, which is visible.
+fn pct(v: int, total: int) -> string {
+    if total <= 0 { return "0%" }
+    // Sign handled explicitly: Wyn's / and % on a negative numerator would give
+    // a "-0.-3%"-shaped string, which is not a CSS length.
+    var neg = 0
+    var n = v
+    if n < 0 {
+        neg = 1
+        n = 0 - n
+    }
+    var pm = (n * 1000) / total
+    // The `: string` is load-bearing, not documentation. In a file compiled as a
+    // MODULE, `var s = <expr>` whose initialiser is a concatenation STARTING with
+    // a string literal makes the compiler print
+    //   WARNING: track_var_with_type called with scope_depth=0
+    // to stderr and skip ARC tracking for that local (codegen.c:1753). Verified,
+    // minimised and reported; the emitted value is correct either way, but a
+    // generator whose stderr is full of compiler noise is a generator whose real
+    // diagnostics nobody reads. An explicit annotation takes a different codegen
+    // path and is silent - and `var s = ""` followed by `s = s + ...` is silent
+    // too, which is why the longer builders below are written that way.
+    var s: string = (pm / 10).to_string() + "." + (pm % 10).to_string() + "%"
+    if neg == 1 { return "-" + s }
+    return s
+}
+
+// The inline style for widget `i`: position plus the four anchor-derived offsets.
+//
+// Returned as its own public function, not just spliced into the document, so a
+// test can assert on ONE widget's CSS. Asserting "the page contains right:" is
+// almost no assertion at all on a form where some other widget is left-anchored;
+// asserting "widget 7's style has right: and does not have left:" is the actual
+// claim.
+pub fn Html_style_for(ui: Ui, i: int) -> string {
+    var dw = widgets.Ui_design_w(ui)
+    var dh = widgets.Ui_design_h(ui)
+    var x = widgets.Ui_x_at(ui, i)
+    var y = widgets.Ui_y_at(ui, i)
+    var w = widgets.Ui_w_at(ui, i)
+    var h = widgets.Ui_h_at(ui, i)
+    var al = widgets.Ui_anchor_left_at(ui, i)
+    var ar = widgets.Ui_anchor_right_at(ui, i)
+    var at = widgets.Ui_anchor_top_at(ui, i)
+    var ab = widgets.Ui_anchor_bottom_at(ui, i)
+
+    var s: string = "position:absolute"
+
+    // ---- horizontal ----
+    // The right OFFSET, not the right EDGE: CSS `right` is the gap from the
+    // container's right edge, so it is (design width - x - w). It can come out
+    // negative for a widget authored past the right edge; that is kept rather
+    // than clamped, because clamping would silently MOVE a control the designer
+    // placed, and a widget hanging off the edge in the browser matches what the
+    // desktop form does.
+    if al == 1 {
+        if ar == 1 {
+            // Stretch. No `width` - see the note above; this is the whole point.
+            s = s + ";left:" + px(x) + ";right:" + px(dw - x - w)
+        } else {
+            s = s + ";left:" + px(x)
+            // A label or checkbox has w == 0 in the model (its size is its
+            // text). Emitting width:0 would collapse it to nothing, so an
+            // unsized widget gets no width and sizes itself, which is what the
+            // desktop does too.
+            if w > 0 { s = s + ";width:" + px(w) }
+        }
+    } else {
+        if ar == 1 {
+            // Right-anchored only: no `left` at all, so the box stays glued to
+            // the right edge as the window widens instead of staying put and
+            // leaving a growing gap.
+            s = s + ";right:" + px(dw - x - w)
+            if w > 0 { s = s + ";width:" + px(w) }
+        } else {
+            // Free on both sides: proportional, matching Ui_relayout.
+            s = s + ";left:" + pct(x, dw)
+            if w > 0 { s = s + ";width:" + px(w) }
+        }
+    }
+
+    // ---- vertical (the same four cases, and the same reason) ----
+    if at == 1 {
+        if ab == 1 {
+            s = s + ";top:" + px(y) + ";bottom:" + px(dh - y - h)
+        } else {
+            s = s + ";top:" + px(y)
+            if h > 0 { s = s + ";height:" + px(h) }
+        }
+    } else {
+        if ab == 1 {
+            s = s + ";bottom:" + px(dh - y - h)
+            if h > 0 { s = s + ";height:" + px(h) }
+        } else {
+            s = s + ";top:" + pct(y, dh)
+            if h > 0 { s = s + ";height:" + px(h) }
+        }
+    }
+    return s + ";"
+}
+
+// ---- widget becomes element ------------------------------------------------
+
+// The handler-wiring attribute for a kind, or "" for a kind that takes none.
+//
+// codegen.takes_handler decides WHETHER a kind is wired (one place, so the two
+// targets cannot disagree about which controls have handlers); this decides which
+// DOM event carries it. A checkbox on onclick would fire before the browser has
+// updated .checked on some paths, so a handler reading its own state would read
+// the old value - onchange is the correct event for a control whose meaning is
+// its state rather than the act of pressing it.
+fn event_attr(kind: int) -> string {
+    if kind == widgets.KIND_BUTTON { return "onclick" }
+    if kind == widgets.KIND_CHECKBOX { return "onchange" }
+    return ""
+}
+
+// `onclick="on_submit(7)"`, or "" for an unwired widget.
+//
+// The id is passed because the Wyn handler signature is `fn on_submit(id: int)`.
+// The web stub therefore has the same arity and the same argument as its desktop
+// counterpart, and a body ported between them does not need rewriting.
+fn wiring(ui: Ui, i: int) -> string {
+    var kind = widgets.Ui_kind_at(ui, i)
+    if codegen.takes_handler(kind) == 0 { return "" }
+    var ev = event_attr(kind)
+    if ev.len() == 0 { return "" }
+    var name = codegen.handler_of(ui, i)
+    return " " + ev + "=\"" + esc_html(name) + "("
+        + widgets.Ui_id_at(ui, i).to_string() + ")\""
+}
+
+// `disabled`, for a control the document marks disabled.
+//
+// enabled is not a constructor argument on the desktop side either (codegen.wyn
+// emits a follow-up Ui_set_enabled call); here it is one attribute, and leaving
+// it out would give a web page whose Cancel button is clickable when the form
+// says it is not.
+fn disabled_attr(ui: Ui, i: int) -> string {
+    if widgets.Ui_enabled_at(ui, i) == 0 { return " disabled" }
+    return ""
+}
+
+// One widget, as its natural HTML element.
+//
+// "Natural" is doing real work here: <button> is focusable, keyboard-activatable,
+// announced as a button by a screen reader and styled by the platform, all of
+// which a <div onclick> has to reimplement and mostly will not. The desktop
+// toolkit has to draw its own everything; on the web that is the wrong instinct.
+pub fn Html_widget(ui: Ui, i: int) -> string {
+    var kind = widgets.Ui_kind_at(ui, i)
+    var id = widgets.Ui_id_at(ui, i)
+    var style = Html_style_for(ui, i)
+    var label = esc_html(widgets.Ui_label_at(ui, i))
+    var text = esc_html(widgets.Ui_text_at(ui, i))
+    // Both annotated `: string` for the codegen reason documented on pct().
+    var eid: string = "wyn-w" + id.to_string()
+    var common: string = " id=\"" + eid + "\" style=\"" + style + "\""
+
+    if kind == widgets.KIND_LABEL {
+        // <label>, matching the model's own name for this kind. Bare (no `for`),
+        // because the document records no association between a caption and a
+        // field - inventing one by proximity would be a guess that reads
+        // correctly to a screen reader exactly when the guess is right.
+        return "  <label class=\"wyn-label\"" + common + ">" + label + "</label>\n"
+    }
+    if kind == widgets.KIND_BUTTON {
+        // type="button" explicitly: inside a <form>, a button with no type
+        // defaults to submit, so every button on the page would reload it and
+        // the handler's work would be discarded mid-flight.
+        return "  <button type=\"button\" class=\"wyn-button\"" + common
+            + disabled_attr(ui, i) + wiring(ui, i) + ">" + label + "</button>\n"
+    }
+    if kind == widgets.KIND_CHECKBOX {
+        // Two elements, so the positioned box is the outer <label>: clicking the
+        // caption toggles the box, which is native behaviour when the input is
+        // nested inside its label and needs no `for`/id pairing to work.
+        var ck = ""
+        if widgets.Ui_checked_at(ui, i) == 1 { ck = " checked" }
+        return "  <label class=\"wyn-check\"" + common + "><input type=\"checkbox\""
+            + ck + disabled_attr(ui, i) + wiring(ui, i) + "><span>" + label
+            + "</span></label>\n"
+    }
+    if kind == widgets.KIND_ENTRY {
+        return "  <input type=\"text\" class=\"wyn-entry\"" + common
+            + disabled_attr(ui, i) + " value=\"" + text + "\">\n"
+    }
+    if kind == widgets.KIND_TEXTAREA {
+        // <textarea> content is text, not an attribute, and its contents are
+        // full of newlines - which is why the shared escaper leaves \n alone and
+        // only touches the five characters that are markup.
+        //
+        // No newline after the open tag: HTML drops a single leading newline
+        // inside <textarea>, so a body that legitimately starts with a blank
+        // line would lose it.
+        return "  <textarea class=\"wyn-textarea\"" + common
+            + disabled_attr(ui, i) + ">" + text + "</textarea>\n"
+    }
+    if kind == widgets.KIND_PANEL {
+        // The model's `panel` is the group box, so it gets <fieldset> - which
+        // brings the grouping semantics a bordered <div> only imitates. <legend>
+        // only when there is a caption: an empty legend still draws a notch in
+        // the border, so an unlabelled panel would render visibly broken.
+        var s: string = "  <fieldset class=\"wyn-panel\"" + common + ">"
+        if widgets.Ui_label_at(ui, i).len() > 0 {
+            s = s + "<legend>" + label + "</legend>"
+        }
+        return s + "</fieldset>\n"
+    }
+    // An unknown kind is COMMENTED, not dropped and not turned into a <div>.
+    // form.Form_from_json already skips kinds this build cannot name, so getting
+    // here means a kind exists in widgets.wyn that this file has not been taught;
+    // a visible marker in the output is how that gets noticed.
+    return "  <!-- wyn: unmapped widget kind \"" + esc_html(widgets.Ui_kind_name(kind))
+        + "\" (id " + id.to_string() + ") -->\n"
+}
+
+// ---- the handler block ----------------------------------------------------
+
+pub fn HANDLERS_BEGIN() -> string {
+    return "// ==== WYN-HANDLERS-BEGIN - YOUR CODE. Never regenerated. ===="
+}
+
+pub fn HANDLERS_END() -> string {
+    return "// ==== WYN-HANDLERS-END ===="
+}
+
+// One empty stub, the web counterpart of codegen.gen_stub.
+//
+// Empty on purpose. codegen.gen_stub prints a line so a freshly generated desktop
+// form visibly responds; a browser has no console in front of the user, so a
+// print there is invisible noise. The comment naming the Wyn file is the useful
+// half: it says where the same handler's real body lives.
+fn stub(form: string, name: string, label: string) -> string {
+    var s = ""
+    s = s + "// " + label + "\n"
+    s = s + "// Web counterpart of " + form + ".wyn's " + name + ".\n"
+    s = s + "function " + name + "(id) {\n"
+    s = s + "}\n\n"
+    return s
+}
+
+// Is `function <name>(` already present?
+//
+// Matched WITH the open paren, for codegen.has_handler's reason: `on_ok` must not
+// match `on_ok_2`. The failure direction is chosen the same way too - this can
+// only ever DECLINE to add a stub (a match inside a comment or a string), which
+// leaves a missing function and a console error the user fixes in one line. The
+// other direction appends a second `function on_ok`, and in JavaScript that is
+// not an error: the later definition silently REPLACES the body the user wrote.
+// That is worse than on the Wyn side, where it would at least fail to compile.
+fn has_fn(text: string, name: string) -> int {
+    if text.index_of("function " + name + "(") >= 0 { return 1 }
+    return 0
+}
+
+// The text between the markers in `existing`, or "" if there is none.
+//
+// A substring lift, NOT a parse. Nothing here interprets the JavaScript, and
+// nothing here reconstructs any part of the form from it - the model is still the
+// only source of truth. All this preserves is a region of bytes the generator
+// promised not to own.
+fn carried_body(existing: string) -> string {
+    var b = existing.index_of(HANDLERS_BEGIN())
+    if b < 0 { return "" }
+    var after = b + HANDLERS_BEGIN().len()
+    // index_of has no start offset, so the end marker is found in the remainder
+    // and the offset added back. Searching the whole string instead would find an
+    // END that precedes the BEGIN in a hand-mangled file and lift a negative
+    // range.
+    var rest = existing.substring(after, existing.len())
+    var e = rest.index_of(HANDLERS_END())
+    if e < 0 {
+        // BEGIN with no END: the file was truncated or edited badly. Keep
+        // everything after BEGIN rather than discarding it. Losing a user's code
+        // to recover a tidy file is never the right trade; the worst case here is
+        // some machine-owned markup carried along, which is visible.
+        return rest
+    }
+    return rest.substring(0, e)
+}
+
+// How many stubs a regeneration would ADD.
+//
+// Split out from Html_generate rather than returned alongside the text, because
+// returning a struct across a module boundary miscompiles today (see the
+// workspace notes). Two pure functions over the same inputs is a smaller price
+// than a shared mutable counter, and it is independently testable.
+pub fn Html_stubs_needed(ui: Ui, existing: string) -> int {
+    var body = carried_body(existing)
+    var seen = body
+    var added = 0
+    var i = 0
+    while i < widgets.Ui_count(ui) {
+        if codegen.takes_handler(widgets.Ui_kind_at(ui, i)) == 1 {
+            var name = codegen.handler_of(ui, i)
+            if has_fn(seen, name) == 0 {
+                // Recorded in `seen` as well as counted, so two buttons sharing
+                // one handler name count once - the same reason Form_generate
+                // tracks names appended in the current pass.
+                seen = seen + "function " + name + "("
+                added = added + 1
+            }
+        }
+        i = i + 1
+    }
+    return added
+}
+
+// The handler block's contents: whatever was already there, plus the missing
+// stubs, in that order.
+//
+// Append-only, and the carried text is never reformatted. Pass "" for `existing`
+// to generate a page from scratch.
+pub fn Html_handlers(ui: Ui, existing: string) -> string {
+    var form = widgets.Ui_name(ui)
+    var body = carried_body(existing)
+    if body.len() == 0 {
+        body = "\n"
+        body = body + "// Handler bodies for " + form + ", the web counterpart of "
+            + form + ".wyn.\n"
+        body = body + "// The desktop and web targets are generated from the same "
+            + form + ".json, so\n"
+        body = body + "// a handler has the same name and the same (id) argument in "
+            + "both.\n"
+        body = body + "//\n"
+        body = body + "// Everything OUTSIDE the two marker comments is regenerated in "
+            + "full. What is\n"
+        body = body + "// between them is carried over verbatim, so a body you write "
+            + "here survives.\n\n"
+    }
+    var i = 0
+    while i < widgets.Ui_count(ui) {
+        if codegen.takes_handler(widgets.Ui_kind_at(ui, i)) == 1 {
+            var name = codegen.handler_of(ui, i)
+            if has_fn(body, name) == 0 {
+                body = body + stub(form, name, widgets.Ui_label_at(ui, i)
+                    + " (" + widgets.Ui_kind_name(widgets.Ui_kind_at(ui, i)) + ")")
+            }
+        }
+        i = i + 1
+    }
+    return body
+}
+
+// ---- the document ---------------------------------------------------------
+
+// The <style> block.
+//
+// Colours are lifted from the toolkit's own defaults (Ui_new: bg 28,28,34;
+// fg 235,235,240; accent 70,110,170) so a generated page LOOKS like the form the
+// designer drew. A web target that renders the same document in a different
+// palette invites "which one is right?" every time someone compares them.
+//
+// The container is width:100% / height:100vh, not the design size. That is what
+// makes the anchors mean anything: a fixed-size container never resizes, so
+// left+right could never stretch and the whole mapping above would be dead code.
+// The design size survives as the reference the pixel offsets were computed
+// against, and as min-height so a short viewport scrolls rather than crushing the
+// form.
+fn style_block(ui: Ui) -> string {
+    var s = ""
+    s = s + "  <style>\n"
+    s = s + "    :root { color-scheme: dark; }\n"
+    s = s + "    * { box-sizing: border-box; }\n"
+    s = s + "    body {\n"
+    s = s + "      margin: 0;\n"
+    s = s + "      background: rgb(28,28,34);\n"
+    s = s + "      color: rgb(235,235,240);\n"
+    s = s + "      font: 15px/1.3 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n"
+    s = s + "    }\n"
+    s = s + "    #wyn-form {\n"
+    s = s + "      position: relative;\n"
+    s = s + "      inline-size: 100%;\n"
+    s = s + "      block-size: 100vh;\n"
+    s = s + "      min-height: " + widgets.Ui_design_h(ui).to_string() + "px;\n"
+    s = s + "      overflow: auto;\n"
+    s = s + "    }\n"
+    s = s + "    .wyn-button {\n"
+    s = s + "      background: rgb(50,50,60);\n"
+    s = s + "      color: inherit;\n"
+    s = s + "      border: 1px solid rgb(90,90,105);\n"
+    s = s + "      border-radius: 4px;\n"
+    s = s + "      font: inherit;\n"
+    s = s + "      cursor: pointer;\n"
+    s = s + "    }\n"
+    s = s + "    .wyn-button:hover:enabled { background: rgb(70,110,170); }\n"
+    s = s + "    .wyn-button:active:enabled { background: rgb(50,80,130); }\n"
+    s = s + "    .wyn-entry, .wyn-textarea {\n"
+    s = s + "      background: rgb(18,18,22);\n"
+    s = s + "      color: inherit;\n"
+    s = s + "      border: 1px solid rgb(120,120,140);\n"
+    s = s + "      border-radius: 3px;\n"
+    s = s + "      font: inherit;\n"
+    s = s + "      padding: 2px 5px;\n"
+    s = s + "    }\n"
+    s = s + "    .wyn-textarea { font-family: ui-monospace, monospace; resize: none; }\n"
+    s = s + "    .wyn-entry:focus, .wyn-textarea:focus {\n"
+    s = s + "      outline: none;\n"
+    s = s + "      border-color: rgb(70,110,170);\n"
+    s = s + "    }\n"
+    // nowrap on the checkbox: its caption is drawn beside the box on the
+    // desktop, and the model gives the box an 18px width - so without this the
+    // caption wraps to a second line inside an 18px column.
+    s = s + "    .wyn-check { display: flex; align-items: center; gap: 8px;\n"
+    s = s + "                 white-space: nowrap; }\n"
+    s = s + "    .wyn-check input { accent-color: rgb(70,110,170); margin: 0; }\n"
+    s = s + "    .wyn-panel {\n"
+    s = s + "      background: rgb(38,38,46);\n"
+    s = s + "      border: 1px solid rgb(60,60,72);\n"
+    s = s + "      border-radius: 4px;\n"
+    s = s + "      margin: 0;\n"
+    s = s + "    }\n"
+    s = s + "    :disabled { color: rgb(110,110,120); cursor: default; }\n"
+    s = s + "  </style>\n"
+    return s
+}
+
+// The whole page, given an already-prepared handler-block body.
+//
+// Split from Html_generate so the document can be built with no filesystem at
+// all - which is how it is tested, and how a caller that wants to serve the page
+// rather than write it gets at the bytes.
+pub fn Html_document(ui: Ui, handlers: string) -> string {
+    var form = widgets.Ui_name(ui)
+    var n = widgets.Ui_count(ui)
+    var s = ""
+    s = s + "<!DOCTYPE html>\n"
+    s = s + "<html lang=\"en\">\n"
+    s = s + "<head>\n"
+    s = s + "  <meta charset=\"utf-8\">\n"
+    s = s + "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    // The title is the form's name from the document, escaped like everything
+    // else: a form called `A & B` must not produce a broken <title>.
+    s = s + "  <title>" + esc_html(form) + "</title>\n"
+    s = s + "  <!-- GENERATED from " + esc_html(form) + ".json by src/html.wyn.\n"
+    s = s + "       Everything outside the WYN-HANDLERS markers below is rewritten\n"
+    s = s + "       in full on every generation - edit " + esc_html(form)
+        + ".json instead.\n"
+    s = s + "       Design size " + widgets.Ui_design_w(ui).to_string() + "x"
+        + widgets.Ui_design_h(ui).to_string()
+        + ": the reference the pixel offsets were\n"
+    s = s + "       computed against, not a fixed page size. -->\n"
+    s = s + style_block(ui)
+    s = s + "</head>\n"
+    s = s + "<body>\n"
+    s = s + "<div id=\"wyn-form\">\n"
+    var i = 0
+    while i < n {
+        s = s + Html_widget(ui, i)
+        i = i + 1
+    }
+    if n == 0 {
+        // A form with no widgets is a legitimate document (it is the first thing
+        // the designer creates), so it must still produce a valid page rather
+        // than an empty file or a crash.
+        s = s + "  <!-- no widgets in this form yet -->\n"
+    }
+    s = s + "</div>\n"
+    s = s + "<script>\n"
+    s = s + HANDLERS_BEGIN() + "\n"
+    s = s + handlers
+    s = s + HANDLERS_END() + "\n"
+    s = s + "</script>\n"
+    s = s + "</body>\n"
+    s = s + "</html>\n"
+    return s
+}
+
+// A complete page for a form that has never been generated before.
+pub fn Html_to_string(ui: Ui) -> string {
+    return Html_document(ui, Html_handlers(ui, ""))
+}
+
+// Write `<dir>/<FormName>.html`, preserving any handler bodies already in it.
+//
+// Returns the number of stubs APPENDED - the same contract as
+// codegen.Form_generate, so a caller can print one status line for both targets
+// and a test can assert the second run adds 0.
+pub fn Html_generate(ui: Ui, dir: string) -> int {
+    var path: string = dir + "/" + widgets.Ui_name(ui) + ".html"
+    var existing = ""
+    if File::exists(path) == 1 { existing = File::read(path) }
+    var added = Html_stubs_needed(ui, existing)
+    File::write(path, Html_document(ui, Html_handlers(ui, existing)))
+    return added
+}

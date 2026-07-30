@@ -1,0 +1,375 @@
+// test_html - the WEB output target: the same form document, as one .html file.
+//
+//   WYN_ROOT=/path/to/wyn  wyn run tests/test_html.wyn
+//
+// Needs no display and no browser: a Ui with win = -1 is a legitimate document
+// (see test_form_json), and the whole target is a pure function from that
+// document to a string. So the assertions are on the STRING, which is also the
+// only place they can be - a screenshot cannot tell you that `width:` was
+// correctly OMITTED.
+//
+// WHAT EACH GROUP IS ACTUALLY FOR
+//
+// 1. Anchors -> CSS is the part with content in it, and every one of its four
+//    cases fails silently. A right-anchored widget that also emits `left:` looks
+//    perfect at the design size and stops following the corner the moment the
+//    window is resized; a left+right widget that also emits `width:` is
+//    over-constrained, so CSS discards `right:` and the widget freezes - and the
+//    file still SAYS `right:`, so reading the output does not reveal it. Hence
+//    the assertions are as much about ABSENCE as presence.
+// 2. Escaping is a test case, not a footnote. A caption of "<script>alert(1)"
+//    reaching the page unescaped turns opening a generated form into arbitrary
+//    code execution, so the assertion is both "the escaped form is present" AND
+//    "the raw substring is absent anywhere in the document".
+// 3. The empty form: the first thing a designer creates has zero widgets, and it
+//    must still produce a document a browser will render.
+// 4. The round trip through the filesystem, because Html_generate is what a
+//    caller uses and its append-only handler contract only exists on disk.
+
+import widgets
+import html
+
+var fails = 0
+
+fn check(label: string, got: string, want: string) {
+    if got == want {
+        print("  ok   ${label} = ${got}")
+    } else {
+        print("  FAIL ${label}: got [${got}] want [${want}]")
+        fails = fails + 1
+    }
+}
+
+fn check_int(label: string, got: int, want: int) {
+    check(label, got.to_string(), want.to_string())
+}
+
+// `text` contains `needle`, as 1/0. Wrapped rather than inlined because the
+// interesting assertion is usually the NEGATIVE one and `contains(...) == 0`
+// reads much better as `absent`.
+fn present(text: string, needle: string) -> int {
+    if text.index_of(needle) >= 0 { return 1 }
+    return 0
+}
+
+fn check_has(label: string, text: string, needle: string) {
+    check_int(label, present(text, needle), 1)
+}
+
+fn check_lacks(label: string, text: string, needle: string) {
+    check_int(label, present(text, needle), 0)
+}
+
+// How many times `needle` occurs in `text`.
+//
+// Hand-rolled because there is no count in the string library and `replace` has
+// no occurrence limit (`s.replace(a, b, 1)` is "Unknown method 'replace'" -
+// verified). Needed for the one assertion that a naive "does it contain it"
+// cannot make: that a preserved handler body was carried over ONCE rather than
+// duplicated. A duplicated `function on_submit` is not a JavaScript error - the
+// second definition silently wins - so a count is the only way to see it.
+fn count_of(text: string, needle: string) -> int {
+    if needle.len() == 0 { return 0 }
+    var n = 0
+    // `"" + text`, NOT `text`. Binding a string PARAMETER to a local and then
+    // REASSIGNING that local releases the caller's string: after
+    // `count_of(doc, "<script")` the caller's own `doc` measured 0, and the next
+    // string allocated reused its buffer, so `doc` silently became a DIFFERENT
+    // document - which is how this was found (an assertion 60 lines later
+    // compared `doc` against the file and got a length of 2548 for a 3984-byte
+    // string). Reduced to:
+    //
+    //     fn eat(a: string) -> int {
+    //         var t = a
+    //         t = t.substring(1, t.len())
+    //         return t.len()
+    //     }
+    //     fn mk(p: string) -> string { var s = ""  s = s + "<html>" + p  return s }
+    //     fn main() {
+    //         var d = mk("PAD")
+    //         print(eat(d).to_string())      // 15 - correct
+    //         print(d.len().to_string())     // 0  - should be 16
+    //     }
+    //
+    // `var t = "" + a` and `return a.substring(...)` (never binding at all) are
+    // both correct, because the concatenation forces an allocation this function
+    // genuinely owns. Same family as the line_copy / insert_line_at bug already
+    // documented in src/widgets.wyn, which is what made it recognisable rather
+    // than baffling. Reported.
+    var rest = "" + text
+    while true {
+        var k = rest.index_of(needle)
+        if k < 0 { return n }
+        n = n + 1
+        rest = rest.substring(k + needle.len(), rest.len())
+    }
+    return n
+}
+
+fn noop(id: int) {}
+
+// The form under test: one of every kind, plus one widget per anchor
+// combination, plus the hostile caption.
+//
+// Widget indices are asserted against below, so the ORDER here is part of the
+// test. Named constants would be nicer; the toolkit indexes by position and
+// there is no lookup-by-label accessor, so a comment column is the honest option.
+fn build_form() -> Ui {
+    var ui = widgets.Ui_new(-1, -1)
+    ui = widgets.Ui_set_name(ui, "WebForm")
+    ui = widgets.Ui_set_design_size(ui, 400, 300)
+
+    // [0] label, default anchors (left+top). Classic absolute placement.
+    ui = widgets.Ui_label(ui, "Email", 20, 30)
+
+    // [1] entry, LEFT+RIGHT: must stretch. The case that needs `width` omitted.
+    ui = widgets.Ui_entry(ui, "a@b.c", 100, 24, 280, 28)
+    ui = widgets.Ui_set_anchor(ui, widgets.Ui_last_id(ui), 1, 1, 1, 0)
+
+    // [2] button, RIGHT only: must stay glued to the right edge, keep its width.
+    ui = widgets.Ui_button(ui, "Sign in", 280, 240, 100, 32, noop)
+    var signin = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, signin, "on_submit")
+    ui = widgets.Ui_set_anchor(ui, signin, 0, 1, 0, 1)
+
+    // [3] checkbox, checked and wired. A handler on a non-button kind.
+    ui = widgets.Ui_checkbox(ui, "Remember me", 100, 70, 1, noop)
+    ui = widgets.Ui_set_handler_name(ui, widgets.Ui_last_id(ui), "on_remember")
+
+    // [4] textarea, ALL FOUR anchors: fills. Contents carry a newline AND a
+    // quote, which the escaper must treat differently (one is markup, one is not).
+    ui = widgets.Ui_textarea(ui, "line1\nsay \"hi\"", 20, 110, 360, 80)
+    ui = widgets.Ui_set_anchor(ui, widgets.Ui_last_id(ui), 1, 1, 1, 1)
+
+    // [5] panel -> <fieldset>, with a caption so <legend> is exercised.
+    ui = widgets.Ui_panel(ui, 20, 200, 120, 60)
+    ui = widgets.Ui_set_label(ui, widgets.Ui_last_id(ui), "Options")
+
+    // [6] button, DISABLED and free on all four sides: the proportional case.
+    ui = widgets.Ui_button(ui, "Cancel", 160, 240, 100, 32, noop)
+    var cancel = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, cancel, "on_cancel")
+    ui = widgets.Ui_set_enabled(ui, cancel, 0)
+    ui = widgets.Ui_set_anchor(ui, cancel, 0, 0, 0, 0)
+
+    // [7] THE HOSTILE ONE. A label whose caption is a script tag. This is the
+    // caption an assistant produces the first time someone asks for a form about
+    // XSS, and it is exactly the input that must come out inert.
+    ui = widgets.Ui_label(ui, "<script>alert(1)</script>", 20, 270)
+
+    return ui
+}
+
+fn main() {
+    print("=== web output target ===")
+    var ui = build_form()
+    var doc = html.Html_to_string(ui)
+    check_int("widget count", widgets.Ui_count(ui), 8)
+
+    // ---- 1. anchors become CSS -------------------------------------------
+    print("")
+    print("--- anchors -> CSS (design size 400x300) ---")
+
+    // left+top only: both offsets AND both sizes present, nothing pinned to the
+    // far edges. The label has w == 0 in the model, so no width is emitted -
+    // asserting that too, because width:0 would collapse it to invisible.
+    var s0 = html.Html_style_for(ui, 0)
+    check("[0] label, left+top", s0, "position:absolute;left:20px;top:30px;")
+
+    // LEFT+RIGHT: both horizontal offsets, and NO `width:` - the whole point.
+    // right = 400 - 100 - 280 = 20.
+    var s1 = html.Html_style_for(ui, 1)
+    check_has("[1] entry left+right has left:", s1, "left:100px")
+    check_has("[1] ...and right:", s1, "right:20px")
+    check_lacks("[1] ...and NO width: (this is what stretches)", s1, "width:")
+    // Vertically it is top-only, so height IS fixed. Proves the two axes are
+    // independent rather than one flag driving both.
+    check_has("[1] top-only keeps height:", s1, "height:28px")
+
+    // RIGHT only: `right:` and a fixed width, and NO `left:` at all - a `left:`
+    // here would pin the box in place and it would stop following the corner.
+    // right = 400 - 280 - 100 = 20; bottom = 300 - 240 - 32 = 28.
+    var s2 = html.Html_style_for(ui, 2)
+    check_has("[2] button right-anchored has right:", s2, "right:20px")
+    check_lacks("[2] ...and NO left: (stays right-aligned as the window widens)",
+                s2, "left:")
+    check_has("[2] ...keeps its width", s2, "width:100px")
+    check_has("[2] bottom-anchored has bottom:", s2, "bottom:28px")
+    check_lacks("[2] ...and NO top:", s2, "top:")
+
+    // ALL FOUR: fills. No width and no height.
+    var s4 = html.Html_style_for(ui, 4)
+    check("[4] textarea all four sides fills", s4,
+          "position:absolute;left:20px;right:20px;top:110px;bottom:110px;")
+
+    // FREE on all four: proportional, matching Ui_relayout's x*new/old.
+    // 160/400 = 40.0%, 240/300 = 80.0%.
+    var s6 = html.Html_style_for(ui, 6)
+    check_has("[6] free/free is a PERCENT (scales proportionally)", s6, "left:40.0%")
+    check_has("[6] ...vertically too", s6, "top:80.0%")
+
+    // ---- 2. one element per kind ------------------------------------------
+    print("")
+    print("--- each kind -> its natural element ---")
+    check_has("label -> <label>", html.Html_widget(ui, 0), "<label class=\"wyn-label\"")
+    check_has("button -> <button>", html.Html_widget(ui, 2), "<button type=\"button\"")
+    check_has("checkbox -> <input type=\"checkbox\">", html.Html_widget(ui, 3),
+              "<input type=\"checkbox\"")
+    check_has("...and it is checked", html.Html_widget(ui, 3), "checkbox\" checked")
+    check_has("entry -> <input type=\"text\">", html.Html_widget(ui, 1),
+              "<input type=\"text\"")
+    check_has("...carrying its value", html.Html_widget(ui, 1), "value=\"a@b.c\"")
+    check_has("textarea -> <textarea>", html.Html_widget(ui, 4), "<textarea")
+    check_has("...contents inside the tag, newline intact",
+              html.Html_widget(ui, 4), ">line1\nsay ")
+    check_has("panel -> <fieldset>", html.Html_widget(ui, 5), "<fieldset")
+    check_has("...with a <legend> for its caption", html.Html_widget(ui, 5),
+              "<legend>Options</legend>")
+    check_has("disabled reaches the element", html.Html_widget(ui, 6), " disabled")
+    check_lacks("...and an enabled one has none", html.Html_widget(ui, 2), " disabled")
+
+    // ---- 3. handler wiring ------------------------------------------------
+    print("")
+    print("--- handlers: onclick + a stub with the same name ---")
+    check_has("button gets onclick=<handler>(id)", doc, "onclick=\"on_submit(3)\"")
+    // onchange, not onclick: a checkbox's meaning is its state, and onclick can
+    // fire before .checked has been updated.
+    check_has("checkbox gets onchange", doc, "onchange=\"on_remember(4)\"")
+    check_has("a stub exists for it", doc, "function on_submit(id) {")
+    check_has("...and for the checkbox", doc, "function on_remember(id) {")
+    check_has("...and for the disabled button too", doc, "function on_cancel(id) {")
+    // The comment tying the web stub to its Wyn counterpart: the two targets are
+    // generated from one document, so the names must be traceable across them.
+    check_has("stub names its Wyn counterpart", doc,
+              "Web counterpart of WebForm.wyn's on_submit")
+    check_lacks("a LABEL gets no handler", html.Html_widget(ui, 0), "onclick")
+
+    // ---- 4. ESCAPING. Not a footnote. -------------------------------------
+    print("")
+    print("--- a caption of <script>alert(1)</script> must be INERT ---")
+    check_has("the caption is escaped", doc,
+              "&lt;script&gt;alert(1)&lt;/script&gt;")
+    // The raw opening tag must not appear ANYWHERE in the document. On its own
+    // this is a WEAK assertion, which is worth writing down because it looks like
+    // the strong one: mutation-testing `< -> <` (no escaping at all) leaves it
+    // GREEN, because the caption then emits "<script>alert(1)" and the needle
+    // "<script>alert" is present... which is what it is testing for. The needle
+    // has to be the one an unescaped caption actually produces, and the count has
+    // to be zero out of a document that legitimately contains one real <script>
+    // block. So: exactly ONE <script in the whole page (the handler block), and
+    // no </script> anywhere except its matching close.
+    check_lacks("the raw <script>alert substring is ABSENT", doc, "<script>alert")
+    check_int("exactly ONE <script in the document (the handler block only)",
+              count_of(doc, "<script"), 1)
+    check_int("...and exactly one </script>", count_of(doc, "</script>"), 1)
+    // Escaping is order-independent by construction (a single per-character pass,
+    // not five sequential replaces), so neither of these can regress to
+    // &amp;lt; - they pin the escape TEXT rather than an ordering rule.
+    check("ampersand escaped once, not twice", html.esc_html("a & b"), "a &amp; b")
+    check("an already-escaped entity is escaped again, not left alone",
+          html.esc_html("&lt;"), "&amp;lt;")
+    check("quote escaped for attribute context", html.esc_html("say \"hi\""),
+          "say &quot;hi&quot;")
+    check("apostrophe too", html.esc_html("it's"), "it&#39;s")
+    // A newline is NOT markup and must survive: a textarea's contents are full of
+    // them, and escaping them would break every multi-line body.
+    check("a newline is left alone", html.esc_html("a\nb"), "a\nb")
+    // The escaped textarea contents, in the real document.
+    check_has("the textarea's embedded quote is escaped", doc,
+              "say &quot;hi&quot;</textarea>")
+
+    // ---- 5. a valid document, and the empty form --------------------------
+    print("")
+    print("--- document shape, including a form with ZERO widgets ---")
+    check_has("doctype", doc, "<!DOCTYPE html>")
+    check_has("charset", doc, "<meta charset=\"utf-8\">")
+    check_has("a <style> block", doc, "<style>")
+    check_lacks("no external stylesheet", doc, "<link")
+    check_lacks("no external script src", doc, "script src")
+    check_has("closes", doc, "</html>")
+
+    var empty = widgets.Ui_new(-1, -1)
+    empty = widgets.Ui_set_name(empty, "Blank & Co")
+    var edoc = html.Html_to_string(empty)
+    check_int("the empty form has no widgets", widgets.Ui_count(empty), 0)
+    check_has("...still a doctype", edoc, "<!DOCTYPE html>")
+    // The title carries the form's name, escaped like everything else - `&` in a
+    // form name must not produce a broken <title>.
+    check_has("...and the form's title, escaped", edoc, "<title>Blank &amp; Co</title>")
+    check_has("...and closes", edoc, "</html>")
+    check_has("...and says so rather than looking truncated", edoc,
+              "no widgets in this form yet")
+    // No widgets means no handlers, so the marked region must still be there and
+    // still be well formed - an empty <script> with only markers.
+    check_has("...markers present even with nothing to wire", edoc,
+              html.HANDLERS_BEGIN())
+    check_has("...and closed", edoc, html.HANDLERS_END())
+
+    // ---- 6. round trip through the filesystem ------------------------------
+    print("")
+    print("--- write, re-read, regenerate: a body already there SURVIVES ---")
+    // Inside the repo, like the other generators' scratch dirs, so the test
+    // leaves nothing outside it.
+    var proj = "scratch/web"
+    File::create_dir_all(proj)
+    var out = proj + "/WebForm.html"
+    // Deleted first: the whole point of the append-only contract is that a file
+    // already on disk changes the outcome, so a stale one from a previous run
+    // would make the "first generation" assertions test the wrong path.
+    File::delete(out)
+
+    var added = html.Html_generate(ui, proj)
+    check_int("first generation appends one stub per handler", added, 3)
+    check_int("the file exists", File::exists(out), 1)
+
+    // Compared as a length plus a flag rather than by passing both documents to
+    // check(): they are ~5KB, and a mismatch would print both in full and bury
+    // every other line of the report.
+    var onDisk = File::read(out)
+    var same = 0
+    if onDisk == doc { same = 1 }
+    check_int("what was written is what Html_to_string produced", same, 1)
+    check_int("...same length", onDisk.len(), doc.len())
+
+    // Write a real body into one stub, the way a user would.
+    var edited: string = onDisk.replace("function on_submit(id) {\n}",
+        "function on_submit(id) {\n  document.title = \"submitted\";\n}")
+    check_int("the edit took", present(edited, "document.title"), 1)
+    File::write(out, edited)
+
+    // Regenerate over it. Nothing new to add, and the body must survive.
+    var again = html.Html_generate(ui, proj)
+    check_int("regenerating adds NO new stubs", again, 0)
+    var after = File::read(out)
+    check_int("the hand-written body survived regeneration",
+              present(after, "document.title = \"submitted\""), 1)
+    // Exactly one definition. Two would not be an error in JavaScript - the
+    // later one silently replaces the body the user wrote - so this is the
+    // assertion that catches "preserve" implemented as "carry it over AND emit a
+    // fresh stub".
+    check_int("...exactly once, not duplicated",
+              count_of(after, "function on_submit(id) {"), 1)
+
+    // A NEW control -> a new stub, and the existing body still survives. This is
+    // the case that catches a "preserve" implemented as "never write again".
+    var ui2 = widgets.Ui_button(ui, "Help", 20, 240, 80, 32, noop)
+    ui2 = widgets.Ui_set_handler_name(ui2, widgets.Ui_last_id(ui2), "on_help")
+    var third = html.Html_generate(ui2, proj)
+    check_int("a new control appends exactly one stub", third, 1)
+    var after2 = File::read(out)
+    check_int("the new stub is there", present(after2, "function on_help(id) {"), 1)
+    check_int("the old body STILL survives",
+              present(after2, "document.title = \"submitted\""), 1)
+    // The machine-owned half, by contrast, IS rewritten: the new button's markup
+    // has to appear or the regeneration did nothing.
+    check_int("...and the new widget's markup appeared",
+              present(after2, "on_help(9)"), 1)
+
+    print("")
+    if fails == 0 {
+        print("=== ALL HTML TESTS PASSED ===")
+    } else {
+        print("=== ${fails} HTML TEST(S) FAILED ===")
+        exit(1)
+    }
+}
