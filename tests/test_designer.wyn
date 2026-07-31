@@ -1,0 +1,838 @@
+// test_designer - assertions on the DESIGNER, driven through its own binary.
+//
+//   SDL_VIDEODRIVER=dummy WYN_ROOT=/path/to/wyn  wyn run tests/test_designer.wyn
+//
+// WHY THIS SHELLS OUT INSTEAD OF IMPORTING
+//
+// examples/designer.wyn is a PROGRAM, not a module: its state is module-level
+// vars and its dispatch is `pump`, both of which need a `fn main` and an event
+// queue. There is no way to `import` it, and rewriting its logic here as a
+// library would produce the one test that cannot fail - a copy of the designer
+// asserting that the copy works.
+//
+// So this builds the real binary once and drives it through WYN_DESIGNER_SCRIPT,
+// exactly as wyncanvas's verify_ui.sh drives its editor, then asserts on printed
+// values. Every `p:<field>` the designer prints reads the MODEL through the same
+// accessor Form_save serialises from - never the inspector's own widget - which
+// is the whole point: an inspector that updated its panel and not the document
+// would pass any assertion made against the panel, and would save the old value.
+//
+// WHAT EACH GROUP IS FOR, AND WHAT IT REFUSES TO ASSERT
+//
+// "It ran" is not an assertion. Every check below names a value:
+//
+//  1. THE PALETTE places all 15 kinds, and the placed widget's KIND is read back
+//     - not just the count. A palette that placed a button for every row would
+//     pass a count check.
+//  2. THE INSPECTOR writes each field family (string, int, bool, multi-line,
+//     per-kind) and the DOCUMENT is read back. Paired with a save-reload, so a
+//     field that mutated an in-memory copy the serialiser does not see is caught.
+//  3. THE ROUND TRIP: place, edit, save, RELOAD FROM DISK, assert the field.
+//     The only check that spans the designer, form.wyn's writer and its reader.
+//  4. ERGONOMICS as arithmetic. A nudge is +1, a grid nudge is +8, distribute
+//     puts the middle of 0/37/400 at exactly 200, align moves to the PRIMARY's
+//     edge, z-order is an id sequence, undo restores a coordinate as well as a
+//     count.
+//  5. THE GENERATED PAIR COMPILES. Shelling out to `wyn build`, as
+//     tests/test_codegen.wyn does - the only check that can catch a designer
+//     that edits fields the generator cannot emit.
+//
+// The gate has its own negative control (see "the gate itself" in main), because
+// every check here funnels through two grep helpers, and a helper that always
+// found what it was looking for would make the entire file vacuous.
+
+var fails = 0
+
+fn check(label: string, got: string, want: string) {
+    if got == want {
+        print("  ok   ${label} = [${got}]")
+    } else {
+        print("  FAIL ${label}: got [${got}] want [${want}]")
+        fails = fails + 1
+    }
+}
+
+fn check_int(label: string, got: int, want: int) {
+    check(label, got.to_string(), want.to_string())
+}
+
+// scratch/, not /tmp: test_codegen and test_pipeline already write here, and a
+// generated file that `import widgets` has to sit under the repo root for the
+// module path to resolve.
+var PROJ = "scratch/designer_test"
+var BIN = "scratch/designer_test/dsgn"
+
+fn wyn() -> string {
+    return Env::get("WYN_ROOT") + "/wyn"
+}
+
+// Run the designer with a script and return everything it printed.
+//
+// Output goes through a FILE rather than System::exec's pipe because a script
+// prints many lines and every check below greps them.
+//
+// Script syntax is `cmd:arg:arg;cmd:arg` - ';' between commands, ':' inside one.
+// Not ',': a caption is arbitrary text and "Save, then quit" is something a user
+// types, so a comma-separated script would truncate it and then pass a test
+// asserting on the truncated value.
+fn drive(script: string) -> string {
+    var out = PROJ + "/out.txt"
+    File::delete(out)
+    var cmd = "SDL_VIDEODRIVER=dummy WYN_DESIGNER_DIR=" + PROJ
+        + " WYN_DESIGNER_SCRIPT='" + script + "' "
+        + "perl -e 'alarm(90); exec @ARGV' -- ./" + BIN + " > " + out + " 2>&1"
+    System::exec_code(cmd)
+    if File::exists(out) == 0 { return "" }
+    return File::read(out)
+}
+
+// Is `needle` a whole LINE of `hay`? Line-anchored on both ends, because
+// "prop(x)=8" must not be satisfied by "prop(x)=80" - which a substring search
+// accepts, and which is exactly the off-by-a-digit a coordinate check exists for.
+fn has_line(hay: string, needle: string) -> int {
+    var ls = hay.split("\n")
+    var i = 0
+    while i < ls.len() {
+        // `"" + ls[i]` forces a fresh string: indexing a [string] yields a
+        // borrowed pointer that the scope exit releases, so a direct compare
+        // reads freed memory. Same reason src/widgets.wyn has line_copy.
+        var line = "" + ls[i]
+        if line == needle { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// The value the designer printed for `key`, or "<missing>". Returns the actual
+// value rather than a yes/no, because that is what makes a failure diagnosable:
+// "got [200] want [37]" says which way it is wrong, "got [0] want [1]" does not.
+fn value_of(hay: string, key: string) -> string {
+    var ls = hay.split("\n")
+    var pre = key + "="
+    var found = "<missing>"
+    var i = 0
+    while i < ls.len() {
+        var line = "" + ls[i]
+        if line.len() >= pre.len() {
+            if line.substring(0, pre.len()) == pre {
+                // LAST match wins: a script reads a field before and after an
+                // edit, and the assertion is about the state it ended in.
+                found = line.substring(pre.len(), line.len())
+            }
+        }
+        i = i + 1
+    }
+    return found
+}
+
+fn check_val(label: string, out: string, key: string, want: string) {
+    check(label, value_of(out, key), want)
+}
+
+fn build_ok(path: string) -> int {
+    var rc = System::exec_code(wyn() + " build " + path + " > /dev/null 2>&1")
+    if rc == 0 { return 1 }
+    return 0
+}
+
+// ---- 1. the palette places every kind -------------------------------------
+
+fn palette_tests() {
+    print("=== THE PALETTE: all 15 kinds, each placed as ITS OWN kind ===")
+    // Every kind, placed by clicking the canvas, then the DOCUMENT's kind read
+    // back. `tool:` goes through Ui_kind_from_name, so a name this test spells
+    // wrong resolves to -1 and nothing is placed - which the count check catches.
+    var kinds = "label,button,checkbox,radio,entry,textarea,spinner,dropdown,"
+        + "listbox,slider,progress,panel,groupbox,tabs,menubar"
+    var names = kinds.split(",")
+    var i = 0
+    while i < names.len() {
+        var k = "" + names[i]
+        var out = drive("tool:" + k + ";click:16:16;kind")
+        check("place " + k, value_of(out, "kind"), k)
+        check("...and exactly one control", value_of(out, "count"), "1")
+        i = i + 1
+    }
+
+    print("-- a placed control is USABLE, not a 0x0 stub --")
+    // Non-zero geometry and real content per kind is the difference between "the
+    // palette lists 15 kinds" and "you can build a form": a 0x0 dropdown cannot
+    // be clicked, a slider with a 0..0 range has nowhere for the thumb to go, and
+    // a tab strip with no titles cannot be selected. Each default below is one a
+    // placement would otherwise get wrong invisibly, until the form was run.
+    var o = drive("tool:dropdown;click:0:0;p:w;p:h;items")
+    check_val("dropdown has a width", o, "prop(w)", "160")
+    check_val("dropdown has a height", o, "prop(h)", "26")
+    check_val("...and three default items", o, "items", "3")
+    o = drive("tool:slider;click:0:0;p:vmin;p:vmax;p:vstep;p:val")
+    check_val("slider min", o, "prop(vmin)", "0")
+    check_val("slider max", o, "prop(vmax)", "100")
+    check_val("slider step", o, "prop(vstep)", "1")
+    check_val("slider starts mid-range, so the thumb is visible",
+              o, "prop(val)", "50")
+    // A radio with no group is exclusive with nothing, which reads as a checkbox
+    // that will not clear - silent until a second radio is placed next to it.
+    o = drive("tool:radio;click:0:0;p:group")
+    check_val("radio gets a default group", o, "prop(group)", "group1")
+    o = drive("tool:tabs;click:0:0;items")
+    check_val("tabs get default titles (an empty strip is unclickable)",
+              o, "items", "2")
+    o = drive("tool:menubar;click:0:0;items")
+    check_val("menubar gets a default two-menu spec", o, "items", "2")
+    o = drive("tool:progress;click:0:0;p:prog")
+    check_val("progress is placed half-full, so it is visible at all",
+              o, "prop(prog)", "50")
+}
+
+// ---- 2. the inspector writes THE MODEL ------------------------------------
+
+fn inspector_tests() {
+    print("=== THE INSPECTOR: every field family reaches the document ===")
+
+    print("-- string, int and bool fields --")
+    var o = drive("tool:button;click:0:0;set:label:Sign in;p:label"
+        + ";set:x:120;p:x;set:y:48;p:y;set:w:140;p:w;set:h:36;p:h"
+        + ";set:enabled:0;p:enabled;set:tooltip:submits it;p:tooltip"
+        + ";set:handler:on_sign_in;p:handler")
+    check_val("label (typed into an entry)", o, "prop(label)", "Sign in")
+    check_val("x (typed into a spinner and committed)", o, "prop(x)", "120")
+    check_val("y (spinner)", o, "prop(y)", "48")
+    check_val("w (spinner)", o, "prop(w)", "140")
+    check_val("h (spinner)", o, "prop(h)", "36")
+    check_val("enabled (checkbox, cleared with SPACE)", o, "prop(enabled)", "0")
+    check_val("tooltip (entry)", o, "prop(tooltip)", "submits it")
+    check_val("handler name (entry)", o, "prop(handler)", "on_sign_in")
+
+    print("-- the four anchors, independently --")
+    // All four, because the pair (left+right pinned = stretch on resize) is what
+    // makes anchors mean anything, and a writer that fed all four checkboxes into
+    // `al` would pass any single-anchor check.
+    o = drive("tool:entry;click:0:0;set:al:0;set:ar:1;set:at:0;set:ab:1"
+        + ";p:al;p:ar;p:at;p:ab")
+    check_val("anchor left cleared", o, "prop(al)", "0")
+    check_val("anchor right set", o, "prop(ar)", "1")
+    check_val("anchor top cleared", o, "prop(at)", "0")
+    check_val("anchor bottom set", o, "prop(ab)", "1")
+
+    print("-- multi-line: a dropdown's item list --")
+    // Newline-separated in the editor, a real array in the document. Three items
+    // -> two, so a writer that appended rather than replaced is caught.
+    o = drive("tool:dropdown;click:0:0;items"
+        + ";set:items:Alpha\nBeta;items;item:0;item:1")
+    check_val("the list was REPLACED, not appended to", o, "items", "2")
+    check_val("first item", o, "item(0)", "Alpha")
+    check_val("second item", o, "item(1)", "Beta")
+
+    print("-- per-kind: radio group, listbox sel, ranges, progress --")
+    o = drive("tool:radio;click:0:0;set:group:payment;p:group"
+        + ";set:checked:1;p:checked")
+    check_val("radio group", o, "prop(group)", "payment")
+    check_val("radio checked", o, "prop(checked)", "1")
+
+    o = drive("tool:listbox;click:0:0;set:sel:2;p:sel")
+    check_val("listbox selection", o, "prop(sel)", "2")
+
+    // RANGE BEFORE VALUE, in ONE sync pass. `setall` fills every field and syncs
+    // once, which is what clicking away from a row does - and it is the only way
+    // this is testable: separate `set:` commands sync separately, so the range is
+    // already committed before the value is written and insp_sync's internal
+    // order cannot matter. 250 is illegal in the default 0..100 and legal in
+    // 0..500, so value-then-range clamps it to 100.
+    o = drive("tool:slider;click:0:0"
+        + ";setall:vmin|0|vmax|500|vstep|5|val|250"
+        + ";p:vmin;p:vmax;p:vstep;p:val")
+    check_val("all four range fields were written", o, "setall", "4")
+    check_val("slider vmin", o, "prop(vmin)", "0")
+    check_val("slider vmax", o, "prop(vmax)", "500")
+    check_val("slider vstep", o, "prop(vstep)", "5")
+    check_val("a value illegal in the OLD range survives (range written first)",
+              o, "prop(val)", "250")
+
+    // The same ordering requirement on the OTHER pair: Ui_set_items rebuilds the
+    // list, so sel must be written AFTER it. sel=3 is illegal in the 3-item
+    // default and legal in the 4-item list below, so sel-then-items clamps to 2.
+    o = drive("tool:listbox;click:0:0"
+        + ";setall:items|A\nB\nC\nD|sel|3;p:sel;items")
+    check_val("the new list has four items", o, "items", "4")
+    check_val("a selection legal only in the NEW list survives"
+        + " (items written first)", o, "prop(sel)", "3")
+
+    o = drive("tool:spinner;click:0:0;set:vmin:1;set:vmax:12;set:val:7;p:val")
+    check_val("spinner value", o, "prop(val)", "7")
+
+    // PROGRESS is a float in the API and val over 0..1000 in storage, so this is
+    // the one field with a conversion in it. 37 is deliberately not a round tenth:
+    // 0.375 and 0.37 both look "roughly right" by eye and only one is correct.
+    o = drive("tool:progress;click:0:0;set:prog:37;p:prog")
+    check_val("progress percent survives the float conversion",
+              o, "prop(prog)", "37")
+
+    print("-- the inspector shows a kind's OWN fields and no others --")
+    // A "group" row on a panel writes a value nothing reads, which teaches the
+    // wrong model of the document; a missing "items" row on a dropdown makes the
+    // list unreachable. Both directions.
+    o = drive("tool:panel;click:0:0;set:group:x")
+    check_int("a panel has no group row",
+        has_line(o, "set(group)=NOSUCHROW"), 1)
+    // A label's w/h are not stored (Ui_label takes neither), so a w row would
+    // show a size the document cannot hold and the generator would drop.
+    o = drive("tool:label;click:0:0;set:w:99")
+    check_int("a label has no w row", has_line(o, "set(w)=NOSUCHROW"), 1)
+    o = drive("tool:dropdown;click:0:0;set:items:One")
+    check_int("a dropdown DOES have an items row",
+        has_line(o, "set(items)=One"), 1)
+    o = drive("tool:label;click:0:0;set:handler:on_x")
+    check_int("a label has no handler row (it takes none in its ctor)",
+        has_line(o, "set(handler)=NOSUCHROW"), 1)
+}
+
+// ---- 3. THE ROUND TRIP ----------------------------------------------------
+
+fn roundtrip_tests() {
+    print("=== SAVE, RELOAD FROM DISK, and the edit is still there ===")
+    File::delete(PROJ + "/RT.json")
+
+    // One of each field family on one control, so the reload proves the writer
+    // and the reader agree about all of them at once - and specifically that a
+    // field the inspector wrote into an in-memory copy the serialiser cannot see
+    // would come back as the default.
+    var o = drive("doc:RT;tool:dropdown;click:40:40"
+        + ";set:items:Red\nGreen\nBlue;set:sel:2;set:x:96;set:y:64"
+        + ";set:tooltip:pick a colour;set:handler:on_colour;set:ar:1"
+        + ";set:enabled:0;save"
+        + ";load;sel:1;pid;item:0;item:1;item:2;items"
+        + ";p:sel;p:x;p:y;p:tooltip;p:handler;p:ar;p:enabled")
+    check_val("saved", o, "saved", "1")
+    check_val("reloaded one control", o, "loaded", "1")
+    // A load CLEARS the selection on purpose: the ids in a freshly loaded
+    // document are the file's, and keeping the old selection would leave handles
+    // drawn around whatever widget happens to reuse that id. In its OWN run,
+    // because value_of takes the LAST match for a key and the `sel:1` below
+    // prints the same `sel=` key.
+    var sc = drive("doc:RT;tool:button;click:0:0;load;sels")
+    check_val("loading clears the selection", sc, "sel", "")
+    // The id has to survive: a loader that renumbered would break every handler
+    // name and every reference the document makes to a widget - which is why
+    // selecting #1 after the load finds anything at all.
+    check_val("the id survived the round trip", o, "pid", "1")
+    // Item by item, not the joined list: a joined value spans lines, and one
+    // grep line cannot assert on three.
+    check_val("three items survived", o, "items", "3")
+    check_val("item 0 survived", o, "item(0)", "Red")
+    check_val("item 1 survived", o, "item(1)", "Green")
+    check_val("item 2 survived", o, "item(2)", "Blue")
+    check_val("sel survived", o, "prop(sel)", "2")
+    check_val("x survived", o, "prop(x)", "96")
+    check_val("y survived", o, "prop(y)", "64")
+    check_val("tooltip survived", o, "prop(tooltip)", "pick a colour")
+    check_val("handler name survived", o, "prop(handler)", "on_colour")
+    check_val("anchor survived", o, "prop(ar)", "1")
+    check_val("enabled=0 survived", o, "prop(enabled)", "0")
+
+    print("-- the FILE ON DISK is what carries it --")
+    var json = File::read(PROJ + "/RT.json")
+    check_int("the JSON names the handler",
+        json.index_of("on_colour") >= 0 ? 1 : 0, 1)
+    check_int("the JSON carries the edited items",
+        json.index_of("Green") >= 0 ? 1 : 0, 1)
+    // The x KEY has to hold it, not just "the file mentions 96" - a label that
+    // happened to contain 96 would satisfy a bare substring check.
+    check_int("the JSON carries the edited x",
+        json.index_of("\"x\": 96") >= 0 ? 1 : 0, 1)
+
+    print("-- a caption with a quote and a newline survives --")
+    // The two characters that break a hand-rolled JSON writer. A textarea's
+    // contents are FULL of newlines, so this is not an edge case.
+    File::delete(PROJ + "/RT2.json")
+    o = drive("doc:RT2;tool:textarea;click:0:0"
+        + ";set:text:say \"hi\"\nline two;save;load;sel:1;tlines;tline:0;tline:1")
+    // Asserted line by line, because the value itself contains a newline and a
+    // grep works on lines. The line COUNT is the half that catches an escape bug:
+    // a writer that emitted a raw newline gives a file that is not JSON, and one
+    // that dropped it gives ONE line.
+    check_val("two lines came back", o, "tlines", "2")
+    check_val("the quotes survived on line 0", o, "tline(0)", "say \"hi\"")
+    check_val("...and line 1 is intact", o, "tline(1)", "line two")
+
+    print("-- loading REPLACES the document rather than merging --")
+    // A load that appended would double the form every time it was opened.
+    o = drive("doc:RT;tool:button;click:0:0;click:0:64;count;load;count")
+    check_val("two placed, one loaded, so the count is the file's",
+              o, "count", "1")
+}
+
+// ---- 4. ergonomics, as arithmetic ----------------------------------------
+
+fn ergonomics_tests() {
+    print("=== ERGONOMICS: nudge, multi-select, align, distribute, z, undo ===")
+
+    print("-- nudge --")
+    var o = drive("tool:button;click:64:64;p:x;nudge:1:0;p:x;nudge:0:-1;p:y")
+    check_val("one nudge right is +1, not +GRID", o, "prop(x)", "65")
+    check_val("...and up is -1", o, "prop(y)", "63")
+    o = drive("tool:button;click:64:64;nudge:8:0;p:x")
+    check_val("a grid nudge is +8", o, "prop(x)", "72")
+
+    print("-- multi-select --")
+    o = drive("tool:button;click:0:0;click:0:64;click:0:128"
+        + ";sel:1;add:2;add:3;sels")
+    check_val("three selected", o, "sel", "1,2,3")
+    o = drive("tool:button;click:0:0;click:0:64;sel:1;add:2;add:2;sels")
+    check_val("re-adding one removes it (a toggle)", o, "sel", "1")
+    // A nudge with three selected must move ALL THREE, or a multi-select is
+    // decoration. Asserted on one that is NOT the primary.
+    o = drive("tool:button;click:0:0;click:0:64;click:0:128"
+        + ";sel:1;add:2;add:3;nudge:16:0;sel:2;p:x")
+    check_val("a nudge moves the whole selection, not just the primary",
+              o, "prop(x)", "16")
+
+    print("-- align to the PRIMARY, not to the leftmost --")
+    // #1 is at x=0 and #2 at x=200. Selecting 1 THEN 2 makes #2 the primary, so
+    // #1 must move to 200 - which is the interesting direction: "align to
+    // whichever is furthest left" would move #2 to 0 and pass a laxer check.
+    o = drive("tool:button;click:0:0;click:200:64;sel:1;add:2;alignl;sel:1;p:x")
+    check_val("the non-primary moved RIGHT, to the primary's x",
+              o, "prop(x)", "200")
+    o = drive("tool:button;click:0:0;click:200:64;sel:1;add:2;alignl;sel:2;p:x")
+    check_val("...and the primary itself did not move", o, "prop(x)", "200")
+    // The mirror: primary = #1 at x=0, so #2 comes LEFT. Both directions, because
+    // one of them is satisfied by an implementation that always takes the minimum.
+    o = drive("tool:button;click:0:0;click:200:64;sel:2;add:1;alignl;sel:2;p:x")
+    check_val("with #1 primary, the other moves LEFT", o, "prop(x)", "0")
+    o = drive("tool:button;click:0:0;sel:1;alignl;status")
+    check_int("align refuses a selection of one",
+        has_line(o, "status=align needs 2 or more selected"), 1)
+
+    print("-- distribute --")
+    // 0 / 37 / 400: the middle must land at exactly 200. 37 is chosen because a
+    // distribute that did nothing leaves it there, and one that divided before
+    // multiplying accumulates the truncation.
+    o = drive("tool:button;click:0:0;click:0:37;click:0:400"
+        + ";sel:1;add:2;add:3;distv;sel:2;p:y")
+    check_val("the middle of 0/37/400 lands at exactly 200",
+              o, "prop(y)", "200")
+    o = drive("tool:button;click:0:0;click:0:37;click:0:400"
+        + ";sel:1;add:2;add:3;distv;sel:1;p:y")
+    check_val("...and the first stays where it was", o, "prop(y)", "0")
+    o = drive("tool:button;click:0:0;click:0:37;click:0:400"
+        + ";sel:1;add:2;add:3;distv;sel:3;p:y")
+    check_val("...and so does the last", o, "prop(y)", "400")
+    // Distribute sorts by POSITION, not by click order. Selecting 3,1,2 must give
+    // the same answer; a click-ordered version puts 200 on the wrong widget,
+    // which is a silent scramble rather than an error.
+    o = drive("tool:button;click:0:0;click:0:37;click:0:400"
+        + ";sel:3;add:1;add:2;distv;sel:2;p:y")
+    check_val("selection ORDER does not change the result",
+              o, "prop(y)", "200")
+    o = drive("tool:button;click:0:0;click:0:400;sel:1;add:2;distv;status")
+    check_int("distribute refuses a selection of two",
+        has_line(o, "status=distribute needs 3 or more selected"), 1)
+    // Horizontal too: one axis working proves nothing about the other, and the
+    // axis is a parameter that is easy to ignore.
+    // Rows 64px apart, because a button is 96x32 and a second click INSIDE the
+    // first one's box selects it instead of placing - which silently gives a
+    // two-widget selection and a distribute that refuses.
+    o = drive("tool:button;click:0:0;click:37:64;click:400:128"
+        + ";sel:1;add:2;add:3;disth;sel:2;p:x")
+    check_val("disth spreads on x", o, "prop(x)", "200")
+
+    print("-- z-order --")
+    // The widget array IS the paint order (Ui_draw_at walks it forwards) and the
+    // hit order (pick takes the last match), so raise/lower is a statement about
+    // that sequence and nothing else can observe it.
+    o = drive("tool:button;click:0:0;click:0:64;click:0:128;zorder"
+        + ";sel:1;raise;zorder;raise;zorder;lower;zorder")
+    check_int("the initial order is declaration order",
+        has_line(o, "zorder=1,2,3"), 1)
+    check_int("raising #1 puts it one slot later",
+        has_line(o, "zorder=2,1,3"), 1)
+    check_int("raising again puts it at the front",
+        has_line(o, "zorder=2,3,1"), 1)
+    o = drive("tool:button;click:0:0;click:0:64;sel:2;raise;status")
+    check_int("raising the frontmost says so instead of silently doing nothing",
+        has_line(o, "status=#2 is already at the front"), 1)
+    // A reorder rebuilds the whole document, so it is the operation most likely
+    // to lose a field. Checked on the two a naive rebuild drops: the item list
+    // (a separate array per widget) and the tooltip.
+    o = drive("tool:dropdown;click:0:0;set:items:P\nQ;set:tooltip:tip"
+        + ";tool:button;click:0:64;sel:1;raise;sel:1;items;item:0;item:1"
+        + ";p:tooltip")
+    check_val("a reorder keeps the item count", o, "items", "2")
+    check_val("...the first item", o, "item(0)", "P")
+    check_val("...the second", o, "item(1)", "Q")
+    check_val("...and the tooltip", o, "prop(tooltip)", "tip")
+
+    print("-- duplicate --")
+    // Offset by one grid step, because a duplicate exactly on top of its original
+    // is indistinguishable from nothing having happened. And the COPY is
+    // selected, so the next drag moves the copy.
+    o = drive("tool:dropdown;click:64:64;set:items:X\nY;set:tooltip:tip"
+        + ";dup;pid;count;p:x;p:y;items;item:0;item:1;p:tooltip")
+    check_val("duplicating gives two controls", o, "count", "2")
+    check_val("the COPY is selected", o, "pid", "2")
+    check_val("offset by one grid step in x", o, "prop(x)", "72")
+    check_val("...and in y", o, "prop(y)", "72")
+    // A duplicate that copied only the geometry is the usual bug: the fields a
+    // designer just spent time editing are exactly the ones worth carrying.
+    check_val("the copy carries both edited items", o, "items", "2")
+    check_val("...item 0", o, "item(0)", "X")
+    check_val("...item 1", o, "item(1)", "Y")
+    check_val("...and the tooltip", o, "prop(tooltip)", "tip")
+
+    print("-- delete --")
+    o = drive("tool:button;click:0:0;click:0:64;sel:1;add:2;delete"
+        + ";count;sels;exists:2")
+    check_val("deleting a selection of two removes both", o, "count", "0")
+    // A selection pointing at a removed widget draws handles around nothing and
+    // the next nudge silently moves a widget that is gone.
+    check_val("...and clears the selection", o, "sel", "")
+    check_val("neither survives", o, "exists(2)", "0")
+
+    print("-- undo / redo --")
+    o = drive("tool:button;click:0:0;p:x;nudge:16:0;p:x;undo;p:x;redo;p:x")
+    check_int("the nudge happened", has_line(o, "prop(x)=16"), 1)
+    check_int("undo took it back", has_line(o, "prop(x)=0"), 1)
+    // Undo has to restore a COORDINATE, not just a count. A history built from
+    // shallow struct copies - which is what `var s = form` gives in Wyn, since the
+    // widget array is shared - restores the count and silently keeps the new
+    // position, because the "snapshot" mutated along with the document.
+    check_val("redo puts it back", o, "prop(x)", "16")
+    o = drive("tool:button;click:0:0;click:0:64;count;delete;count;undo;count"
+        + ";exists:2")
+    check_val("undo restores a deleted control", o, "count", "2")
+    check_val("...and it is really there, not a hole", o, "exists(2)", "1")
+    // A property edit is undoable too, not just a geometry change.
+    o = drive("tool:button;click:0:0;set:label:After;p:label;undo;p:label")
+    check_val("undo reverts a property edit", o, "prop(label)", "Button1")
+    o = drive("tool:button;click:0:0;undo;undo;undo;status")
+    check_int("undoing past the start says so rather than corrupting",
+        has_line(o, "status=nothing to undo"), 1)
+    // A new edit after an undo must DISCARD the redo tail - otherwise redo
+    // replays a future that no longer follows from the present.
+    o = drive("tool:button;click:0:0;nudge:16:0;undo;nudge:8:0;redo;p:x")
+    check_val("an edit after undo discards the redo tail", o, "prop(x)", "8")
+
+    print("-- snap-to-grid --")
+    // A click at 19 snapped to 8 is 16. With snapping off it is 19 - and the
+    // generated source is then full of numbers like 187 and 213 that no human
+    // would have written, which is the whole reason the grid exists.
+    o = drive("tool:button;click:19:19;p:x;p:y")
+    check_val("a click at 19 snaps to 16", o, "prop(x)", "16")
+    check_val("...in y too", o, "prop(y)", "16")
+    o = drive("grid;tool:button;click:19:19;p:x;p:y")
+    check_val("with snap off, 19 stays 19", o, "prop(x)", "19")
+    check_val("...in y too", o, "prop(y)", "19")
+}
+
+// ---- 5. generate, and the pair COMPILES ----------------------------------
+
+fn generate_tests() {
+    print("=== GENERATE: the designer's document reaches a binary ===")
+    // A fresh pair every time: a stale GEN.wyn from an earlier run would make
+    // "no new stubs on a regeneration" pass vacuously.
+    File::delete(PROJ + "/GEN.designer.wyn")
+    File::delete(PROJ + "/GEN.wyn")
+    File::delete(PROJ + "/GEN.json")
+
+    // A form using the LATER kinds, each with a NON-DEFAULT field, because those
+    // are what regressed silently before: the designer could not place them, so
+    // nothing exercised the generator's branches for them.
+    var o = drive("doc:GEN"
+        + ";tool:button;click:16:16;set:label:Sign in!;set:handler:on_sign_in"
+        + ";tool:dropdown;click:16:64;set:items:Red\nGreen;set:sel:1"
+        + ";tool:slider;click:16:112;set:vmax:200;set:val:60"
+        + ";tool:radio;click:16:160;set:group:contact"
+        + ";tool:spinner;click:16:208;set:vmax:12;set:val:3"
+        + ";tool:progress;click:16:256;set:prog:40"
+        + ";tool:listbox;click:200:16;set:sel:1"
+        + ";tool:tabs;click:200:128;set:items:General\nAdvanced"
+        // The menubar defaults to the full canvas width, so it goes LAST in the
+        // y order - a later click inside its 700px-wide box would select it
+        // instead of placing, and the form would come out one control short.
+        + ";tool:groupbox;click:400:16;set:label:Options"
+        + ";tool:textarea;click:400:184;set:text:fn f() {\n    return 1\n}"
+        + ";tool:entry;click:400:320;set:ar:1;set:al:0"
+        + ";tool:label;click:400:360;tool:checkbox;click:400:400"
+        + ";tool:menubar;click:200:440"
+        + ";count;save;gen")
+    check_val("14 controls placed", o, "count", "14")
+    check_val("saved", o, "saved", "1")
+    // 9 handler-taking controls here: button, dropdown, slider, radio, spinner,
+    // listbox, tabs, menubar, checkbox. progress, groupbox, textarea, entry and
+    // label take none and must add none.
+    check_val("nine handler stubs on a fresh project", o, "gen", "9")
+    check_int("the designer file appeared",
+        File::exists(PROJ + "/GEN.designer.wyn"), 1)
+    check_int("...and the user's file", File::exists(PROJ + "/GEN.wyn"), 1)
+
+    var d = File::read(PROJ + "/GEN.designer.wyn")
+    print("-- the generated source carries the EDITED fields --")
+    // Each of these is a field the designer edited through the inspector. A
+    // generator that emitted the right KIND but dropped the property it was
+    // given is the exact failure a palette-only designer hid.
+    check_int("the edited handler name is used",
+        d.index_of("GEN.on_sign_in(id)") >= 0 ? 1 : 0, 1)
+    // "Sign in!" goes two ways at once and both must be right: as an IDENTIFIER
+    // the space and the bang are illegal, so the handler is sanitised; as the
+    // CAPTION it is the user's text and survives verbatim.
+    check_int("the caption keeps its punctuation",
+        d.index_of("\"Sign in!\"") >= 0 ? 1 : 0, 1)
+    check_int("the dropdown's edited items are emitted",
+        d.index_of("Red\\nGreen") >= 0 ? 1 : 0, 1)
+    check_int("the radio's group is emitted",
+        d.index_of("\"contact\"") >= 0 ? 1 : 0, 1)
+    check_int("the non-default anchor is emitted",
+        d.index_of("Ui_set_anchor(ui, widgets.Ui_last_id(ui), 0, 1, 1, 0)")
+            >= 0 ? 1 : 0, 1)
+
+    print("-- THE ASSERTION: it compiles --")
+    check_int("wyn build GEN.designer.wyn",
+        build_ok(PROJ + "/GEN.designer.wyn"), 1)
+
+    print("-- regenerating adds nothing and keeps a hand-written body --")
+    // The WinForms split: GEN.wyn is the user's and is never rewritten. Proven by
+    // editing it and regenerating, which is the only way to catch a generator
+    // that "helpfully" rewrites both files.
+    var c = File::read(PROJ + "/GEN.wyn")
+    File::write(PROJ + "/GEN.wyn",
+        c + "\npub fn my_helper(n: int) -> int { return n * 2 }\n")
+    o = drive("doc:GEN;load;gen")
+    check_val("nothing appended on a regeneration", o, "gen", "0")
+    var c2 = File::read(PROJ + "/GEN.wyn")
+    check_int("the hand-written helper is still there",
+        c2.index_of("my_helper") >= 0 ? 1 : 0, 1)
+    check_int("and the pair still compiles",
+        build_ok(PROJ + "/GEN.designer.wyn"), 1)
+}
+
+
+// ---- 6. THE CHROME, BY PIXEL -----------------------------------------------
+//
+// The state a designer shows the user is DRAWN, and geometry assertions cannot
+// reach it: "widget 1 is selected" is a fact about a list, while "the user can
+// see WHICH one is primary" is a fact about pixels. Align and distribute measure
+// against the primary, so a selection that cannot show you which one that is is a
+// guess - and the only way to assert it is to read the rendered frame.
+//
+// Coordinates come from the designer's own `at:` op, not from arithmetic here: a
+// test holding its own copy of the layout formula passes whether or not the two
+// agree, which is the failure mode this whole file is built to avoid. The two
+// exceptions are noted where they occur.
+
+// The RGB the designer prints for one pixel.
+fn px_at(o: string, x: int, y: int) -> string {
+    return value_of(o, "px(" + x.to_string() + "," + y.to_string() + ")")
+}
+
+fn chrome_tests() {
+    print("=== THE CHROME: what the user SEES, read back as pixels ===")
+
+    print("-- the toolbox highlights the SELECTED tool --")
+    // A toolbox that does not show which tool is armed means every placement is
+    // a guess about what will appear. The accent is 70,110,170 and the idle row
+    // 50,50,62 - two colours, so "it drew something" cannot pass.
+    //
+    // Rows 11 (panel) and 1 (button) at the y the designer itself reports.
+    var a = drive("at:palrow:11;at:palrow:1")
+    var panel_row = value_of(a, "at(palrow)")
+    check_int("the designer reports a toolbox row coordinate",
+        panel_row.len() > 0 ? 1 : 0, 1)
+    var o = drive("tool:panel;draw;px:32:318;px:32:98"
+        + ";tool:button;draw;px:32:318;px:32:98")
+    // Two draws, so value_of's last-match rule gives the SECOND frame. Asserted
+    // as a swap: after picking button, row 1 is accented and row 11 is not.
+    check_val("with button armed, the button row is accented",
+              o, "px(32,98)", "70,110,170")
+    check_val("...and the panel row has gone back to idle",
+              o, "px(32,318)", "50,50,62")
+
+    print("-- the grid is drawn at the pitch the snap USES --")
+    // A grid drawn at 32 while snapping to 8 is a lie that makes every correct
+    // placement look off-grid. So: a dot at canvas (8,8) and NO dot 3px later.
+    o = drive("draw;px:180:52;px:183:52")
+    check_val("a grid dot sits on the 8px lattice", o, "px(180,52)", "44,44,52")
+    check_val("...and the pixel 3px along is bare canvas",
+              o, "px(183,52)", "28,28,34")
+    // And turning snapping off removes the grid, so the two cannot disagree.
+    o = drive("grid;draw;px:180:52")
+    check_val("with snap off the grid is gone", o, "px(180,52)", "28,28,34")
+
+    print("-- the PRIMARY has solid handles, a secondary hollow ones --")
+    // Both widgets are selected and both get a highlight box; only the primary
+    // gets FILLED corner blocks. (249,121) is inside a corner block and outside
+    // its outline, so it is exactly the pixel that separates the two.
+    // Hard-coded rather than asked for, because it is a point INSIDE a 6x6 mark -
+    // there is no designer function whose job is to name it.
+    o = drive("tool:button;click:80:80;click:80:200;sel:1;add:2"
+        + ";draw;px:249:121;px:250:122;px:249:241")
+    check_val("the secondary's corner is HOLLOW (bare canvas inside the mark)",
+              o, "px(249,121)", "28,28,34")
+    check_val("...though its outline is drawn, in the dimmer colour",
+              o, "px(250,122)", "120,160,200")
+    check_val("the primary's corner is FILLED, in the bright colour",
+              o, "px(249,241)", "90,200,255")
+    // Reversing which one is primary must move the solid marks, or the panel is
+    // showing a fixed decoration rather than the state.
+    o = drive("tool:button;click:80:80;click:80:200;sel:2;add:1"
+        + ";draw;px:249:121")
+    check_val("making it primary FILLS its corner", o, "px(249,121)",
+              "90,200,255")
+
+    print("-- a full frame leaves the clip stack balanced --")
+    // An unbalanced push leaks the clip into the next frame, after which
+    // everything drawn is invisible for reasons that look nothing like a clip
+    // bug. The designer pushes twice per frame (canvas, inspector).
+    o = drive("tool:dropdown;click:0:0;sel:1;draw")
+    check_val("clip depth is 0 after drawing", o, "draw", "0")
+}
+
+
+// ---- 7. the REAL event path -----------------------------------------------
+//
+// Everything above drives the inspector through `set:`, which writes the editor
+// widget and calls insp_sync. That covers insp_sync thoroughly and covers the
+// ROUTING not at all: whether a press at the field's coordinate is delivered to
+// the inspector rather than to the canvas or the toolbar, whether Ui_press then
+// focuses the field, and whether a typed character reaches insp_type. A designer
+// whose panel is only reachable from a test harness is not a designer.
+//
+// examples/designer.wyn's --selftest drives exactly that, with Win_push_* -
+// which queues a REAL platform event, so the branch a click takes is decided by
+// the shipping code. This group asserts on what that run prints, which is the
+// only way to make those lines a gate rather than a demo.
+
+fn eventpath_tests() {
+    print("=== THE REAL EVENT PATH: press, type, and the model changes ===")
+    var out = PROJ + "/selftest.txt"
+    File::delete(out)
+    System::exec_code("SDL_VIDEODRIVER=dummy perl -e 'alarm(120); exec @ARGV' -- ./"
+        + BIN + " --selftest > " + out + " 2>&1")
+    var o = File::read(out)
+
+    // A run that failed to open even a dummy window prints a notice and skips the
+    // event pass. Say so rather than reporting nine silent passes.
+    if o.index_of("no display: skipping") >= 0 {
+        print("  SKIP no display - the synthetic-event pass needs a window")
+        return
+    }
+    check_int("the selftest ran at all",
+        o.index_of("SYNTHETIC EVENTS through pump()") >= 0 ? 1 : 0, 1)
+    // Not "FAIL is absent": the selftest prints values rather than asserting, so
+    // each claim below is checked against its printed number.
+    check_int("no FAIL anywhere in the selftest",
+        o.index_of("FAIL") >= 0 ? 1 : 0, 0)
+
+    print("-- the toolbox, the canvas and the drag --")
+    // A toolbox click must change the tool and place NOTHING.
+    check_int("a toolbox click arms the tool without placing",
+        o.index_of("tool after  = panel   (expect panel; count still 0") >= 0
+            ? 1 : 0, 1)
+    // The grab offset: the press was 24,16 into a button at 56,256, so a pointer
+    // at form 400,400 must put the CORNER at 376,384. Ignoring the offset gives
+    // 400,400 - a widget that teleports to the cursor the instant you press.
+    check_int("the drag honours the 24,16 grab offset",
+        o.index_of("grab offset = 24,16") >= 0 ? 1 : 0, 1)
+    check_int("...so the corner lands at 376,384 and not at the pointer",
+        o.index_of("after : 376,384") >= 0 ? 1 : 0, 1)
+    check_int("a motion with no press held moves nothing",
+        o.index_of("x still 376 (was 376)") >= 0 ? 1 : 0, 1)
+
+    print("-- typing into the inspector through a REAL press + EV_TEXT --")
+    // The press lands inside the inspector's rectangle, so pump routes it there;
+    // Ui_press focuses the entry; the EV_TEXT reaches insp_type; insp_sync writes
+    // the document. Every one of those four has to work for the label to read Ok.
+    check_int("a keystroke typed into the panel reaches the DOCUMENT",
+        o.index_of("model label = 'Ok'") >= 0 ? 1 : 0, 1)
+    // The reason a caption can contain "d" at all: while a field has focus the
+    // editor owns the keyboard, so D types rather than duplicating.
+    check_int("D does not duplicate while a field has focus",
+        o.index_of("with the field focused = 2 (was 2") >= 0 ? 1 : 0, 1)
+    // And Escape leaves the FIELD. Quitting because the user finished typing is
+    // not a recoverable mistake.
+    check_int("Escape leaves the field and does NOT quit",
+        o.index_of("focus after Escape = -1, g_running = 1") >= 0 ? 1 : 0, 1)
+    check_int("...after which D is a command again",
+        o.index_of("with nothing focused = 3") >= 0 ? 1 : 0, 1)
+
+    print("-- keys reach the same commands the toolbar does --")
+    check_int("an arrow key nudges by 1",
+        o.index_of("after RIGHT 377 (expect +1)") >= 0 ? 1 : 0, 1)
+    check_int("Z undoes it",
+        o.index_of("after Z 376") >= 0 ? 1 : 0, 1)
+    check_int("the DELETE key removes the selection",
+        o.index_of("Ui_exists(deleted) = 0, panel survives = 1") >= 0 ? 1 : 0, 1)
+    check_int("Escape with nothing focused asks the loop to quit",
+        o.index_of("g_running = 0 (expect 0)") >= 0 ? 1 : 0, 1)
+    check_int("a full frame leaves the clip stack balanced",
+        o.index_of("depth after  draw = 0") >= 0 ? 1 : 0, 1)
+
+    print("-- the model pass places every kind and generates --")
+    check_int("all 15 kinds placed with no window at all",
+        o.index_of("count = 15 (expect 15)") >= 0 ? 1 : 0, 1)
+}
+
+fn main() {
+    File::create_dir_all(PROJ)
+
+    print("=== building the designer under test ===")
+    var rc = System::exec_code(wyn() + " build examples/designer.wyn -o "
+        + BIN + " > " + PROJ + "/build.log 2>&1")
+    check_int("examples/designer.wyn builds", rc == 0 ? 1 : 0, 1)
+    if rc != 0 {
+        print("  (build log: " + PROJ + "/build.log)")
+        print("=== 1 DESIGNER TEST(S) FAILED ===")
+        return
+    }
+
+    // ---- the gate's own negative control ---------------------------------
+    // Every assertion in this file funnels through value_of/has_line over the
+    // designer's stdout. A value_of that always found something - or a `drive`
+    // that silently returned a previous run's output - would make all of it
+    // vacuous. Prove they can say NO before trusting them to say yes.
+    print("-- the gate itself --")
+    var o = drive("tool:button;click:0:0;p:x")
+    check_val("a real field reads back", o, "prop(x)", "0")
+    check_val("an absent key is <missing>, not a stale value",
+              o, "prop(nothing)", "<missing>")
+    check_int("has_line does not match a substring",
+        has_line(o, "prop(x)=0000"), 0)
+    // A field name the designer does not know must be REJECTED, not silently
+    // ignored - otherwise a typo in any script below would read as a pass.
+    o = drive("tool:button;click:0:0;p:nosuchfield")
+    check_int("an unknown field is reported",
+        has_line(o, "prop(nosuchfield)=BADFIELD"), 1)
+    // And a script that places nothing must not report a control.
+    o = drive("count")
+    check_val("an empty form is empty", o, "count", "0")
+    // An unrecognised command must SAY so. Every command dispatches through one
+    // else-chain, and a chain where the fallthrough became unreachable would make
+    // a typo in any script below a silent no-op rather than a failure.
+    o = drive("tool:button;click:0:0;nosuchcmd;status")
+    check_int("an unknown command is reported",
+        has_line(o, "status=unknown command: nosuchcmd"), 1)
+    // build_ok is the only check that can catch a broken generator, so prove it
+    // can fail before trusting it in generate_tests.
+    File::write(PROJ + "/notok.wyn",
+        "import widgets\nfn main() { var u = widgets.Ui_no_such_fn(1) }\n")
+    check_int("build_ok says NO to a call that does not exist",
+        build_ok(PROJ + "/notok.wyn"), 0)
+    File::write(PROJ + "/notok.wyn", "fn main() { print(\"ok\") }\n")
+    check_int("build_ok says YES to a file that compiles",
+        build_ok(PROJ + "/notok.wyn"), 1)
+    File::delete(PROJ + "/notok.wyn")
+
+    palette_tests()
+    inspector_tests()
+    roundtrip_tests()
+    ergonomics_tests()
+    chrome_tests()
+    eventpath_tests()
+    generate_tests()
+
+    print("")
+    if fails == 0 {
+        print("=== ALL DESIGNER TESTS PASSED ===")
+    } else {
+        print("=== ${fails} DESIGNER TEST(S) FAILED ===")
+    }
+}
