@@ -248,9 +248,8 @@ fn main() {
     // project is stuck broken with no way back from the designer.
     File::write(cpath(), "// emptied\n")
     var n3 = codegen.Form_generate(ui, PROJ)
-    // Re-stubbing an emptied Form1.wyn restores every handler. The count is 11,
-    // one more than the 10 handler-taking widgets: the emptied-file path adds the
-    // same +1 the original test encoded (it asserted 3 fresh but 4 re-stubbed).
+    // Re-stubbing an emptied Form1.wyn restores every handler: 11, because the
+    // "Help" button added above brought the handler-taking count from 10 to 11.
     check_int("all handlers re-stubbed", n3, 11)
     check_int("compiles again from an emptied code file", build_ok(dpath()), 1)
 
@@ -262,7 +261,7 @@ fn main() {
     var n4 = codegen.Form_generate(ui, PROJ)
     var c4 = File::read(cpath())
     check_int("on_remember was not re-added", count_of(c4, "fn on_remember("), 1)
-    // The other ten handlers (11 total minus on_remember, still present) are.
+    // The other ten are re-added (11 handler widgets minus on_remember, present).
     check_int("the other ten were", n4, 10)
 
     print("")
