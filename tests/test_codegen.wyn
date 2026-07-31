@@ -93,6 +93,22 @@ fn build_form() -> Ui {
     ui = widgets.Ui_textarea(ui,
         "fn f(x: int) -> int {\n    return x * 2\n}", 16, 170, 300, 120)
     ui = widgets.Ui_panel(ui, 340, 170, 120, 120)
+
+    // One of every LATER kind too, so the gate compiles the calls the generator
+    // emits for each. These are what regressed silently before: Form_generate
+    // emitted nothing for them, so a form using them generated a .designer.wyn
+    // that had simply lost its dropdown, slider, listbox and the rest. Each
+    // carries a NON-default field (a chosen index, a range, a value) so the
+    // emitted call has to reproduce that field, not just the kind.
+    ui = widgets.Ui_radio(ui, "Email", "contact", 340, 16, 1, noop)
+    ui = widgets.Ui_dropdown(ui, "Red\nGreen\nBlue", 340, 40, 120, 26, 2, noop)
+    ui = widgets.Ui_slider(ui, 340, 76, 120, 20, 0, 200, 5, 60, noop)
+    ui = widgets.Ui_progress(ui, 340, 104, 120, 12, 0.4)
+    ui = widgets.Ui_listbox(ui, "One\nTwo\nThree", 480, 16, 120, 80, 1, noop)
+    ui = widgets.Ui_tabs(ui, "General\nAdvanced", 16, 300, 300, 24, 1, noop)
+    ui = widgets.Ui_groupbox(ui, "Options", 16, 330, 300, 120)
+    ui = widgets.Ui_spinner(ui, 340, 130, 120, 26, 1, 10, 1, 3, noop)
+    ui = widgets.Ui_menubar(ui, "File\nEdit\nView", 0, 0, 640, 24, noop)
     return ui
 }
 
@@ -134,7 +150,11 @@ fn main() {
 
     // ---- first generation: both files appear -----------------------------
     var added = codegen.Form_generate(ui, PROJ)
-    check_int("stubs appended on a fresh project", added, 3)
+    // 10 handler-taking widgets, so 10 stubs on a fresh project: 2 buttons +
+    // checkbox from the original set, plus radio/dropdown/slider/listbox/tabs/
+    // spinner/menubar. label, entry, textarea, panel, PROGRESS and GROUPBOX take
+    // no handler and add none.
+    check_int("stubs appended on a fresh project", added, 10)
     check_int("Form1.designer.wyn exists", File::exists(dpath()), 1)
     check_int("Form1.wyn exists", File::exists(cpath()), 1)
 
@@ -161,6 +181,30 @@ fn main() {
     // Only ONE anchor line: the other six widgets are on the default and must
     // not each carry a no-op call.
     check_int("default anchors are NOT emitted", count_of(d1, "Ui_set_anchor"), 1)
+
+    // The nine later kinds must be emitted WITH their non-default fields, not
+    // dropped. Before this, Form_generate had no case for them and a form using
+    // them silently lost the widget. Assert the field, not just the kind, so a
+    // constructor that emits the wrong argument is caught too.
+    print("-- the later widget kinds generate, with their fields --")
+    check_int("radio carries its group",
+        d1.index_of("Ui_radio(ui, \"Email\", \"contact\"") >= 0 ? 1 : 0, 1)
+    check_int("dropdown carries its chosen index",
+        d1.index_of("Ui_dropdown(ui, \"Red\\nGreen\\nBlue\", 340, 40, 120, 26, 2,") >= 0 ? 1 : 0, 1)
+    check_int("slider carries its range and value",
+        d1.index_of("Ui_slider(ui, 340, 76, 120, 20, 0, 200, 5, 60,") >= 0 ? 1 : 0, 1)
+    check_int("progress carries its fraction",
+        d1.index_of("Ui_progress(ui, 340, 104, 120, 12, 0.4") >= 0 ? 1 : 0, 1)
+    check_int("listbox carries its selection",
+        d1.index_of("Ui_listbox(ui, \"One\\nTwo\\nThree\", 480, 16, 120, 80, 1,") >= 0 ? 1 : 0, 1)
+    check_int("tabs carries its active page",
+        d1.index_of("Ui_tabs(ui, \"General\\nAdvanced\", 16, 300, 300, 24, 1,") >= 0 ? 1 : 0, 1)
+    check_int("groupbox carries its title",
+        d1.index_of("Ui_groupbox(ui, \"Options\"") >= 0 ? 1 : 0, 1)
+    check_int("spinner carries its range and value",
+        d1.index_of("Ui_spinner(ui, 340, 130, 120, 26, 1, 10, 1, 3,") >= 0 ? 1 : 0, 1)
+    check_int("menubar carries its spec",
+        d1.index_of("Ui_menubar(ui, \"File\\nEdit\\nView\"") >= 0 ? 1 : 0, 1)
 
     print("-- THE assertion: the generated pair compiles --")
     check_int("wyn build Form1.designer.wyn", build_ok(dpath()), 1)
@@ -204,7 +248,10 @@ fn main() {
     // project is stuck broken with no way back from the designer.
     File::write(cpath(), "// emptied\n")
     var n3 = codegen.Form_generate(ui, PROJ)
-    check_int("all four handlers re-stubbed", n3, 4)
+    // Re-stubbing an emptied Form1.wyn restores every handler. The count is 11,
+    // one more than the 10 handler-taking widgets: the emptied-file path adds the
+    // same +1 the original test encoded (it asserted 3 fresh but 4 re-stubbed).
+    check_int("all handlers re-stubbed", n3, 11)
     check_int("compiles again from an emptied code file", build_ok(dpath()), 1)
 
     print("-- a handler that is NOT pub is left alone, not duplicated --")
@@ -215,7 +262,8 @@ fn main() {
     var n4 = codegen.Form_generate(ui, PROJ)
     var c4 = File::read(cpath())
     check_int("on_remember was not re-added", count_of(c4, "fn on_remember("), 1)
-    check_int("the other three were", n4, 3)
+    // The other ten handlers (11 total minus on_remember, still present) are.
+    check_int("the other ten were", n4, 10)
 
     print("")
     if fails == 0 {

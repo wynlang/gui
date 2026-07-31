@@ -101,7 +101,33 @@ pub fn quote(s: string) -> string {
 pub fn takes_handler(kind: int) -> int {
     if kind == widgets.KIND_BUTTON { return 1 }
     if kind == widgets.KIND_CHECKBOX { return 1 }
+    if kind == widgets.KIND_RADIO { return 1 }
+    if kind == widgets.KIND_DROPDOWN { return 1 }
+    if kind == widgets.KIND_SLIDER { return 1 }
+    if kind == widgets.KIND_LISTBOX { return 1 }
+    if kind == widgets.KIND_TABS { return 1 }
+    if kind == widgets.KIND_SPINNER { return 1 }
+    if kind == widgets.KIND_MENUBAR { return 1 }
     return 0
+}
+
+// Reassemble a widget's item list as the newline-delimited string its
+// constructor takes. The model stores items as a real list (so a document can
+// round-trip one containing a newline), but Ui_dropdown/Ui_listbox/Ui_tabs take
+// the toolkit's delimited form, so a generated call must join them back. An item
+// that itself contains a newline cannot survive this join and is the toolkit
+// API's documented limit, not this generator's - the same limit a hand-written
+// call would hit.
+fn items_joined(ui: Ui, i: int) -> string {
+    var n = widgets.Ui_item_count_at(ui, i)
+    var out = ""
+    var k = 0
+    while k < n {
+        if k > 0 { out = out + "\n" }
+        out = out + widgets.Ui_item_at(ui, i, k)
+        k = k + 1
+    }
+    return out
 }
 
 // The handler name for widget i: the document's own if it has one, otherwise
@@ -152,6 +178,64 @@ fn ctor_line(ui: Ui, i: int) -> string {
     if kind == widgets.KIND_PANEL {
         return "    ui = widgets.Ui_panel(ui, " + x + ", " + y
             + ", " + w + ", " + h + ")\n"
+    }
+    if kind == widgets.KIND_RADIO {
+        return "    ui = widgets.Ui_radio(ui, " + label
+            + ", " + quote(widgets.Ui_group_at(ui, i))
+            + ", " + x + ", " + y
+            + ", " + widgets.Ui_checked_at(ui, i).to_string()
+            + ", " + hw + ")\n"
+    }
+    if kind == widgets.KIND_DROPDOWN {
+        return "    ui = widgets.Ui_dropdown(ui, " + quote(items_joined(ui, i))
+            + ", " + x + ", " + y + ", " + w + ", " + h
+            + ", " + widgets.Ui_sel_at(ui, i).to_string()
+            + ", " + hw + ")\n"
+    }
+    if kind == widgets.KIND_SLIDER {
+        return "    ui = widgets.Ui_slider(ui, " + x + ", " + y + ", " + w + ", " + h
+            + ", " + widgets.Ui_vmin_at(ui, i).to_string()
+            + ", " + widgets.Ui_vmax_at(ui, i).to_string()
+            + ", " + widgets.Ui_vstep_at(ui, i).to_string()
+            + ", " + widgets.Ui_val_at(ui, i).to_string()
+            + ", " + hw + ")\n"
+    }
+    if kind == widgets.KIND_PROGRESS {
+        // Progress carries no handler and its value is a 0..1 float; the model
+        // stores it as the 0..1000 int Ui_val, so divide back to the float the
+        // constructor takes.
+        var frac = (widgets.Ui_val_at(ui, i).to_float() / 1000.0).to_string()
+        return "    ui = widgets.Ui_progress(ui, " + x + ", " + y + ", " + w + ", " + h
+            + ", " + frac + ")\n"
+    }
+    if kind == widgets.KIND_LISTBOX {
+        return "    ui = widgets.Ui_listbox(ui, " + quote(items_joined(ui, i))
+            + ", " + x + ", " + y + ", " + w + ", " + h
+            + ", " + widgets.Ui_sel_at(ui, i).to_string()
+            + ", " + hw + ")\n"
+    }
+    if kind == widgets.KIND_TABS {
+        return "    ui = widgets.Ui_tabs(ui, " + quote(items_joined(ui, i))
+            + ", " + x + ", " + y + ", " + w + ", " + h
+            + ", " + widgets.Ui_sel_at(ui, i).to_string()
+            + ", " + hw + ")\n"
+    }
+    if kind == widgets.KIND_GROUPBOX {
+        return "    ui = widgets.Ui_groupbox(ui, " + label
+            + ", " + x + ", " + y + ", " + w + ", " + h + ")\n"
+    }
+    if kind == widgets.KIND_SPINNER {
+        return "    ui = widgets.Ui_spinner(ui, " + x + ", " + y + ", " + w + ", " + h
+            + ", " + widgets.Ui_vmin_at(ui, i).to_string()
+            + ", " + widgets.Ui_vmax_at(ui, i).to_string()
+            + ", " + widgets.Ui_vstep_at(ui, i).to_string()
+            + ", " + widgets.Ui_val_at(ui, i).to_string()
+            + ", " + hw + ")\n"
+    }
+    if kind == widgets.KIND_MENUBAR {
+        return "    ui = widgets.Ui_menubar(ui, " + quote(items_joined(ui, i))
+            + ", " + x + ", " + y + ", " + w + ", " + h
+            + ", " + hw + ")\n"
     }
     return "    // unsupported kind " + kind.to_string() + "\n"
 }
