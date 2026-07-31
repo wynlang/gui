@@ -238,7 +238,33 @@ pub struct Ui {
     // Separate from `active` because a slider tracks the pointer while it is
     // down - a mouse-move with `drag` set changes the value, whereas `active` on
     // a button only decides whether the release counts as a click.
-    drag: int
+    drag: int,
+
+    // ---- unconsumed keys (application keyboard shortcuts) ----------------
+    //
+    // WHY THE TOOLKIT HAS TO HAND KEYS BACK, rather than the app reading the
+    // queue itself. `Ui_events` DRAINS the platform queue, so a second reader
+    // sees nothing - which is why WynCanvas had zero keyboard shortcuts and
+    // documented modifier-less selection ops as a consequence. An app cannot fix
+    // that from outside: by the time it looks, the events are gone.
+    //
+    // So keys the widgets did not want are recorded here instead of dropped, and
+    // the app drains them AFTER Ui_events with Ui_shortcut_count/Ui_shortcut_at.
+    // "Did not want" is exactly `focus_owns_key` plus the toolkit's own Tab and
+    // Escape - the same predicate that already decided routing, so a key can
+    // never be both delivered to a widget and offered as a shortcut. Typing "s"
+    // into a focused text field must not also mean Save.
+    //
+    // An array rather than one slot because a frame can carry several keystrokes
+    // and a fast typist must not lose any; it is cleared at the START of each
+    // Ui_events so a shortcut fires once, not forever.
+    keys: [int],
+
+    // Modifier state sampled when the key was recorded, one entry per `keys`
+    // entry. Sampled rather than polled by the app because by the time the app
+    // drains the queue the user may have released Cmd, which would turn Cmd+Z
+    // into a bare Z - the difference between Undo and nothing.
+    key_mods: [int]
 }
 
 fn noop_handler(id: int) { }
@@ -498,7 +524,9 @@ pub fn Ui_new(win: int, font: int) -> Ui {
         accent_r: 70, accent_g: 110, accent_b: 170,
         tooltip_delay: 600,
         fake_now: 0,
-        drag: 0 - 1
+        drag: 0 - 1,
+        keys: [],
+        key_mods: []
     }
 }
 
@@ -3280,6 +3308,46 @@ fn focus_owns_key(ui: Ui, key: int) -> int {
 // Escape (Escape in a menu closes the menu, it does not quit the program), then
 // the focused widget owns its own keys, then Tab moves the focus, then Escape
 // quits.
+// Read the live modifier state as a KMOD_* bitmask.
+//
+// Polled with Win_key_down rather than taken from the event, because the platform
+// reports a key's modifiers only for TEXT events; a raw EV_KEY_DOWN carries just
+// the scancode. Polling at record time is correct: the modifier is physically
+// held while its key is pressed, which is the instant this runs.
+//
+// Both sides of every modifier are tested - see the RSHIFT comment in gui.wyn.
+fn live_mods() -> int {
+    var m = 0
+    if gui.Win_key_down(gui.SCANCODE_LSHIFT) == 1 { m = m + gui.KMOD_SHIFT }
+    else { if gui.Win_key_down(gui.SCANCODE_RSHIFT) == 1 { m = m + gui.KMOD_SHIFT } }
+    if gui.Win_key_down(gui.SCANCODE_LCTRL) == 1 { m = m + gui.KMOD_CTRL }
+    else { if gui.Win_key_down(gui.SCANCODE_RCTRL) == 1 { m = m + gui.KMOD_CTRL } }
+    if gui.Win_key_down(gui.SCANCODE_LALT) == 1 { m = m + gui.KMOD_ALT }
+    else { if gui.Win_key_down(gui.SCANCODE_RALT) == 1 { m = m + gui.KMOD_ALT } }
+    if gui.Win_key_down(gui.SCANCODE_LGUI) == 1 { m = m + gui.KMOD_GUI }
+    else { if gui.Win_key_down(gui.SCANCODE_RGUI) == 1 { m = m + gui.KMOD_GUI } }
+    return m
+}
+
+// Record a key no widget claimed, for the application to read as a shortcut.
+//
+// A modifier key is never itself offered: "the user pressed Shift" is not a
+// shortcut, and recording it would make every real chord arrive as two entries.
+fn record_shortcut(ui: Ui, key: int) -> Ui {
+    var u = ui
+    if key == gui.SCANCODE_LSHIFT { return u }
+    if key == gui.SCANCODE_RSHIFT { return u }
+    if key == gui.SCANCODE_LCTRL { return u }
+    if key == gui.SCANCODE_RCTRL { return u }
+    if key == gui.SCANCODE_LALT { return u }
+    if key == gui.SCANCODE_RALT { return u }
+    if key == gui.SCANCODE_LGUI { return u }
+    if key == gui.SCANCODE_RGUI { return u }
+    u.keys.push(key)
+    u.key_mods.push(live_mods())
+    return u
+}
+
 pub fn Ui_key(ui: Ui, key: int) -> Ui {
     var u = ui
     if key == gui.SCANCODE_ESCAPE {
@@ -3293,8 +3361,92 @@ pub fn Ui_key(ui: Ui, key: int) -> Ui {
         u = Ui_focus_next(u, 1)
         return blur_commit(u, was)
     }
+    // A FOCUSED text field swallows ordinary keys even though focus_owns_key said
+    // no. It returns 0 for a plain letter because the letter arrives as a TEXT
+    // event, not this one - so without this guard, typing "s" in a filename box
+    // would ALSO fire the app's Save shortcut. Modified chords are still offered:
+    // Cmd+S while typing is Save in every editor.
+    if u.focus != -1 {
+        var fk = Ui_kind_of(u, u.focus)
+        if fk == KIND_ENTRY or fk == KIND_TEXTAREA or fk == KIND_SPINNER {
+            if live_mods() == gui.KMOD_NONE { return u }
+        }
+    }
+    // Escape still stops the app, but is ALSO offered as a shortcut first so an
+    // app can give it a meaning (cancel the marquee) instead of quitting.
+    u = record_shortcut(u, key)
     if key == gui.SCANCODE_ESCAPE { u.running = 0 }
     return u
+}
+
+// ---- application keyboard shortcuts --------------------------------------
+//
+// Drain these AFTER Ui_events, each frame:
+//
+//     ui = widgets.Ui_events(ui)
+//     var k = 0
+//     while k < widgets.Ui_shortcut_count(ui) {
+//         var key = widgets.Ui_shortcut_at(ui, k)
+//         var mod = widgets.Ui_shortcut_mod_at(ui, k)
+//         if key == gui.SCANCODE_Z and widgets.Ui_mod_is_cmd(mod) == 1 { ... }
+//         k = k + 1
+//     }
+//
+// Accessors rather than exposing `ui.keys` because an app in another repository
+// reaching into a field cannot survive a rename - the same argument WynCanvas's
+// src/ui.wyn makes for Ui_x_at over ui.widgets[i].x.
+
+// How many keys this frame's Ui_events collected that no widget wanted.
+pub fn Ui_shortcut_count(ui: Ui) -> int {
+    return ui.keys.len()
+}
+
+// The i'th unclaimed scancode, or -1 if i is out of range.
+pub fn Ui_shortcut_at(ui: Ui, i: int) -> int {
+    if i < 0 { return 0 - 1 }
+    if i >= ui.keys.len() { return 0 - 1 }
+    return ui.keys[i]
+}
+
+// The KMOD_* bitmask that was held when the i'th key was pressed.
+pub fn Ui_shortcut_mod_at(ui: Ui, i: int) -> int {
+    if i < 0 { return 0 }
+    if i >= ui.key_mods.len() { return 0 }
+    return ui.key_mods[i]
+}
+
+// Was a given modifier held? A helper per modifier rather than making every
+// caller write `mod % 2` style bit arithmetic, which is where a shortcut table
+// silently gets its precedence wrong.
+pub fn Ui_mod_shift(m: int) -> int {
+    if m / gui.KMOD_SHIFT % 2 == 1 { return 1 }
+    return 0
+}
+
+pub fn Ui_mod_ctrl(m: int) -> int {
+    if m / gui.KMOD_CTRL % 2 == 1 { return 1 }
+    return 0
+}
+
+pub fn Ui_mod_alt(m: int) -> int {
+    if m / gui.KMOD_ALT % 2 == 1 { return 1 }
+    return 0
+}
+
+pub fn Ui_mod_gui(m: int) -> int {
+    if m / gui.KMOD_GUI % 2 == 1 { return 1 }
+    return 0
+}
+
+// "The platform's menu-shortcut modifier is held" - Cmd on macOS, Ctrl
+// elsewhere. THE POINT OF THIS FUNCTION is that an app must not hard-code
+// either: binding Ctrl+S on a Mac is wrong, and binding Cmd+S on Linux is
+// wrong. Accepting EITHER is deliberate, so a user's muscle memory from another
+// platform still works and a test can drive one of them on any host.
+pub fn Ui_mod_is_cmd(m: int) -> int {
+    if Ui_mod_gui(m) == 1 { return 1 }
+    if Ui_mod_ctrl(m) == 1 { return 1 }
+    return 0
 }
 
 // ---- events --------------------------------------------------------------
@@ -3307,6 +3459,11 @@ pub fn Ui_key(ui: Ui, key: int) -> Ui {
 // toolkit treats as a cancel.
 pub fn Ui_events(ui: Ui) -> Ui {
     var u = ui
+    // Last frame's unclaimed keys expire HERE, at the start of the drain that
+    // will collect this frame's. Clearing at the end instead would hand the app
+    // an always-empty list; never clearing would make one Cmd+Z undo forever.
+    u.keys = []
+    u.key_mods = []
     var ev = gui.Win_poll_event()
     while ev != gui.EV_NONE {
         if ev == gui.EV_QUIT {

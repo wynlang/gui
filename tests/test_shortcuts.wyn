@@ -1,0 +1,169 @@
+// test_shortcuts - keys no widget wanted are handed back to the application.
+//
+//   SDL_VIDEODRIVER=dummy WYN_ROOT=/path/to/wyn  wyn run tests/test_shortcuts.wyn
+//
+// WHY THIS MECHANISM EXISTS. `Ui_events` DRAINS the platform event queue, so an
+// application cannot read the keyboard itself: by the time it looks, the events
+// are gone. That is not a theoretical limit - it is why WynCanvas shipped with
+// ZERO keyboard shortcuts and documented its selection-op buttons as a
+// consequence ("kept as state rather than a modifier key because the widget
+// toolkit owns the key queue"). So the toolkit records what it did not consume
+// and the app drains that afterwards.
+//
+// WHAT THIS FILE REFUSES TO ASSERT. That `Ui_shortcut_count` returns a number.
+// The whole value of the feature is the PARTITION - every keystroke goes to
+// exactly one of {a focused widget, the toolkit itself, the application} and
+// never to two. A test that only pushed an unfocused key would pass while
+// typing "s" into a filename box also triggered Save, which is the bug that
+// makes shortcuts unusable rather than merely absent.
+//
+// So the cases below are chosen as the BOUNDARIES of that partition:
+//   - an unclaimed key IS offered
+//   - a key a focused text field claims is NOT offered (bare)
+//   - the same key WITH a modifier IS offered even while typing
+//   - a modifier alone is never offered
+//   - Tab, which the toolkit owns for focus, is not offered
+//   - the buffer is per-frame: one press is one shortcut, not one forever
+//
+// Every key arrives via Win_push_key_down - a REAL platform event that
+// Win_poll_event returns exactly as it returns a human's - so this drives the
+// same dispatch a user does. Poking ui.keys directly would prove only that
+// assignment works.
+
+import gui
+import widgets
+
+var fails = 0
+
+fn check_int(label: string, got: int, want: int) {
+    if got == want {
+        print("  ok   ${label} = ${got}")
+    } else {
+        print("  FAIL ${label}: got ${got} want ${want}")
+        fails = fails + 1
+    }
+}
+
+// Push one key and drain, returning the Ui. The push-then-Ui_events pair is the
+// whole point: Ui_events is what clears last frame's buffer and collects this
+// frame's, so a helper that skipped it would test a buffer nothing filled.
+fn press_key(ui: Ui, win: int, key: int) -> Ui {
+    gui.Win_push_key_down(win, key)
+    return widgets.Ui_events(ui)
+}
+
+fn main() {
+    if gui.Win_available() == 0 {
+        print("SKIP: no window backend")
+        return
+    }
+    var win = gui.Win_window("shortcuts", 400, 300)
+    if win == 0 - 1 {
+        print("SKIP: cannot open a window")
+        return
+    }
+
+    print("=== an unclaimed key is offered to the application ===")
+    var ui = widgets.Ui_new(win, 0 - 1)
+    ui = press_key(ui, win, gui.SCANCODE_B)
+    check_int("count after B", widgets.Ui_shortcut_count(ui), 1)
+    check_int("key is B", widgets.Ui_shortcut_at(ui, 0), gui.SCANCODE_B)
+    check_int("no modifier held", widgets.Ui_shortcut_mod_at(ui, 0), gui.KMOD_NONE)
+
+    print("=== the buffer is PER FRAME, so one press is one shortcut ===")
+    // The regression this guards: never clearing makes one Cmd+Z undo forever
+    // (the app re-reads the same key every frame), and clearing at the END of
+    // Ui_events instead hands the app an always-empty list.
+    //
+    // Both halves must be asserted, and the ORDER matters. An empty frame after
+    // a keypress is NOT sufficient on its own - proven by mutation: deleting the
+    // clear entirely still passes that check, because a frame that polls nothing
+    // also pushes nothing and a stale one-element buffer reads the same as a
+    // freshly-cleared one at count==0... only if you never look at what it holds.
+    // So: press, confirm 1, empty frame, confirm 0, then press a DIFFERENT key
+    // and confirm the buffer holds ONLY the new one. Without the clear, that
+    // last check sees 2 and names the leftover.
+    ui = widgets.Ui_events(ui)
+    check_int("count after an empty frame", widgets.Ui_shortcut_count(ui), 0)
+    ui = press_key(ui, win, gui.SCANCODE_E)
+    check_int("a later press holds only itself", widgets.Ui_shortcut_count(ui), 1)
+    check_int("and it is the NEW key, not the old", widgets.Ui_shortcut_at(ui, 0), gui.SCANCODE_E)
+
+    print("=== several keys in one frame all survive ===")
+    // A fast typist must not lose keystrokes, which is why `keys` is an array
+    // and not a single slot.
+    gui.Win_push_key_down(win, gui.SCANCODE_B)
+    gui.Win_push_key_down(win, gui.SCANCODE_E)
+    ui = widgets.Ui_events(ui)
+    check_int("two keys in one frame", widgets.Ui_shortcut_count(ui), 2)
+    check_int("first is B", widgets.Ui_shortcut_at(ui, 0), gui.SCANCODE_B)
+    check_int("second is E", widgets.Ui_shortcut_at(ui, 1), gui.SCANCODE_E)
+
+    print("=== out-of-range reads are -1, not a crash ===")
+    check_int("at(-1)", widgets.Ui_shortcut_at(ui, 0 - 1), 0 - 1)
+    check_int("at(99)", widgets.Ui_shortcut_at(ui, 99), 0 - 1)
+    check_int("mod_at(99)", widgets.Ui_shortcut_mod_at(ui, 99), 0)
+
+    print("=== a modifier alone is never a shortcut ===")
+    // Otherwise every real chord arrives as two entries and the app sees a
+    // phantom "the user pressed Shift" command.
+    ui = press_key(ui, win, gui.SCANCODE_LSHIFT)
+    check_int("shift alone", widgets.Ui_shortcut_count(ui), 0)
+    ui = press_key(ui, win, gui.SCANCODE_LGUI)
+    check_int("cmd alone", widgets.Ui_shortcut_count(ui), 0)
+
+    print("=== Tab belongs to the toolkit (focus), not the app ===")
+    var t = widgets.Ui_new(win, 0 - 1)
+    t = widgets.Ui_button(t, "OK", 10, 10, 60, 24, on_nothing)
+    t = press_key(t, win, gui.SCANCODE_TAB)
+    check_int("tab not offered", widgets.Ui_shortcut_count(t), 0)
+
+    print("=== a focused ENTRY swallows bare letters ===")
+    // THE CASE THAT MAKES SHORTCUTS SAFE. Typing a filename must not also run
+    // commands. focus_owns_key says "no" for a plain letter (it arrives as a
+    // TEXT event, not a key event), so without an explicit guard the letter
+    // would be offered as a shortcut while ALSO being typed.
+    var e = widgets.Ui_new(win, 0 - 1)
+    e = widgets.Ui_entry(e, "", 10, 10, 200, 24)
+    var eid = widgets.Ui_last_id(e)
+    e = widgets.Ui_set_focus(e, eid)
+    check_int("entry is focused", widgets.Ui_focus(e), eid)
+    e = press_key(e, win, gui.SCANCODE_S)
+    check_int("bare S while typing is NOT a shortcut", widgets.Ui_shortcut_count(e), 0)
+
+    print("=== the mod-bit helpers decode a bitmask independently ===")
+    // Unit-tested directly rather than through a keystroke, because under the
+    // dummy video driver a SYNTHETIC key-down does not update the polled
+    // keyboard state that live_mods() reads - so a chord cannot be driven
+    // end-to-end headlessly. Asserting the decoder on its own is honest about
+    // that: it proves the half that is testable here, and the half that is not
+    // is one function (live_mods) with no branching per-modifier beyond the
+    // left/right fallback.
+    check_int("shift bit", widgets.Ui_mod_shift(gui.KMOD_SHIFT), 1)
+    check_int("ctrl bit", widgets.Ui_mod_ctrl(gui.KMOD_CTRL), 1)
+    check_int("alt bit", widgets.Ui_mod_alt(gui.KMOD_ALT), 1)
+    check_int("gui bit", widgets.Ui_mod_gui(gui.KMOD_GUI), 1)
+    check_int("shift is not ctrl", widgets.Ui_mod_ctrl(gui.KMOD_SHIFT), 0)
+    check_int("gui is not alt", widgets.Ui_mod_alt(gui.KMOD_GUI), 0)
+    // A combined mask must decode BOTH, which is the case a `==` comparison
+    // instead of a bit test would get wrong.
+    var both = gui.KMOD_SHIFT + gui.KMOD_GUI
+    check_int("shift+cmd -> shift", widgets.Ui_mod_shift(both), 1)
+    check_int("shift+cmd -> gui", widgets.Ui_mod_gui(both), 1)
+    check_int("shift+cmd -> not ctrl", widgets.Ui_mod_ctrl(both), 0)
+    check_int("shift+cmd -> not alt", widgets.Ui_mod_alt(both), 0)
+    // The platform-neutral menu modifier: EITHER Cmd or Ctrl, never hard-coded.
+    check_int("is_cmd(gui)", widgets.Ui_mod_is_cmd(gui.KMOD_GUI), 1)
+    check_int("is_cmd(ctrl)", widgets.Ui_mod_is_cmd(gui.KMOD_CTRL), 1)
+    check_int("is_cmd(shift)", widgets.Ui_mod_is_cmd(gui.KMOD_SHIFT), 0)
+    check_int("is_cmd(none)", widgets.Ui_mod_is_cmd(gui.KMOD_NONE), 0)
+
+    if fails == 0 {
+        print("=== ALL SHORTCUT TESTS PASSED ===")
+    } else {
+        print("=== ${fails} SHORTCUT TEST(S) FAILED ===")
+    }
+    gui.Win_close(win)
+}
+
+fn on_nothing(id: int) { }

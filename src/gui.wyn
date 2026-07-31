@@ -224,3 +224,40 @@ var SCANCODE_LCTRL = 224
 var SCANCODE_LSHIFT = 225
 var SCANCODE_LALT = 226
 var SCANCODE_LGUI = 227
+
+// The RIGHT-hand modifiers. Present because a shortcut check that tests only the
+// left one is wrong for every user who holds Shift with their right hand - a bug
+// that is invisible to a right-handed developer testing their own habits.
+var SCANCODE_RCTRL = 228
+var SCANCODE_RSHIFT = 229
+var SCANCODE_RALT = 230
+var SCANCODE_RGUI = 231
+
+// Digits, in SDL's row order: 1..9 then 0. NOT contiguous with 0 first, which is
+// the mistake this comment exists to prevent - SDL puts 0 AFTER 9.
+var SCANCODE_1 = 30
+var SCANCODE_2 = 31
+var SCANCODE_3 = 32
+var SCANCODE_4 = 33
+var SCANCODE_5 = 34
+var SCANCODE_6 = 35
+var SCANCODE_7 = 36
+var SCANCODE_8 = 37
+var SCANCODE_9 = 38
+var SCANCODE_0 = 39
+
+// The bracket keys, which every image editor binds to brush size.
+var SCANCODE_LEFTBRACKET = 47
+var SCANCODE_RIGHTBRACKET = 48
+
+// Punctuation used by zoom shortcuts: Cmd+- / Cmd+= (the unshifted `+` key).
+var SCANCODE_MINUS = 45
+var SCANCODE_EQUALS = 46
+
+// Modifier BITS for the sampled-modifier word (see widgets.Ui_shortcut_mod_at).
+// A bitmask rather than four parallel arrays: one int travels with one keystroke.
+var KMOD_NONE = 0
+var KMOD_SHIFT = 1
+var KMOD_CTRL = 2
+var KMOD_ALT = 4
+var KMOD_GUI = 8
