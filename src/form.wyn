@@ -17,12 +17,49 @@
 //
 // WHAT IS AND IS NOT IN THE DOCUMENT
 //
-// In: id, kind, x/y/w/h, label, text, checked, enabled, handler name, anchors.
-// Out: the on_click FUNCTION POINTER. It cannot be serialised and cannot be
-// reconstructed (Wyn has no eval), so the document stores the handler's NAME and
-// the generated Form1.designer.wyn re-binds a real pointer at compile time. A
-// loaded form has correct names and noop pointers - which is exactly right for a
-// designer, whose job is to edit names.
+// In: id, kind, x/y/w/h, label, text, checked, enabled, handler name, anchors,
+// and every field the nine later widget kinds need - group (radio exclusivity),
+// items (dropdown/listbox/tabs/menubar), sel, val/vmin/vmax/vstep (slider,
+// spinner, progress), tooltip, owner and page (containment).
+//
+// Out: three kinds of thing, each for a different reason.
+//
+//  - The on_click FUNCTION POINTER. It cannot be serialised and cannot be
+//    reconstructed (Wyn has no eval), so the document stores the handler's NAME
+//    and the generated Form1.designer.wyn re-binds a real pointer at compile
+//    time. A loaded form has correct names and noop pointers - which is exactly
+//    right for a designer, whose job is to edit names.
+//  - INTERACTION state: hot, active, focus, drag, open, hover_since, and the
+//    textarea's caret_line/caret_col/scroll_line, and the listbox's scroll. These
+//    describe what the USER is doing to a running form, not what the form IS. A
+//    document that remembered which menu was pulled down would reopen it on load,
+//    and a saved caret column is a diff on every keystroke in git.
+//  - The `lines` array. It is a cache of `text` split on newlines, so writing it
+//    would let the two disagree in a file. Ui_add_raw re-splits.
+//
+// HOW ITEMS ARE ENCODED, AND WHY IT IS NOT A DELIMITED STRING
+//
+// `items` is a real JSON ARRAY of strings: ["Red", "Green", "Blue"]. The in-memory
+// constructors take a newline-delimited string (Ui_dropdown, Ui_listbox,
+// Ui_set_items) because that is what a designer's multi-line property editor
+// holds, and that is a genuine footgun: an item containing a newline is
+// unrepresentable there - it silently becomes two items.
+//
+// The DOCUMENT does not inherit that limit, and it must not, because the document
+// is the source of truth. A JSON array has no delimiter to collide with: a
+// newline inside an element is `\n` inside a quoted string and carries no
+// structure. So `{"items": ["two\nlines"]}` is ONE item and loads as one, and the
+// loader appends element by element (widgets.Ui_add_item) rather than joining them
+// into a string it would then have to re-split.
+//
+// MENUBAR is the one kind that still has a delimiter inside an item: it packs two
+// levels into each element as "File|New|Open", because an array field of an array
+// does not survive Wyn's module boundary (see the `items` note on Widget). That
+// pipe is part of the menubar's own encoding, not part of the document format, so
+// it round-trips verbatim - a menu entry containing a literal "|" would be read as
+// an extra entry by Ui_menu_entry, which is a documented limitation of the MENUBAR
+// spec and is unchanged by saving and loading. Every other kind's items are
+// arbitrary strings.
 //
 // WHY THE WRITER IS HAND-ROLLED
 //
@@ -71,6 +108,26 @@ fn esc(s: string) -> string {
 
 fn qs(s: string) -> string {
     return "\"" + esc(s) + "\""
+}
+
+// Widget i's item list as a JSON array literal.
+//
+// Empty is written as `[]` rather than omitted. The two are NOT equivalent to a
+// reader: an absent key means "this build/author had nothing to say about items"
+// and a present empty array means "this widget has no items", and a dropdown
+// whose list an assistant deliberately emptied must not reload with the old one.
+// Since the loader can only default an absent key, writing `[]` is what makes
+// "emptied" expressible at all.
+fn items_json(ui: Ui, i: int) -> string {
+    var n = widgets.Ui_item_count_at(ui, i)
+    var s = "["
+    var k = 0
+    while k < n {
+        if k > 0 { s = s + ", " }
+        s = s + qs(widgets.Ui_item_at(ui, i, k))
+        k = k + 1
+    }
+    return s + "]"
 }
 
 // ---- JSON string UNescaping -----------------------------------------------
@@ -155,7 +212,38 @@ pub fn Form_to_json(ui: Ui) -> string {
         s = s + ", \"right\": " + widgets.Ui_anchor_right_at(ui, i).to_string()
         s = s + ", \"top\": " + widgets.Ui_anchor_top_at(ui, i).to_string()
         s = s + ", \"bottom\": " + widgets.Ui_anchor_bottom_at(ui, i).to_string()
-        s = s + "}}"
+        s = s + "}"
+        // ---- the fields the nine later kinds need ----
+        //
+        // Written for EVERY widget, not only for the kinds that use them.
+        //
+        // The conditional alternative is tempting (why give a label a vstep?) and
+        // is the bug this format cannot afford: it makes the written key set
+        // depend on `kind`, so changing a widget's kind in the designer - or an
+        // assistant retyping "label" as "slider" - silently drops the fields the
+        // old kind did not write, and the reload defaults them. Worse, the
+        // condition is a second place that has to know which kind uses what, and
+        // it disagrees with the first one the moment a kind gains a property.
+        //
+        // Uniform means the document is a TABLE: every row has every column, a
+        // `git diff` of a property change is one line, and a property inspector
+        // can be written against the key set instead of against the kind. The cost
+        // is ~90 bytes per widget of keys nobody reads.
+        s = s + ",\n     \"group\": " + qs(widgets.Ui_group_at(ui, i))
+        s = s + ", \"items\": " + items_json(ui, i)
+        s = s + ", \"sel\": " + widgets.Ui_sel_at(ui, i).to_string()
+        s = s + ",\n     \"val\": " + widgets.Ui_val_at(ui, i).to_string()
+        s = s + ", \"vmin\": " + widgets.Ui_vmin_at(ui, i).to_string()
+        s = s + ", \"vmax\": " + widgets.Ui_vmax_at(ui, i).to_string()
+        s = s + ", \"vstep\": " + widgets.Ui_vstep_at(ui, i).to_string()
+        s = s + ",\n     \"tooltip\": " + qs(widgets.Ui_tooltip_at(ui, i))
+        // owner/page are ids and page indices, so -1 ("none") is written out
+        // rather than omitted - the same reason `enabled: 0` is. int_or's default
+        // is -1 for both, so an older document without them loads as top-level,
+        // always-visible controls, which is what it meant.
+        s = s + ", \"owner\": " + widgets.Ui_owner_at(ui, i).to_string()
+        s = s + ", \"page\": " + widgets.Ui_page_at(ui, i).to_string()
+        s = s + "}"
         i = i + 1
     }
     if n > 0 { s = s + "\n  " }
@@ -226,6 +314,18 @@ pub fn Form_from_json(text: string, win: int, font: int) -> Ui {
                 at = int_or(an, "top", 1)
                 ab = int_or(an, "bottom", 0)
             }
+            // Every default below MATCHES make_widget's, so a document that omits
+            // a key loads the widget a constructor would have built. That is the
+            // whole migration story for this format: an older file, or one an
+            // assistant wrote without knowing about sliders, is not an error case
+            // - it is the normal case - and the widget it produces has to be a
+            // usable default rather than a corrupt one.
+            //
+            // The two that are NOT zero are the ones where zero is a real value a
+            // widget could hold and therefore cannot double as "absent": vmax
+            // (0 would make a dead 0..0 range that Ui_slider_frac has to
+            // special-case) and vstep (0 would divide by zero in clamp_step were
+            // it not guarded). owner/page default to -1, "no container".
             ui = widgets.Ui_add_raw(ui,
                 int_or(wn, "id", i + 1),
                 kind,
@@ -236,7 +336,42 @@ pub fn Form_from_json(text: string, win: int, font: int) -> Ui {
                 int_or(wn, "checked", 0),
                 int_or(wn, "enabled", 1),
                 str_or(wn, "handler", ""),
-                al, ar, at, ab)
+                al, ar, at, ab,
+                str_or(wn, "group", ""),
+                int_or(wn, "sel", 0 - 1),
+                int_or(wn, "val", 0),
+                int_or(wn, "vmin", 0),
+                int_or(wn, "vmax", 100),
+                int_or(wn, "vstep", 1),
+                str_or(wn, "tooltip", ""),
+                int_or(wn, "owner", 0 - 1),
+                int_or(wn, "page", 0 - 1))
+            // Items go in AFTER the widget exists, one element per call, because a
+            // module function cannot take an array parameter (see the
+            // join_lines_at note in widgets.wyn) and because joining them into a
+            // delimited string would destroy exactly the property the JSON array
+            // buys: an item may contain a newline.
+            //
+            // Ui_add_raw sets `sel` before these arrive, deliberately: appending
+            // items must not renegotiate a selection the document states.
+            //
+            // Addressed by INDEX (the widget just pushed is the last one), not by
+            // the id the document gave: a hand-edited file may repeat an id, and
+            // an id lookup would then append this widget's items to the earlier
+            // one's list. See Ui_add_item_at.
+            var wi = widgets.Ui_count(ui) - 1
+            var its = Json::get_array(wn, "items")
+            var m = Json::array_len(its)
+            var k = 0
+            while k < m {
+                // node_str, not get: the elements are bare strings in an array,
+                // and like Json::get it hands back the RAW body with escapes
+                // intact - so an item containing a newline needs unesc for the
+                // same reason a textarea's text does.
+                ui = widgets.Ui_add_item_at(ui, wi,
+                    unesc(Json::node_str(Json::array_get(its, k))))
+                k = k + 1
+            }
         }
         i = i + 1
     }
@@ -340,6 +475,70 @@ pub fn Form_diff(a: Ui, b: Ui) -> string {
         }
         if widgets.Ui_anchor_bottom_at(a, i) != widgets.Ui_anchor_bottom_at(b, i) {
             out = out + p + "anchor.bottom differs\n"
+        }
+        // ---- the nine later kinds' fields ----
+        //
+        // Every one of these was silently lost by the serialiser before it wrote
+        // them, and this diff PASSED throughout - it compared eleven fields of a
+        // widget that has twenty. A round-trip check is only as strong as the
+        // field list it walks, so a new persisted field means a line here as well
+        // as a line in Form_to_json, and forgetting this half is worse than
+        // forgetting that one: it makes the test that would have caught the bug
+        // report success.
+        if widgets.Ui_group_at(a, i) != widgets.Ui_group_at(b, i) {
+            out = out + p + "group: [" + widgets.Ui_group_at(a, i) + "] != ["
+                + widgets.Ui_group_at(b, i) + "]\n"
+        }
+        if widgets.Ui_sel_at(a, i) != widgets.Ui_sel_at(b, i) {
+            out = out + p + "sel: " + widgets.Ui_sel_at(a, i).to_string() + " != "
+                + widgets.Ui_sel_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_val_at(a, i) != widgets.Ui_val_at(b, i) {
+            out = out + p + "val: " + widgets.Ui_val_at(a, i).to_string() + " != "
+                + widgets.Ui_val_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_vmin_at(a, i) != widgets.Ui_vmin_at(b, i) {
+            out = out + p + "vmin: " + widgets.Ui_vmin_at(a, i).to_string() + " != "
+                + widgets.Ui_vmin_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_vmax_at(a, i) != widgets.Ui_vmax_at(b, i) {
+            out = out + p + "vmax: " + widgets.Ui_vmax_at(a, i).to_string() + " != "
+                + widgets.Ui_vmax_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_vstep_at(a, i) != widgets.Ui_vstep_at(b, i) {
+            out = out + p + "vstep: " + widgets.Ui_vstep_at(a, i).to_string()
+                + " != " + widgets.Ui_vstep_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_tooltip_at(a, i) != widgets.Ui_tooltip_at(b, i) {
+            out = out + p + "tooltip: [" + widgets.Ui_tooltip_at(a, i) + "] != ["
+                + widgets.Ui_tooltip_at(b, i) + "]\n"
+        }
+        if widgets.Ui_owner_at(a, i) != widgets.Ui_owner_at(b, i) {
+            out = out + p + "owner: " + widgets.Ui_owner_at(a, i).to_string()
+                + " != " + widgets.Ui_owner_at(b, i).to_string() + "\n"
+        }
+        if widgets.Ui_page_at(a, i) != widgets.Ui_page_at(b, i) {
+            out = out + p + "page: " + widgets.Ui_page_at(a, i).to_string()
+                + " != " + widgets.Ui_page_at(b, i).to_string() + "\n"
+        }
+        // Items: the count first, then element by element. Naming the differing
+        // ELEMENT matters more here than anywhere else, because the failure this
+        // catches is a delimiter bug - "two\nlines" arriving back as two items -
+        // and "items differ" would not distinguish that from a lost list.
+        if widgets.Ui_item_count_at(a, i) != widgets.Ui_item_count_at(b, i) {
+            out = out + p + "item count: "
+                + widgets.Ui_item_count_at(a, i).to_string() + " != "
+                + widgets.Ui_item_count_at(b, i).to_string() + "\n"
+        } else {
+            var k = 0
+            while k < widgets.Ui_item_count_at(a, i) {
+                if widgets.Ui_item_at(a, i, k) != widgets.Ui_item_at(b, i, k) {
+                    out = out + p + "items[" + k.to_string() + "]: ["
+                        + widgets.Ui_item_at(a, i, k) + "] != ["
+                        + widgets.Ui_item_at(b, i, k) + "]\n"
+                }
+                k = k + 1
+            }
         }
         i = i + 1
     }

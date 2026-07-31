@@ -1,0 +1,545 @@
+// test_form_roundtrip - EVERY widget kind through the JSON document, field by
+// field.
+//
+//   WYN_ROOT=/path/to/wyn  wyn run tests/test_form_roundtrip.wyn
+//
+// Needs no display: a Ui with win = -1 is a legitimate document, so the model and
+// its serialiser are testable with no SDL at all.
+//
+// WHY THIS EXISTS SEPARATELY FROM test_form_json
+//
+// test_form_json covers the ORIGINAL six kinds and the escaping cases, and it
+// passed - unchanged and green - while a radio group, a dropdown's chosen index, a
+// slider's range, a listbox selection, a tab's active page, a spinner's bounds, a
+// tooltip and every containment link were being SILENTLY DROPPED on save. Not
+// mangled: dropped. `Ui_add_raw` did not take those fields, so the loader could
+// not restore them, and `Form_diff` did not compare them, so nothing noticed.
+//
+// That is the failure mode this file is aimed at, and it dictates its shape:
+//
+//  - Every field gets a NON-DEFAULT value. A field that happens to equal the
+//    loader's default round-trips perfectly while being thrown away, so a test
+//    built out of defaults proves nothing. Hence a slider whose value is off both
+//    ends of its grid, a selection that is not 0, a tab page that is not the
+//    first, and a group name that is not "".
+//  - The assertions are per FIELD, not `Form_diff == ""`. Form_diff is the thing
+//    under test as much as the serialiser is - it is where nine fields were
+//    missing - so it cannot be the only witness. It is asserted too, as a
+//    cross-check: if the explicit assertions pass and Form_diff finds a
+//    difference, Form_diff is right and this file is short a field.
+//
+// AND THE THREE AI-EDITING CASES, which are not edge cases for this design:
+//
+//  - A document missing a field must load with the default a CONSTRUCTOR would
+//    have produced (a form written by an older build; an assistant that omitted a
+//    key it did not know about).
+//  - An item containing the ITEM DELIMITER of the in-memory API must survive,
+//    because the document uses a JSON array and has no delimiter. This is the
+//    assertion that distinguishes a real encoding from a documented footgun.
+//  - A widget's items must be REPLACEABLE with an empty list, i.e. `[]` and an
+//    absent key must not mean the same thing.
+
+import widgets
+import form
+
+var fails = 0
+
+fn check(label: string, got: string, want: string) {
+    if got == want {
+        print("  ok   ${label} = [${got}]")
+    } else {
+        print("  FAIL ${label}: got [${got}] want [${want}]")
+        fails = fails + 1
+    }
+}
+
+fn check_int(label: string, got: int, want: int) {
+    check(label, got.to_string(), want.to_string())
+}
+
+fn noop(id: int) { }
+
+// ---- the form under test --------------------------------------------------
+//
+// One widget of every kind, in kind order, so an index in the assertions below is
+// readable as a kind. The indices are named as constants rather than written as
+// literals because inserting a widget would otherwise silently re-point forty
+// assertions at the wrong control - and they would still PASS wherever two kinds
+// share a field's value, which is the worst possible outcome for this file.
+var I_LABEL = 0
+var I_BUTTON = 1
+var I_CHECKBOX = 2
+var I_ENTRY = 3
+var I_PANEL = 4
+var I_TEXTAREA = 5
+var I_RADIO_A = 6
+var I_RADIO_B = 7
+var I_DROPDOWN = 8
+var I_SLIDER = 9
+var I_PROGRESS = 10
+var I_LISTBOX = 11
+var I_TABS = 12
+var I_GROUPBOX = 13
+var I_SPINNER = 14
+var I_MENUBAR = 15
+var N_WIDGETS = 16
+
+fn build_form() -> Ui {
+    var ui = widgets.Ui_new(-1, -1)
+    ui = widgets.Ui_set_name(ui, "EveryKind")
+    ui = widgets.Ui_set_design_size(ui, 900, 700)
+
+    // --- the original six, so this file is a superset and a regression here is
+    // caught by whichever test runs first ---
+    ui = widgets.Ui_label(ui, "Settings", 12, 8)
+
+    ui = widgets.Ui_button(ui, "Apply", 12, 30, 90, 26, noop)
+    var apply = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, apply, "on_apply")
+    ui = widgets.Ui_set_tooltip(ui, apply, "Write the changes to disk")
+    // All four anchors pinned: the anchor set html.wyn reads, on a widget that
+    // also carries a tooltip, so a serialiser that wrote one nested object over
+    // the other would be caught.
+    ui = widgets.Ui_set_anchor(ui, apply, 1, 1, 1, 1)
+
+    ui = widgets.Ui_checkbox(ui, "Verbose", 12, 64, 1, noop)
+    var verbose = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, verbose, "on_verbose")
+    // enabled = 0 on a CHECKED box: two fields whose absent-key defaults differ
+    // (0 and 1) both set to the other value.
+    ui = widgets.Ui_set_enabled(ui, verbose, 0)
+
+    ui = widgets.Ui_entry(ui, "/var/log/app.log", 12, 92, 220, 24)
+    ui = widgets.Ui_panel(ui, 250, 92, 120, 60)
+    ui = widgets.Ui_textarea(ui, "line one\nline \"two\"\nline\tthree",
+                             12, 160, 340, 90)
+
+    // --- the nine that did not round-trip ---
+
+    // A RADIO GROUP: two radios, same group name, the SECOND one checked. One
+    // radio would not prove the group survived (a lost group string reads back as
+    // "" and a lone radio behaves identically); two in a named group means a lost
+    // group name breaks exclusivity, which Ui_radio_select then demonstrates.
+    ui = widgets.Ui_radio(ui, "Light", "theme", 12, 262, 0, noop)
+    ui = widgets.Ui_radio(ui, "Dark", "theme", 90, 262, 1, noop)
+    var dark = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, dark, "on_theme")
+
+    // A DROPDOWN with a CHOSEN index that is neither 0 nor -1, and items that are
+    // not all plain words.
+    ui = widgets.Ui_dropdown(ui, "Red\nGreen\nBlue\nUltra Violet",
+                             12, 290, 160, 24, 2, noop)
+    var colour = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, colour, "on_colour")
+    ui = widgets.Ui_set_tooltip(ui, colour, "Accent colour")
+
+    // A SLIDER with a non-zero minimum, a maximum off the step grid, a step > 1,
+    // and a value the CONSTRUCTOR will have snapped. The stored value is therefore
+    // one no naive round trip produces by accident, and it must come back
+    // BIT-IDENTICAL rather than be re-snapped on load (re-snapping is a no-op
+    // here, but re-snapping against a DEFAULT range is not - see the load-order
+    // note on Ui_add_raw).
+    ui = widgets.Ui_slider(ui, 12, 322, 200, 20, 10, 53, 5, 37, noop)
+    var vol = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, vol, "on_volume")
+    ui = widgets.Ui_set_anchor(ui, vol, 1, 1, 0, 0)
+
+    // A PROGRESS bar, whose 0..1 API hides a 0..1000 val - so this asserts the
+    // STORAGE round-trips, not just the float that reads back from it.
+    ui = widgets.Ui_progress(ui, 12, 350, 200, 12, 0.375)
+
+    // A LISTBOX with a selection past the first row.
+    ui = widgets.Ui_listbox(ui, "alpha\nbeta\ngamma\ndelta\nepsilon",
+                            12, 372, 160, 80, 3, noop)
+    var files = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, files, "on_file_pick")
+
+    // TABS with a NON-ZERO active page, plus two children bound to pages - which
+    // is what makes owner/page load-bearing rather than decorative.
+    ui = widgets.Ui_tabs(ui, "General\nAdvanced\nAbout", 380, 262, 300, 26,
+                         1, noop)
+    var tabs = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, tabs, "on_tab")
+
+    ui = widgets.Ui_groupbox(ui, "Network", 380, 300, 300, 100)
+    var box = widgets.Ui_last_id(ui)
+    // A GROUPBOX that is itself INSIDE tab page 1: an owner chain two deep, so a
+    // loader that reset owner to -1 on the container would still look right for
+    // the leaf.
+    ui = widgets.Ui_set_owner(ui, box, tabs)
+    ui = widgets.Ui_set_page(ui, box, 1)
+
+    ui = widgets.Ui_spinner(ui, 400, 330, 90, 24, 10, 90, 5, 45, noop)
+    var port = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, port, "on_port")
+    ui = widgets.Ui_set_owner(ui, port, box)
+    // page -1 on a child of a groupbox: "always shown", which is the default and
+    // is deliberately re-asserted, because owner != -1 with page == -1 is the
+    // combination a loader that conflated the two fields would get wrong.
+    ui = widgets.Ui_set_tooltip(ui, port, "Listen port")
+
+    // A MENUBAR: two levels packed per item, including a separator entry.
+    ui = widgets.Ui_menubar(ui, "File|New|Open|-|Quit\nHelp|About",
+                            0, 0, 900, 22, noop)
+    var menu = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_handler_name(ui, menu, "on_menu")
+
+    return ui
+}
+
+// ---- assertions ------------------------------------------------------------
+//
+// Field by field, both forms, one field per line. Comparing a to b rather than b
+// to a literal: a literal would be a third copy of the form's definition, and the
+// question here is whether the document preserves what was built, not whether
+// this file can restate it.
+fn compare_all(a: Ui, b: Ui) {
+    check_int("widget count", widgets.Ui_count(b), widgets.Ui_count(a))
+    if widgets.Ui_count(a) != widgets.Ui_count(b) { return }
+    var i = 0
+    while i < widgets.Ui_count(a) {
+        var k = widgets.Ui_kind_name(widgets.Ui_kind_at(a, i))
+        var p = "[" + i.to_string() + " " + k + "] "
+        check(p + "kind", widgets.Ui_kind_name(widgets.Ui_kind_at(b, i)), k)
+        check_int(p + "id", widgets.Ui_id_at(b, i), widgets.Ui_id_at(a, i))
+        check_int(p + "x", widgets.Ui_x_at(b, i), widgets.Ui_x_at(a, i))
+        check_int(p + "y", widgets.Ui_y_at(b, i), widgets.Ui_y_at(a, i))
+        check_int(p + "w", widgets.Ui_w_at(b, i), widgets.Ui_w_at(a, i))
+        check_int(p + "h", widgets.Ui_h_at(b, i), widgets.Ui_h_at(a, i))
+        check(p + "label", widgets.Ui_label_at(b, i), widgets.Ui_label_at(a, i))
+        check(p + "text", widgets.Ui_text_at(b, i), widgets.Ui_text_at(a, i))
+        check_int(p + "checked", widgets.Ui_checked_at(b, i),
+                  widgets.Ui_checked_at(a, i))
+        check_int(p + "enabled", widgets.Ui_enabled_at(b, i),
+                  widgets.Ui_enabled_at(a, i))
+        check(p + "handler", widgets.Ui_handler_name_at(b, i),
+              widgets.Ui_handler_name_at(a, i))
+        // Anchors. In the model since the start and html.wyn depends on them, so
+        // they are asserted for every widget rather than spot-checked - a
+        // serialiser that dropped one flag on one kind is the shape of bug the
+        // spot check misses.
+        check_int(p + "anchor.left", widgets.Ui_anchor_left_at(b, i),
+                  widgets.Ui_anchor_left_at(a, i))
+        check_int(p + "anchor.right", widgets.Ui_anchor_right_at(b, i),
+                  widgets.Ui_anchor_right_at(a, i))
+        check_int(p + "anchor.top", widgets.Ui_anchor_top_at(b, i),
+                  widgets.Ui_anchor_top_at(a, i))
+        check_int(p + "anchor.bottom", widgets.Ui_anchor_bottom_at(b, i),
+                  widgets.Ui_anchor_bottom_at(a, i))
+        // The nine kinds' fields.
+        check(p + "group", widgets.Ui_group_at(b, i), widgets.Ui_group_at(a, i))
+        check_int(p + "sel", widgets.Ui_sel_at(b, i), widgets.Ui_sel_at(a, i))
+        check_int(p + "val", widgets.Ui_val_at(b, i), widgets.Ui_val_at(a, i))
+        check_int(p + "vmin", widgets.Ui_vmin_at(b, i), widgets.Ui_vmin_at(a, i))
+        check_int(p + "vmax", widgets.Ui_vmax_at(b, i), widgets.Ui_vmax_at(a, i))
+        check_int(p + "vstep", widgets.Ui_vstep_at(b, i), widgets.Ui_vstep_at(a, i))
+        check(p + "tooltip", widgets.Ui_tooltip_at(b, i),
+              widgets.Ui_tooltip_at(a, i))
+        check_int(p + "owner", widgets.Ui_owner_at(b, i), widgets.Ui_owner_at(a, i))
+        check_int(p + "page", widgets.Ui_page_at(b, i), widgets.Ui_page_at(a, i))
+        check_int(p + "item count", widgets.Ui_item_count_at(b, i),
+                  widgets.Ui_item_count_at(a, i))
+        if widgets.Ui_item_count_at(a, i) == widgets.Ui_item_count_at(b, i) {
+            var n = 0
+            while n < widgets.Ui_item_count_at(a, i) {
+                check(p + "items[" + n.to_string() + "]",
+                      widgets.Ui_item_at(b, i, n), widgets.Ui_item_at(a, i, n))
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn main() {
+    print("=== every widget kind through the JSON document ===")
+
+    var a = build_form()
+    check_int("built one widget of every kind", widgets.Ui_count(a), N_WIDGETS)
+    // The build itself is asserted before the round trip: if the constructors did
+    // not store what was asked for, a perfect round trip of the wrong values
+    // would read as a pass.
+    check_int("slider value snapped to its grid by the constructor",
+              widgets.Ui_val(a, widgets.Ui_id_at(a, I_SLIDER)), 35)
+    check_int("progress 0.375 stored as 375 of 1000",
+              widgets.Ui_val(a, widgets.Ui_id_at(a, I_PROGRESS)), 375)
+
+    var path = "/tmp/wyn_form_everykind.json"
+    check_int("Form_save wrote the file", form.Form_save(a, path), 1)
+    var text = File::read(path)
+
+    var b = form.Form_load(path, -1, -1)
+
+    print("")
+    print("--- field by field, all ${N_WIDGETS} widgets ---")
+    compare_all(a, b)
+
+    // Form_diff is under test too - it was missing the same nine fields the
+    // serialiser was - so it is a cross-check on the explicit assertions above,
+    // not a substitute for them.
+    print("")
+    check("Form_diff agrees nothing changed", form.Form_diff(a, b), "")
+
+    // Determinism. A format whose second save differs from its first produces a
+    // spurious git diff on every open, which destroys the reviewability that made
+    // JSON the right choice.
+    check_int("re-serialising the loaded form is byte-identical",
+              text == form.Form_to_json(b), 1)
+
+    // ---- the fields, again, as VALUES rather than as a comparison ----
+    //
+    // compare_all proves a == b. It cannot prove the value is the one the form was
+    // built with, because a serialiser that wrote a constant would satisfy it on
+    // both sides. These name the number.
+    print("")
+    print("--- the values, stated ---")
+    check("radio group name", widgets.Ui_group_at(b, I_RADIO_B), "theme")
+    check_int("the SECOND radio is the checked one",
+              widgets.Ui_checked_at(b, I_RADIO_B), 1)
+    check_int("...and the first is not", widgets.Ui_checked_at(b, I_RADIO_A), 0)
+    check_int("dropdown chose index 2", widgets.Ui_sel_at(b, I_DROPDOWN), 2)
+    check("dropdown item 3 survived (with its space)",
+          widgets.Ui_item_at(b, I_DROPDOWN, 3), "Ultra Violet")
+    check_int("slider vmin 10", widgets.Ui_vmin_at(b, I_SLIDER), 10)
+    check_int("slider vmax 53 (deliberately off the step grid)",
+              widgets.Ui_vmax_at(b, I_SLIDER), 53)
+    check_int("slider vstep 5", widgets.Ui_vstep_at(b, I_SLIDER), 5)
+    check_int("slider val 35", widgets.Ui_val_at(b, I_SLIDER), 35)
+    check_int("listbox selected row 3", widgets.Ui_sel_at(b, I_LISTBOX), 3)
+    check_int("listbox has 5 items", widgets.Ui_item_count_at(b, I_LISTBOX), 5)
+    check_int("tabs active page 1 (not the first)",
+              widgets.Ui_sel_at(b, I_TABS), 1)
+    check("tab titles round-tripped", widgets.Ui_item_at(b, I_TABS, 2), "About")
+    check_int("spinner range 10..90 step 5",
+              widgets.Ui_vmax_at(b, I_SPINNER) - widgets.Ui_vmin_at(b, I_SPINNER),
+              80)
+    check_int("spinner val 45", widgets.Ui_val_at(b, I_SPINNER), 45)
+    check("spinner text field agrees with its value",
+          widgets.Ui_text_at(b, I_SPINNER), "45")
+    check("tooltip on the button", widgets.Ui_tooltip_at(b, I_BUTTON),
+          "Write the changes to disk")
+    check("tooltip on the spinner", widgets.Ui_tooltip_at(b, I_SPINNER),
+          "Listen port")
+    check_int("disabled checkbox stayed disabled",
+              widgets.Ui_enabled_at(b, I_CHECKBOX), 0)
+    check_int("...and stayed checked", widgets.Ui_checked_at(b, I_CHECKBOX), 1)
+    check_int("groupbox owner is the tab strip",
+              widgets.Ui_owner_at(b, I_GROUPBOX), widgets.Ui_id_at(b, I_TABS))
+    check_int("groupbox lives on tab page 1",
+              widgets.Ui_page_at(b, I_GROUPBOX), 1)
+    check_int("spinner owner is the groupbox",
+              widgets.Ui_owner_at(b, I_SPINNER), widgets.Ui_id_at(b, I_GROUPBOX))
+    check_int("spinner page stayed -1 (always shown inside its box)",
+              widgets.Ui_page_at(b, I_SPINNER), 0 - 1)
+    check("menubar packed spec round-tripped verbatim",
+          widgets.Ui_item_at(b, I_MENUBAR, 0), "File|New|Open|-|Quit")
+    check_int("progress val 375 of 1000", widgets.Ui_val_at(b, I_PROGRESS), 375)
+    check("anchors on the all-four button",
+          widgets.Ui_anchor_left_at(b, I_BUTTON).to_string()
+              + widgets.Ui_anchor_right_at(b, I_BUTTON).to_string()
+              + widgets.Ui_anchor_top_at(b, I_BUTTON).to_string()
+              + widgets.Ui_anchor_bottom_at(b, I_BUTTON).to_string(),
+          "1111")
+    check("anchors on the horizontally-stretched slider",
+          widgets.Ui_anchor_left_at(b, I_SLIDER).to_string()
+              + widgets.Ui_anchor_right_at(b, I_SLIDER).to_string()
+              + widgets.Ui_anchor_top_at(b, I_SLIDER).to_string()
+              + widgets.Ui_anchor_bottom_at(b, I_SLIDER).to_string(),
+          "1100")
+
+    // ---- the loaded form still BEHAVES ----
+    //
+    // Round-tripping the fields is necessary and not sufficient: the point of
+    // storing `group` is exclusivity, of `owner`/`page` is visibility, and of
+    // vmin/vmax/vstep is that a drag lands on the grid. A document that reloads
+    // the right numbers into a form that no longer behaves has not round-tripped
+    // the widget, only its printout.
+    print("")
+    print("--- the loaded form behaves, not merely reads, correctly ---")
+    var light = widgets.Ui_id_at(b, I_RADIO_A)
+    var c = widgets.Ui_radio_select(b, light)
+    check_int("selecting the loaded 'Light' radio checks it",
+              widgets.Ui_checked_at(c, I_RADIO_A), 1)
+    check_int("...and clears 'Dark' - the GROUP survived the trip",
+              widgets.Ui_checked_at(c, I_RADIO_B), 0)
+
+    // Containment: the groupbox is on page 1 and the strip's selection is 1, so it
+    // is visible; switch to page 0 and it must hide. This fails outright if either
+    // owner, page or sel was lost.
+    check_int("groupbox visible while its tab page is current",
+              widgets.Ui_visible(b, widgets.Ui_id_at(b, I_GROUPBOX)), 1)
+    var d = widgets.Ui_set_sel(b, widgets.Ui_id_at(b, I_TABS), 0)
+    check_int("...and hidden after switching to page 0",
+              widgets.Ui_visible(d, widgets.Ui_id_at(d, I_GROUPBOX)), 0)
+
+    // The slider's grid: a value between two ticks must snap, which needs vmin and
+    // vstep, and the top of the range must reach 53, which needs vmax.
+    var e = widgets.Ui_set_val(b, widgets.Ui_id_at(b, I_SLIDER), 41)
+    check_int("loaded slider snaps 41 onto its 10-based step-5 grid",
+              widgets.Ui_val_at(e, I_SLIDER), 40)
+    var f = widgets.Ui_set_val(b, widgets.Ui_id_at(b, I_SLIDER), 999)
+    check_int("loaded slider clamps to vmax 53, not to 100",
+              widgets.Ui_val_at(f, I_SLIDER), 53)
+
+    // The menubar's two-level spec: decoding it after a round trip proves the
+    // packed item is intact in a way string equality does not (a lost "|" would
+    // still compare equal to a differently-lost one).
+    var mid = widgets.Ui_id_at(b, I_MENUBAR)
+    check_int("menubar decodes to 2 menus", widgets.Ui_menu_count(b, mid), 2)
+    check("menu 0 title", widgets.Ui_menu_title(b, mid, 0), "File")
+    check_int("menu 0 has 4 entries", widgets.Ui_menu_entry_count(b, mid, 0), 4)
+    check("menu 0 entry 2 is the separator",
+          widgets.Ui_menu_entry(b, mid, 0, 2), "-")
+    check("menu 1 entry 0", widgets.Ui_menu_entry(b, mid, 1, 0), "About")
+
+    // ---- AI-EDITING CASE 1: a document missing fields -------------------------
+    //
+    // The normal case for this design, not an error case: a form written by an
+    // older build, or by an assistant that emitted the four keys it cared about.
+    // Every absent field must default to what a CONSTRUCTOR would have produced,
+    // because the widget has to be usable - a slider that loads with vmax 0 is a
+    // dead control, and a vstep of 0 would divide by zero were clamp_step not
+    // guarded.
+    print("")
+    print("--- an assistant-written document omitting most keys ---")
+    var thin = "{\n"
+        + "  \"form\": \"Sparse\",\n"
+        + "  \"widgets\": [\n"
+        + "    {\"kind\": \"slider\", \"x\": 5, \"y\": 5, \"w\": 100, \"h\": 20},\n"
+        + "    {\"kind\": \"radio\", \"x\": 5, \"y\": 30, \"label\": \"Yes\"},\n"
+        + "    {\"kind\": \"dropdown\", \"x\": 5, \"y\": 55, \"w\": 90, \"h\": 24,\n"
+        + "     \"items\": [\"one\", \"two\"]},\n"
+        + "    {\"kind\": \"tabs\", \"x\": 5, \"y\": 90, \"w\": 200, \"h\": 24,\n"
+        + "     \"items\": [\"A\", \"B\"], \"sel\": 1}\n"
+        + "  ]\n"
+        + "}\n"
+    var t = form.Form_from_json(thin, -1, -1)
+    check_int("4 widgets loaded from the sparse document", widgets.Ui_count(t), 4)
+    check("form name", widgets.Ui_name(t), "Sparse")
+    check_int("absent vmin defaults to 0", widgets.Ui_vmin_at(t, 0), 0)
+    check_int("absent vmax defaults to 100, NOT 0 (a 0..0 range is a dead widget)",
+              widgets.Ui_vmax_at(t, 0), 100)
+    check_int("absent vstep defaults to 1, NOT 0",
+              widgets.Ui_vstep_at(t, 0), 1)
+    check_int("absent val defaults to 0", widgets.Ui_val_at(t, 0), 0)
+    check_int("absent group defaults to empty",
+              widgets.Ui_group_at(t, 1).len(), 0)
+    check_int("absent tooltip defaults to empty",
+              widgets.Ui_tooltip_at(t, 1).len(), 0)
+    check_int("absent items defaults to an empty list",
+              widgets.Ui_item_count_at(t, 0), 0)
+    check_int("absent sel defaults to -1 (nothing chosen)",
+              widgets.Ui_sel_at(t, 2), 0 - 1)
+    check_int("absent owner defaults to -1 (top level)",
+              widgets.Ui_owner_at(t, 0), 0 - 1)
+    check_int("absent page defaults to -1 (always shown)",
+              widgets.Ui_page_at(t, 0), 0 - 1)
+    check_int("absent enabled still defaults to 1",
+              widgets.Ui_enabled_at(t, 0), 1)
+    check_int("items given as a JSON array load as items",
+              widgets.Ui_item_count_at(t, 2), 2)
+    check("...in order", widgets.Ui_item_at(t, 2, 1), "two")
+    // The defaulted slider is USABLE, which is the actual requirement behind the
+    // vmax/vstep defaults: a value can be set and lands where it was asked to.
+    var tv = widgets.Ui_set_val(t, widgets.Ui_id_at(t, 0), 42)
+    check_int("a slider with every range key absent is still settable",
+              widgets.Ui_val_at(tv, 0), 42)
+    // And the sparse tabs still show a page, so a sparse document is not a
+    // half-built form.
+    check_int("sparse tabs honoured their sel", widgets.Ui_sel_at(t, 3), 1)
+
+    // A document that is not JSON at all must not produce a corrupt form. It
+    // produces an EMPTY one, which the designer shows as a blank canvas.
+    var junk = form.Form_from_json("this is not a document", -1, -1)
+    check_int("unparseable text yields 0 widgets, not garbage",
+              widgets.Ui_count(junk), 0)
+
+    // ---- AI-EDITING CASE 2: an item containing the delimiter -----------------
+    //
+    // THE assertion that says the document's item encoding is real rather than a
+    // documented footgun.
+    //
+    // The in-memory constructors (Ui_dropdown, Ui_listbox, Ui_set_items) take a
+    // NEWLINE-DELIMITED string, so "two\nlines" is two items there and always
+    // will be - that is their contract. The DOCUMENT is a JSON array, where a
+    // newline inside an element is `\n` inside a quoted string and carries no
+    // structure, so one element containing a newline is ONE item and must load as
+    // one. A tab and a comma are checked alongside it because they are the
+    // delimiters an alternative encoding would have picked.
+    print("")
+    print("--- an item containing the in-memory delimiter ---")
+    var tricky = "{\n"
+        + "  \"form\": \"Tricky\",\n"
+        + "  \"widgets\": [\n"
+        + "    {\"kind\": \"listbox\", \"x\": 0, \"y\": 0, \"w\": 200, \"h\": 80,\n"
+        + "     \"sel\": 1,\n"
+        + "     \"items\": [\"plain\", \"two\\nlines\", \"tab\\there\","
+        + " \"comma,here\", \"quote\\\"here\", \"back\\\\slash\", \"\"]}\n"
+        + "  ]\n"
+        + "}\n"
+    var x = form.Form_from_json(tricky, -1, -1)
+    check_int("7 items, NOT 8 - the newline did not split one into two",
+              widgets.Ui_item_count_at(x, 0), 7)
+    check("item 0", widgets.Ui_item_at(x, 0, 0), "plain")
+    check_int("item 1 is one item two lines long (its length says so)",
+              widgets.Ui_item_at(x, 0, 1).len(), 9)
+    check("item 1 contains a real newline",
+          widgets.Ui_item_at(x, 0, 1), "two\nlines")
+    check("item 2 contains a real tab", widgets.Ui_item_at(x, 0, 2), "tab\there")
+    check("item 3 contains a comma", widgets.Ui_item_at(x, 0, 3), "comma,here")
+    check("item 4 contains a quote", widgets.Ui_item_at(x, 0, 4), "quote\"here")
+    check("item 5 contains a backslash",
+          widgets.Ui_item_at(x, 0, 5), "back\\slash")
+    check_int("item 6 is empty and still an item",
+              widgets.Ui_item_at(x, 0, 6).len(), 0)
+    check_int("the selection past those items survived",
+              widgets.Ui_sel_at(x, 0), 1)
+
+    // And it survives OUR writer too, not only the parser: save it and load it
+    // back. This is the half that catches an escaping bug on the way OUT, which
+    // a hand-written document cannot reach.
+    var tpath = "/tmp/wyn_form_tricky.json"
+    check_int("saving the tricky form", form.Form_save(x, tpath), 1)
+    var y = form.Form_load(tpath, -1, -1)
+    check("the delimiter-bearing item survives OUR serialiser as well",
+          form.Form_diff(x, y), "")
+    check_int("still 7 items after a real save/load",
+              widgets.Ui_item_count_at(y, 0), 7)
+    check("still one item, two lines", widgets.Ui_item_at(y, 0, 1), "two\nlines")
+
+    // ---- AI-EDITING CASE 3: [] is not the same as absent --------------------
+    //
+    // An assistant that empties a dropdown's list writes "items": []. If the
+    // loader treated that as "no opinion" the old list would come back, so the
+    // edit would appear to have been ignored - the worst outcome for a format
+    // whose whole premise is that editing the file IS the operation.
+    print("")
+    print("--- an explicitly EMPTIED item list ---")
+    var emptied = "{\"form\": \"Emptied\", \"widgets\": [\n"
+        + "  {\"kind\": \"dropdown\", \"x\": 0, \"y\": 0, \"w\": 90, \"h\": 24,"
+        + " \"items\": [], \"sel\": -1}\n"
+        + "]}\n"
+    var z = form.Form_from_json(emptied, -1, -1)
+    check_int("an explicit [] loads as zero items",
+              widgets.Ui_item_count_at(z, 0), 0)
+    // And a form whose list WAS emptied in memory writes [] rather than omitting
+    // the key, so the emptying survives the trip.
+    var cleared = widgets.Ui_set_items(b, widgets.Ui_id_at(b, I_DROPDOWN), "")
+    // Ui_set_items splits, and splitting "" gives one empty item - the in-memory
+    // API's own limitation, stated here rather than worked around, because the
+    // point is that whatever the model holds is what the document says.
+    check_int("Ui_set_items(\"\") leaves one empty item (the split contract)",
+              widgets.Ui_item_count_at(cleared, I_DROPDOWN), 1)
+    var cpath = "/tmp/wyn_form_cleared.json"
+    check_int("saving the cleared form", form.Form_save(cleared, cpath), 1)
+    var cl = form.Form_load(cpath, -1, -1)
+    check("a cleared list round-trips exactly as the model holds it",
+          form.Form_diff(cleared, cl), "")
+
+    print("")
+    if fails == 0 {
+        print("=== ALL FORM ROUND-TRIP TESTS PASSED ===")
+    } else {
+        print("=== ${fails} FORM ROUND-TRIP TEST(S) FAILED ===")
+    }
+}

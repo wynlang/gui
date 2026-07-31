@@ -835,10 +835,45 @@ pub fn Ui_set_design_size(ui: Ui, w: int, h: int) -> Ui {
 // the generated Form1.designer.wyn is what turns the name back into a call.
 // Pretending otherwise - accepting a handler here - would suggest load/save can
 // preserve behaviour, which it cannot and must not appear to.
+//
+// WHY THIS TAKES 24 PARAMETERS INSTEAD OF CALLING THE SETTERS
+//
+// Every persisted field could be written afterwards with Ui_set_group /
+// Ui_set_sel / Ui_set_range / Ui_set_val / Ui_set_tooltip / Ui_set_owner /
+// Ui_set_page, and that would be a shorter signature. It would also be WRONG,
+// for two reasons a loader cannot work around:
+//
+//  - Those setters VALIDATE. Ui_set_sel clamps to the item list; Ui_set_val
+//    snaps to the step grid and clamps to [vmin, vmax]. That is correct for a
+//    designer's property inspector - an out-of-range value must never be stored
+//    by a human's edit - and it is exactly wrong for a loader, whose job is to
+//    reproduce the document. A form built by `Ui_dropdown(items, .., 9)` with
+//    three items HAS sel = 9 in memory (the constructor honours it verbatim, see
+//    Ui_radio's note on the same decision); reloading it as sel = 2 is a round
+//    trip that changes the widget.
+//  - They are ORDER-DEPENDENT. Ui_set_range re-clamps the current value, so
+//    range-then-value and value-then-range give different answers, and a loader
+//    that got the order wrong would corrupt only the sliders whose value happens
+//    to sit off the new grid - the hardest possible bug to notice.
+//
+// So this assigns verbatim. An out-of-range `sel` is inert everywhere it is read
+// (every draw and hit path bounds-checks the item list), so reproducing the
+// document faithfully cannot crash - it can only preserve something the author
+// wrote.
+//
+// `items` is NOT a parameter: it is a list, and a module function cannot take an
+// array parameter (see the join_lines_at note). A packed string would reintroduce
+// the delimiter problem the document format exists to avoid, so the loader calls
+// Ui_add_item once per item instead - which also means an item containing a
+// newline survives, which no delimited encoding can offer.
 pub fn Ui_add_raw(ui: Ui, id: int, kind: int, x: int, y: int, w: int, h: int,
                   label: string, text: string, checked: int, enabled: int,
                   handler_name: string,
-                  al: int, ar: int, at: int, ab: int) -> Ui {
+                  al: int, ar: int, at: int, ab: int,
+                  group: string,
+                  sel: int, val: int, vmin: int, vmax: int, vstep: int,
+                  tooltip: string,
+                  owner: int, page: int) -> Ui {
     var u = ui
     var wd = make_widget(id, kind, x, y, w, h, label, checked, text, noop_handler)
     wd.enabled = enabled
@@ -847,12 +882,64 @@ pub fn Ui_add_raw(ui: Ui, id: int, kind: int, x: int, y: int, w: int, h: int,
     wd.anchor_right = ar
     wd.anchor_top = at
     wd.anchor_bottom = ab
+    wd.group = group
+    wd.sel = sel
+    wd.val = val
+    wd.vmin = vmin
+    wd.vmax = vmax
+    wd.vstep = vstep
+    wd.tooltip = tooltip
+    wd.owner = owner
+    wd.page = page
     if kind == KIND_TEXTAREA { wd.lines = split_lines(text) }
     u.widgets.push(wd)
     // next_id must clear every id in the document, or the next widget the user
     // places collides with a loaded one and two controls share an id - after
     // which every id-keyed operation silently hits the wrong one.
     if id >= u.next_id { u.next_id = id + 1 }
+    return u
+}
+
+// Append ONE item to a widget's item list, verbatim.
+//
+// This is the loader's counterpart to Ui_set_items, and the difference between
+// them is the whole reason it exists: Ui_set_items takes a NEWLINE-DELIMITED
+// string and splits it, so an item that contains a newline is impossible to
+// express - `Ui_set_items(ui, id, "two\nlines")` is two items, not one. That is
+// fine for a constructor a human writes and fatal for a loader, because the JSON
+// document stores items as a real JSON array where a newline inside a string is
+// just `\n` and carries no structure.
+//
+// So the document round trip goes array-element -> Ui_add_item, one call per
+// item, and never through a delimiter. Also useful at runtime: appending to a
+// listbox no longer means re-serialising the whole list.
+//
+// The selection is NOT touched. Growing a list cannot invalidate a selection, and
+// the loader sets `sel` before the items exist (see Ui_add_raw) precisely so that
+// an out-of-range selection in the document survives instead of being clamped
+// against a half-built list.
+pub fn Ui_add_item(ui: Ui, id: int, s: string) -> Ui {
+    return Ui_add_item_at(ui, Ui_index_of(ui, id), s)
+}
+
+// The same, BY INDEX - which is what the JSON loader uses, and not merely for
+// symmetry with the other _at accessors.
+//
+// A loader appends to "the widget I just pushed", and it knows that widget's
+// INDEX exactly (count - 1) while it only knows its id as whatever the document
+// claimed. A hand-edited document can name the same id twice; Ui_index_of would
+// then resolve to the FIRST of them and the second widget's items would be
+// appended to the first one's list. Going by index makes that impossible, so a
+// duplicate id degrades to "two widgets share an id" (already survivable - see
+// Ui_add_raw's next_id note) rather than to "one widget silently ate the other's
+// items".
+pub fn Ui_add_item_at(ui: Ui, i: int, s: string) -> Ui {
+    var u = ui
+    if in_range(u, i) == 0 { return u }
+    // `"" + s`, not `s`: pushing a PARAMETER string stores the caller's pointer
+    // without retaining it and the caller's scope-exit release then frees the
+    // string this array holds. Same family as the insert_line_at note above.
+    u.widgets[i].items.push("" + s)
     return u
 }
 
@@ -1838,6 +1925,20 @@ pub fn Ui_item(ui: Ui, id: int, n: int) -> string {
     return item_copy(ui, i, n)
 }
 
+// The same two, BY INDEX. The serialiser walks 0..Ui_count and so does Form_diff;
+// going through the by-id pair would make each field read an O(n) id lookup and,
+// worse, would silently read the wrong widget if a document ever contained a
+// duplicate id (which a hand-edited one can).
+pub fn Ui_item_count_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].items.len()
+}
+
+pub fn Ui_item_at(ui: Ui, i: int, n: int) -> string {
+    if in_range(ui, i) == 0 { return "" }
+    return item_copy(ui, i, n)
+}
+
 // Replace the item list. Newline-separated, exactly as the constructors take it.
 //
 // The selection is CLAMPED rather than reset: a designer retyping the item list
@@ -1857,6 +1958,11 @@ pub fn Ui_set_items(ui: Ui, id: int, s: string) -> Ui {
 pub fn Ui_sel(ui: Ui, id: int) -> int {
     var i = Ui_index_of(ui, id)
     if i == -1 { return -1 }
+    return ui.widgets[i].sel
+}
+
+pub fn Ui_sel_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return -1 }
     return ui.widgets[i].sel
 }
 
@@ -1955,6 +2061,34 @@ pub fn Ui_vmax(ui: Ui, id: int) -> int {
 pub fn Ui_vstep(ui: Ui, id: int) -> int {
     var i = Ui_index_of(ui, id)
     if i == -1 { return 0 }
+    return ui.widgets[i].vstep
+}
+
+// The numeric four BY INDEX, for the serialiser and the diff.
+//
+// The neutral value for an out-of-range index is 0 for val/vmin and NOT for
+// vmax/vstep: the by-id pair above returns 0 for all four, which is a lie for a
+// range - a 0..0 range with step 0 is not a state any widget can be in, and a
+// serialiser that wrote it would produce a document that loads as a dead slider.
+// These mirror make_widget's defaults instead, so a missing widget serialises as
+// a DEFAULT one rather than as a broken one.
+pub fn Ui_val_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].val
+}
+
+pub fn Ui_vmin_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 0 }
+    return ui.widgets[i].vmin
+}
+
+pub fn Ui_vmax_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 100 }
+    return ui.widgets[i].vmax
+}
+
+pub fn Ui_vstep_at(ui: Ui, i: int) -> int {
+    if in_range(ui, i) == 0 { return 1 }
     return ui.widgets[i].vstep
 }
 
@@ -2565,6 +2699,11 @@ pub fn Ui_set_tooltip(ui: Ui, id: int, s: string) -> Ui {
 pub fn Ui_tooltip_of(ui: Ui, id: int) -> string {
     var i = Ui_index_of(ui, id)
     if i == -1 { return "" }
+    return ui.widgets[i].tooltip
+}
+
+pub fn Ui_tooltip_at(ui: Ui, i: int) -> string {
+    if in_range(ui, i) == 0 { return "" }
     return ui.widgets[i].tooltip
 }
 
