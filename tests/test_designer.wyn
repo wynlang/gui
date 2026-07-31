@@ -386,6 +386,40 @@ fn ergonomics_tests() {
     check_val("a nudge moves the whole selection, not just the primary",
               o, "prop(x)", "16")
 
+    print("-- SHIFT makes an arrow key a grid step, and both Shift keys count --")
+    // The modifier had NO coverage at all, for a mechanical reason: shift_held()
+    // polls the real keyboard with Win_key_down, and a synthetic key event does
+    // not update that state under SDL_VIDEODRIVER=dummy - so the shifted branch
+    // was unreachable from a test. It is now injectable (`shift:0|1|auto`), which
+    // is the same argument the toolkit's injectable clock makes: anything that
+    // depends on the outside world has to be substitutable or it is untestable,
+    // and untested modifier handling is where a left/right-Shift bug can live
+    // unnoticed - the unshifted command just runs instead, silently.
+    //
+    // `arrow:` goes through nudge_cmd, the path an ARROW KEY takes. The existing
+    // `nudge:` calls do_nudge directly and cannot see the modifier at all.
+    //
+    // 96 rather than 100 because a placed widget snaps to the grid.
+    o = drive("tool:button;click:100:100;shift:0;arrow:1:0;p:x")
+    check_val("unshifted, an arrow moves 1px", o, "prop(x)", "97")
+    o = drive("tool:button;click:100:100;shift:1;arrow:1:0;p:x")
+    check_val("shifted, an arrow moves a whole grid step", o, "prop(x)", "104")
+    // Vertical too, so the multiplier is not applied on one axis only.
+    o = drive("tool:button;click:100:100;shift:1;arrow:0:1;p:y")
+    check_val("shifted, a vertical arrow also steps the grid", o, "prop(y)", "104")
+    // And the modifier must not LATCH: a shifted nudge followed by an unshifted
+    // one moves 8 then 1, not 8 then 8.
+    o = drive("tool:button;click:100:100;shift:1;arrow:1:0;shift:0;arrow:1:0;p:x")
+    check_val("shift does not latch across nudges", o, "prop(x)", "105")
+    // WHAT THESE FOUR CANNOT REACH, stated rather than left to be assumed. They
+    // drive the INJECTED shift, so they prove every consumer of shift_held()
+    // honours it - but not shift_held()'s own reading of the hardware. Measured:
+    // breaking the RSHIFT line fails none of them. That line is unreachable from
+    // a headless test by construction (Win_key_down reads a keyboard state that a
+    // synthetic event does not touch), so the alternative to leaving it uncovered
+    // is not a better test, it is a human pressing right-Shift. It is two
+    // symmetric lines beside a tested one.
+
     print("-- align to the PRIMARY, not to the leftmost --")
     // #1 is at x=0 and #2 at x=200. Selecting 1 THEN 2 makes #2 the primary, so
     // #1 must move to 200 - which is the interesting direction: "align to

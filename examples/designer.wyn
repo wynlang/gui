@@ -606,7 +606,7 @@ fn hist_undo(f: Ui) -> Ui {
     }
     g_hcur = g_hcur - 1
     g_status = "undo (" + g_hcur.to_string() + "/" + (g_hn - 1).to_string() + ")"
-    return g_hist[g_hcur]
+    return clone_ui(g_hist[g_hcur], 0 - 1, 0 - 1)
 }
 
 fn hist_redo(f: Ui) -> Ui {
@@ -1640,8 +1640,28 @@ fn tb_command(i: int) -> string {
 
 // Is the shift key held? Polled rather than read off the event, because SDL
 // reports modifiers as state and a synthetic key event carries none.
+// Injectable Shift state, so the modifier can be tested headlessly.
+//
+// `Win_key_down` reads the real keyboard, and a SYNTHETIC key event does not
+// update that state under SDL_VIDEODRIVER=dummy - so a chord cannot be driven
+// end-to-end in CI, and every shifted command (redo, lower, align right/bottom)
+// was therefore untested. -1 means "ask the hardware"; 0 or 1 forces the answer.
+// Same reasoning as the toolkit's injectable clock in widgets.wyn: anything that
+// depends on the outside world has to be substitutable or the behaviour is
+// untestable, and untested modifier handling is exactly where the left/right bug
+// below was able to live.
+var g_shift_override = -1
+
 fn shift_held() -> int {
+    if g_shift_override >= 0 { return g_shift_override }
     if gui.Win_key_down(gui.SCANCODE_LSHIFT) == 1 { return 1 }
+    // BOTH shift keys. Testing only the left one is broken for everyone who
+    // holds Shift with their right hand while the left hand is on the mouse -
+    // which is most people, most of the time, and is invisible to a
+    // right-handed developer testing their own habits. Shift here selects the
+    // opposite of every shifted command (redo, lower, align right/bottom), so
+    // the failure is silent: the unshifted command runs instead.
+    if gui.Win_key_down(gui.SCANCODE_RSHIFT) == 1 { return 1 }
     return 0
 }
 
@@ -2029,6 +2049,17 @@ fn script_one(fm: Ui, cmd: string) -> Ui {
         print("tool=" + widgets.Ui_kind_name(g_tool))
         return f
     }
+    // shift:0|1|auto - force the Shift modifier, so the SHIFTED half of every
+    // command (redo, lower, align right/bottom, distribute) can be driven in CI.
+    // A synthetic key event does not update the polled keyboard state under the
+    // dummy video driver, so without this the shifted branches are unreachable
+    // from a test and were entirely uncovered.
+    if op == "shift" {
+        var sv = "" + p[1]
+        if sv == "auto" { g_shift_override = 0 - 1 } else { g_shift_override = sv.to_int() }
+        print("shift=" + g_shift_override.to_string())
+        return f
+    }
     if op == "click" {
         f = script_click(f, ("" + p[1]).to_int(), ("" + p[2]).to_int())
         // ONE key=value per line, always. A test greps by key, so a line that
@@ -2057,6 +2088,14 @@ fn script_one(fm: Ui, cmd: string) -> Ui {
         f = do_nudge(f, ("" + p[1]).to_int(), ("" + p[2]).to_int())
         insp_refresh(f)
         hist_push(f)
+        return f
+    }
+    // arrow:dx:dy - a nudge through nudge_cmd, the path an ARROW KEY takes, so
+    // the Shift-means-grid-step rule is exercised. `nudge:` above calls do_nudge
+    // directly and therefore cannot see the modifier at all - which is why the
+    // grid-step branch had no coverage.
+    if op == "arrow" {
+        f = nudge_cmd(f, ("" + p[1]).to_int(), ("" + p[2]).to_int())
         return f
     }
     if op == "count" {
