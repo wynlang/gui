@@ -67,6 +67,21 @@ var KIND_GROUPBOX = 12
 var KIND_SPINNER = 13
 var KIND_MENUBAR = 14
 
+// A TREE: a listbox whose rows carry a DEPTH and an expanded/collapsed state.
+//
+// Built on the listbox rather than beside it, because everything a tree needs
+// except indentation and folding already exists there - rows, a selection,
+// scrolling, keyboard movement and hit testing - and a second implementation of
+// row geometry is a second thing that can disagree with the painter about which
+// row a click landed on.
+//
+// DEPTH IS ENCODED IN THE ITEM TEXT, as leading tab characters. A parallel
+// depth array would be a second list that can fall out of step with the items
+// (this repo has that scar twice over: widgets.wyn's own column lists and
+// wyncanvas's layer store). One list cannot disagree with itself, and "\tchild"
+// is legible in a form document and in a diff.
+var KIND_TREE = 15
+
 // A single control. One flat struct for every kind rather than a variant per
 // kind: a designer's property inspector wants a uniform field set to read and
 // write, and `checked` being meaningless on a label costs one int.
@@ -735,6 +750,246 @@ pub fn Ui_listbox(ui: Ui, items: string, x: int, y: int, w: int, h: int,
     return u
 }
 
+// A tree. `items` is newline-separated, and LEADING TABS give each row's depth.
+//
+//     Ui_tree(ui, "root\n\tchild\n\tchild 2\n\t\tgrandchild", ...)
+//
+// A row with children is a FOLDER and can be collapsed; a row deeper than its
+// predecessor is that predecessor's child. That is the entire model - there is no
+// separate parent list, because a second list can disagree with the first.
+//
+// Collapsed state lives in `group`, one character per row ("o" open, "c" closed),
+// for the same reason: it is indexed by the same positions as `items`, so a row
+// inserted without a matching flag is visible in one string rather than silently
+// misaligned across two arrays. A missing character reads as open, so a caller
+// that never touches folding gets a fully expanded tree.
+pub fn Ui_tree(ui: Ui, items: string, x: int, y: int, w: int, h: int,
+               sel: int, handler: fn(int) -> void) -> Ui {
+    var u = ui
+    var wd = make_widget(u.next_id, KIND_TREE, x, y, w, h,
+                         "", 0, "", handler)
+    wd.items = split_lines(items)
+    wd.sel = sel
+    wd.scroll = 0
+    wd.group = ""
+    u.widgets.push(wd)
+    u.next_id = u.next_id + 1
+    return u
+}
+
+// How many leading tabs row `n` has: its depth in the tree.
+pub fn Ui_tree_depth(ui: Ui, id: int, n: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    if n < 0 { return 0 }
+    if n >= ui.widgets[i].items.len() { return 0 }
+    // item_copy, NOT a direct ui.widgets[i].items[n]. The direct read emits a
+    // borrowed pointer plus a scope-exit release, which frees the string the array
+    // still holds - so the item reads back EMPTY after being touched once. That is
+    // documented at item_copy and line_copy, and this function rediscovered it the
+    // hard way: every label came back as "".
+    var t = item_copy(ui, i, n)
+    var d = 0
+    while d < t.len() {
+        if t.substring(d, d + 1) != "\t" { return d }
+        d = d + 1
+    }
+    return d
+}
+
+// Row `n`'s label, without its indentation.
+pub fn Ui_tree_label(ui: Ui, id: int, n: int) -> string {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return "" }
+    if n < 0 { return "" }
+    if n >= ui.widgets[i].items.len() { return "" }
+    var d = Ui_tree_depth(ui, id, n)
+    var t = item_copy(ui, i, n)
+    return t.substring(d, t.len())
+}
+
+// Does row `n` have children? True when the NEXT row is deeper.
+//
+// Derived rather than stored, so it cannot disagree with the item list: a row
+// gains and loses its folder-ness purely by what follows it.
+pub fn Ui_tree_has_children(ui: Ui, id: int, n: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    if n < 0 { return 0 }
+    if n + 1 >= ui.widgets[i].items.len() { return 0 }
+    if Ui_tree_depth(ui, id, n + 1) > Ui_tree_depth(ui, id, n) { return 1 }
+    return 0
+}
+
+// Is row `n` expanded? Anything without an explicit "c" is open, so a caller that
+// never folds anything sees the whole tree.
+pub fn Ui_tree_open(ui: Ui, id: int, n: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 1 }
+    if n < 0 { return 1 }
+    // A FRESH COPY, for the reason item_copy and line_copy document: reading a
+    // string field of a widget directly emits a borrowed pointer plus a scope-exit
+    // release, so this function FREES the widget's own `group` string on the way
+    // out. The symptom was spectacular and worth recording - the first read
+    // returned the right answer, and every read after it saw an empty string, so a
+    // folded tree silently unfolded itself one call later.
+    var g = "" + ui.widgets[i].group
+    if n >= g.len() { return 1 }
+    if g.substring(n, n + 1) == "c" { return 0 }
+    return 1
+}
+
+pub fn Ui_tree_set_open(ui: Ui, id: int, n: int, open: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    if n < 0 { return u }
+    if n >= u.widgets[i].items.len() { return u }
+    // Pad to n+1 so the string is indexable at n. Padding with "o" keeps the
+    // default (open) for every row this call is not about.
+    var g = "" + u.widgets[i].group
+    while g.len() <= n { g = g + "o" }
+    var head = g.substring(0, n)
+    var tail = g.substring(n + 1, g.len())
+    if open == 1 { u.widgets[i].group = head + "o" + tail }
+    else { u.widgets[i].group = head + "c" + tail }
+    return u
+}
+
+pub fn Ui_tree_toggle(ui: Ui, id: int, n: int) -> Ui {
+    if Ui_tree_open(ui, id, n) == 1 { return Ui_tree_set_open(ui, id, n, 0) }
+    return Ui_tree_set_open(ui, id, n, 1)
+}
+
+// Is row `n` hidden because an ANCESTOR is collapsed?
+//
+// Walks backwards looking for a shallower row: the first one found is the parent,
+// and if it or anything above it is closed, this row is hidden. Computed rather
+// than cached because the answer changes with every fold, and a cache that is one
+// fold stale draws rows that cannot be clicked.
+pub fn Ui_tree_hidden(ui: Ui, id: int, n: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    var d = Ui_tree_depth(ui, id, n)
+    if d == 0 { return 0 }
+    var want = d
+    var k = n - 1
+    while k >= 0 {
+        var dk = Ui_tree_depth(ui, id, k)
+        if dk < want {
+            if Ui_tree_open(ui, id, k) == 0 { return 1 }
+            want = dk
+            if dk == 0 { return 0 }
+        }
+        k = k - 1
+    }
+    return 0
+}
+
+// How many rows are actually VISIBLE - the count a scrollbar and a keyboard
+// walk care about.
+pub fn Ui_tree_visible_count(ui: Ui, id: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    var n = 0
+    var k = 0
+    while k < ui.widgets[i].items.len() {
+        if Ui_tree_hidden(ui, id, k) == 0 { n = n + 1 }
+        k = k + 1
+    }
+    return n
+}
+
+// The item index shown at visible position `v`, or -1.
+//
+// The mapping a painter and a click both need, in ONE place: a painter that
+// counted visible rows itself and a hit test that counted them again is the
+// classic off-by-one where clicking row 4 selects row 5 once something is folded.
+pub fn Ui_tree_item_at_visible(ui: Ui, id: int, v: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 - 1 }
+    var seen = 0
+    var k = 0
+    while k < ui.widgets[i].items.len() {
+        if Ui_tree_hidden(ui, id, k) == 0 {
+            if seen == v { return k }
+            seen = seen + 1
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// The visible position of item `n`, or -1 if it is hidden.
+pub fn Ui_tree_visible_of_item(ui: Ui, id: int, n: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 - 1 }
+    if Ui_tree_hidden(ui, id, n) == 1 { return 0 - 1 }
+    var seen = 0
+    var k = 0
+    while k < n {
+        if Ui_tree_hidden(ui, id, k) == 0 { seen = seen + 1 }
+        k = k + 1
+    }
+    return seen
+}
+
+// Move the selection by `d` VISIBLE rows, skipping anything a fold has hidden.
+//
+// By visible position rather than by item index, because stepping the index would
+// walk into a collapsed subtree: the selection would vanish for several keypresses
+// and then reappear, which reads as the keyboard being broken.
+pub fn Ui_tree_move(ui: Ui, id: int, d: int) -> Ui {
+    var u = ui
+    var i = Ui_index_of(u, id)
+    if i == -1 { return u }
+    var vis = Ui_tree_visible_count(u, id)
+    if vis == 0 { return u }
+
+    var cur = Ui_tree_visible_of_item(u, id, u.widgets[i].sel)
+    // A selection that is currently hidden (its parent was just folded) has no
+    // visible position; start from the top rather than refusing to move.
+    if cur < 0 { cur = 0 } else { cur = cur + d }
+    if cur < 0 { cur = 0 }
+    if cur >= vis { cur = vis - 1 }
+
+    var item = Ui_tree_item_at_visible(u, id, cur)
+    if item >= 0 { u.widgets[i].sel = item }
+    return fix_tree_scroll(u, i, cur)
+}
+
+// Scroll so visible row `v` is on screen. Both directions, for the same reason
+// the listbox and the textarea caret do it both ways: a selection moved off the
+// top is as invisible as one moved off the bottom.
+fn fix_tree_scroll(ui: Ui, i: int, v: int) -> Ui {
+    var u = ui
+    var rows = list_rows(u, i)
+    if rows <= 0 { return u }
+    if v < u.widgets[i].scroll { u.widgets[i].scroll = v }
+    if v >= u.widgets[i].scroll + rows { u.widgets[i].scroll = v - rows + 1 }
+    if u.widgets[i].scroll < 0 { u.widgets[i].scroll = 0 }
+    return u
+}
+
+// Centre-y of the visible row showing item `n`, for a test to click. -1 if the
+// item is hidden or scrolled out of view.
+pub fn Ui_tree_item_cy(ui: Ui, id: int, n: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 - 1 }
+    var v = Ui_tree_visible_of_item(ui, id, n)
+    if v < 0 { return 0 - 1 }
+    var rh = row_h(ui)
+    return ui.widgets[i].y + 2 + (v - ui.widgets[i].scroll) * rh + rh / 2
+}
+
+// The x a twisty occupies for item `n`, so a test can click the fold control
+// rather than guessing its column from the indent width.
+pub fn Ui_tree_twisty_cx(ui: Ui, id: int, n: int) -> int {
+    var i = Ui_index_of(ui, id)
+    if i == -1 { return 0 }
+    return ui.widgets[i].x + 4 + Ui_tree_depth(ui, id, n) * 12 + 5
+}
+
 // A tab strip. `titles` is newline-separated; the widget occupies only the STRIP
 // (x, y, w, h is the strip, not the page area).
 //
@@ -1149,6 +1404,7 @@ pub fn Ui_kind_name(kind: int) -> string {
     if kind == KIND_SLIDER { return "slider" }
     if kind == KIND_PROGRESS { return "progress" }
     if kind == KIND_LISTBOX { return "listbox" }
+    if kind == KIND_TREE { return "tree" }
     if kind == KIND_TABS { return "tabs" }
     if kind == KIND_GROUPBOX { return "groupbox" }
     if kind == KIND_SPINNER { return "spinner" }
@@ -1172,6 +1428,7 @@ pub fn Ui_kind_from_name(name: string) -> int {
     if name == "slider" { return KIND_SLIDER }
     if name == "progress" { return KIND_PROGRESS }
     if name == "listbox" { return KIND_LISTBOX }
+    if name == "tree" { return KIND_TREE }
     if name == "tabs" { return KIND_TABS }
     if name == "groupbox" { return KIND_GROUPBOX }
     if name == "spinner" { return KIND_SPINNER }
@@ -3018,6 +3275,33 @@ pub fn Ui_press(ui: Ui, mx: int, my: int) -> Ui {
         u.widgets[ti].val = Ui_slider_value_at(u, target, mx)
     }
 
+    if kind == KIND_TREE {
+        u.focus = target
+        // Rows are indexed by VISIBLE position here, then mapped to an item -
+        // through the same two functions the painter uses, so a click cannot
+        // land on a different row from the one drawn once something is folded.
+        var rh = row_h(u)
+        var voff = my - u.widgets[ti].y - 2
+        if voff >= 0 {
+            var vrow = u.widgets[ti].scroll + voff / rh
+            var item = Ui_tree_item_at_visible(u, target, vrow)
+            if item >= 0 {
+                // THE TWISTY IS THE INDENT COLUMN of a folder row. Clicking a
+                // folder's LABEL selects it; clicking its twisty folds it. Two
+                // meanings in one row, split by x, which is what every tree does.
+                var d = Ui_tree_depth(u, target, item)
+                var tx = u.widgets[ti].x + 4 + d * 12
+                if Ui_tree_has_children(u, target, item) == 1 and mx < tx + 12 {
+                    u = Ui_tree_toggle(u, target, item)
+                } else {
+                    u.widgets[ti].sel = item
+                    u.active = target
+                }
+            }
+        }
+        return u
+    }
+
     if kind == KIND_LISTBOX {
         u.focus = target
         var r = list_row_at(u, ti, my)
@@ -3204,6 +3488,20 @@ fn key_to_focus(u: Ui, key: int) -> Ui {
         return cu
     }
 
+    if kind == KIND_TREE {
+        // Up/down move by VISIBLE row, so a collapsed subtree is skipped rather
+        // than walked through invisibly. Left/right fold and unfold, which is the
+        // keyboard convention for every tree.
+        if key == gui.SCANCODE_UP { return Ui_tree_move(cu, fid, 0 - 1) }
+        if key == gui.SCANCODE_DOWN { return Ui_tree_move(cu, fid, 1) }
+        if key == gui.SCANCODE_LEFT {
+            return Ui_tree_set_open(cu, fid, cu.widgets[i].sel, 0)
+        }
+        if key == gui.SCANCODE_RIGHT {
+            return Ui_tree_set_open(cu, fid, cu.widgets[i].sel, 1)
+        }
+        return cu
+    }
     if kind == KIND_LISTBOX {
         if key == gui.SCANCODE_UP { return Ui_listbox_move(cu, fid, 0 - 1) }
         if key == gui.SCANCODE_DOWN { return Ui_listbox_move(cu, fid, 1) }
@@ -3278,6 +3576,12 @@ fn focus_owns_key(ui: Ui, key: int) -> int {
     if kind == KIND_LISTBOX {
         if key == gui.SCANCODE_UP { return 1 }
         if key == gui.SCANCODE_DOWN { return 1 }
+    }
+    if kind == KIND_TREE {
+        if key == gui.SCANCODE_UP { return 1 }
+        if key == gui.SCANCODE_DOWN { return 1 }
+        if key == gui.SCANCODE_LEFT { return 1 }
+        if key == gui.SCANCODE_RIGHT { return 1 }
     }
     if kind == KIND_SLIDER {
         if key == gui.SCANCODE_LEFT { return 1 }
@@ -3947,6 +4251,65 @@ fn draw_widget(ui: Ui, w: Widget) {
         }
         gui.Win_rect(win, w.x + 1, w.y + 1, fill, w.h - 2, gr, gg, gb)
         gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, 120, 120, 140)
+        return
+    }
+
+    if w.kind == KIND_TREE {
+        // Frame and background, matching the listbox so the two read as the same
+        // family of control.
+        gui.Win_rect(win, w.x, w.y, w.w, w.h, 16, 16, 20)
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, 90, 90, 110)
+        var trh = row_h(ui)
+        // Row count from the widget's own height, because draw_widget receives a
+        // Widget rather than an index and list_rows takes an index. Same formula,
+        // and it is only two lines - a helper taking a Widget would be a third
+        // spelling of it.
+        var tvis = (w.h - 4) / trh
+        if tvis < 1 { tvis = 1 }
+        var tfr = ui.fg_r
+        var tfg = ui.fg_g
+        var tfb = ui.fg_b
+        if w.enabled == 0 { tfr = 110 tfg = 110 tfb = 120 }
+
+        var vr = 0
+        while vr < tvis {
+            var vitem = Ui_tree_item_at_visible(ui, w.id, w.scroll + vr)
+            if vitem >= 0 {
+                var ry2 = w.y + 2 + vr * trh
+                if vitem == w.sel {
+                    gui.Win_rect(win, w.x + 1, ry2, w.w - 2, trh,
+                                 ui.accent_r, ui.accent_g, ui.accent_b)
+                }
+                var dep = Ui_tree_depth(ui, w.id, vitem)
+                var indent = w.x + 4 + dep * 12
+                // A TWISTY ONLY WHERE THERE ARE CHILDREN. Drawing one on every row
+                // would invite a click that does nothing, which is worse than no
+                // affordance at all. "-" open, "+" closed: two characters rather
+                // than a triangle, because the toolkit draws text and rectangles
+                // and a hand-built triangle at this size is a smudge.
+                if Ui_tree_has_children(ui, w.id, vitem) == 1 {
+                    var mark = "-"
+                    if Ui_tree_open(ui, w.id, vitem) == 0 { mark = "+" }
+                    gui.Win_text(win, font, mark, indent, ry2 + 1, tfr, tfg, tfb)
+                }
+                gui.Win_text(win, font, Ui_tree_label(ui, w.id, vitem),
+                             indent + 12, ry2 + 1, tfr, tfg, tfb)
+            }
+            vr = vr + 1
+        }
+        // A scrollbar when the VISIBLE rows outnumber the box, counted after
+        // folding - a bar sized to the raw item count would claim there is more to
+        // see than a collapsed tree actually has.
+        var tvc = Ui_tree_visible_count(ui, w.id)
+        if tvc > tvis {
+            var trh2 = w.h - 4
+            var thh2 = (trh2 * tvis) / tvc
+            if thh2 < 8 { thh2 = 8 }
+            var sp2 = tvc - tvis
+            var sty2 = w.y + 2
+            if sp2 > 0 { sty2 = w.y + 2 + ((trh2 - thh2) * w.scroll) / sp2 }
+            gui.Win_rect(win, w.x + w.w - 6, sty2, 4, thh2, 90, 90, 110)
+        }
         return
     }
 

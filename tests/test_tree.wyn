@@ -1,0 +1,233 @@
+// test_tree - the TREE widget: depth, folding, and what a click lands on.
+//
+//   SDL_VIDEODRIVER=dummy WYN_ROOT=/path/to/wyn  wyn run tests/test_tree.wyn
+//
+// WHY A TREE AT ALL. A layer panel, a file browser and a form outline are all the
+// same control, and every one of them was previously a flat listbox with the
+// hierarchy written into the labels by hand. WynCanvas grew real layer groups and
+// needs to show them.
+//
+// WHAT THIS FILE IS MOSTLY ABOUT: the mapping between an ITEM index and a VISIBLE
+// row. Those two are the same number only while nothing is folded, and every
+// interesting bug in a tree lives in the gap between them - a painter that counts
+// visible rows one way and a hit test that counts them another gives you a control
+// where clicking row 4 selects row 5, but only after you collapse something. So
+// the geometry is asked of the widget (Ui_tree_item_cy, Ui_tree_twisty_cx) and
+// never recomputed here: a test holding its own copy of the formula passes whether
+// or not the widget agrees with it.
+//
+// Depth is encoded as leading TABS in the item text, and folded state as one
+// character per row in a single string. Both are single sources of truth on
+// purpose - a parallel depth array or a parallel flag array is a second list that
+// can fall out of step with the items, which is a bug this repo has already had
+// twice (widgets.wyn's own column lists, wyncanvas's layer store).
+
+import gui
+import widgets
+
+var fails = 0
+
+fn check(label: string, got: string, want: string) {
+    if got == want {
+        print("  ok   ${label} = [${got}]")
+    } else {
+        print("  FAIL ${label}: got [${got}] want [${want}]")
+        fails = fails + 1
+    }
+}
+
+fn check_int(label: string, got: int, want: int) {
+    check(label, got.to_string(), want.to_string())
+}
+
+fn on_pick(id: int) { }
+
+// A four-level tree:
+//   0 root
+//   1   alpha
+//   2     alpha-1
+//   3   beta
+//   4 second
+fn sample() -> string {
+    return "root\n\talpha\n\t\talpha-1\n\tbeta\nsecond"
+}
+
+fn main() {
+    print("=== TREE: depth comes from leading tabs ===")
+    var ui = widgets.Ui_new(0 - 1, 0 - 1)
+    ui = widgets.Ui_tree(ui, sample(), 10, 10, 200, 200, 0, on_pick)
+    var t = widgets.Ui_last_id(ui)
+
+    check_int("root depth", widgets.Ui_tree_depth(ui, t, 0), 0)
+    check_int("alpha depth", widgets.Ui_tree_depth(ui, t, 1), 1)
+    check_int("alpha-1 depth", widgets.Ui_tree_depth(ui, t, 2), 2)
+    check_int("beta depth", widgets.Ui_tree_depth(ui, t, 3), 1)
+    check_int("second depth", widgets.Ui_tree_depth(ui, t, 4), 0)
+
+    print("=== the label is the text WITHOUT its indentation ===")
+    // A label that kept its tabs would be drawn with them and would compare
+    // unequal to the name the program actually holds.
+    check("root label", widgets.Ui_tree_label(ui, t, 0), "root")
+    check("alpha label", widgets.Ui_tree_label(ui, t, 1), "alpha")
+    check("alpha-1 label", widgets.Ui_tree_label(ui, t, 2), "alpha-1")
+
+    print("=== a row is a FOLDER when the next row is deeper ===")
+    // Derived, not stored, so it cannot disagree with the item list.
+    check_int("root has children", widgets.Ui_tree_has_children(ui, t, 0), 1)
+    check_int("alpha has children", widgets.Ui_tree_has_children(ui, t, 1), 1)
+    check_int("alpha-1 is a leaf", widgets.Ui_tree_has_children(ui, t, 2), 0)
+    check_int("beta is a leaf", widgets.Ui_tree_has_children(ui, t, 3), 0)
+    // The LAST row can never be a folder, and that is the off-by-one this checks:
+    // has_children looks at n+1, which is out of range here.
+    check_int("the last row is a leaf", widgets.Ui_tree_has_children(ui, t, 4), 0)
+
+    print("=== everything is open by default ===")
+    // A caller that never folds anything must see the whole tree, so a row with no
+    // recorded state reads as open rather than closed.
+    check_int("root open", widgets.Ui_tree_open(ui, t, 0), 1)
+    check_int("all five rows visible", widgets.Ui_tree_visible_count(ui, t), 5)
+
+    print("=== collapsing hides DESCENDANTS, not siblings ===")
+    ui = widgets.Ui_tree_set_open(ui, t, 1, 0)      // fold `alpha`
+    check_int("alpha is closed", widgets.Ui_tree_open(ui, t, 1), 0)
+    check_int("alpha itself stays visible", widgets.Ui_tree_hidden(ui, t, 1), 0)
+    check_int("alpha-1 is hidden", widgets.Ui_tree_hidden(ui, t, 2), 1)
+    // beta is alpha's SIBLING and must be unaffected - the bug where folding one
+    // node hides the rest of its level.
+    check_int("beta is unaffected", widgets.Ui_tree_hidden(ui, t, 3), 0)
+    check_int("second is unaffected", widgets.Ui_tree_hidden(ui, t, 4), 0)
+    check_int("four rows visible now", widgets.Ui_tree_visible_count(ui, t), 4)
+
+    print("=== folding an ANCESTOR hides a whole subtree ===")
+    ui = widgets.Ui_tree_set_open(ui, t, 1, 1)      // reopen alpha
+    ui = widgets.Ui_tree_set_open(ui, t, 0, 0)      // fold root
+    check_int("alpha hidden by root", widgets.Ui_tree_hidden(ui, t, 1), 1)
+    // The grandchild is hidden by root even though its own parent is OPEN, which
+    // is what makes this a walk up the ancestors rather than a parent check.
+    check_int("alpha-1 hidden by its GRANDparent", widgets.Ui_tree_hidden(ui, t, 2), 1)
+    check_int("beta hidden by root", widgets.Ui_tree_hidden(ui, t, 3), 1)
+    check_int("second still visible", widgets.Ui_tree_hidden(ui, t, 4), 0)
+    check_int("two rows visible", widgets.Ui_tree_visible_count(ui, t), 2)
+
+    print("=== item <-> visible position round-trips ===")
+    // With root folded, visible order is [root, second] = items [0, 4].
+    check_int("visible 0 is item 0", widgets.Ui_tree_item_at_visible(ui, t, 0), 0)
+    check_int("visible 1 is item 4", widgets.Ui_tree_item_at_visible(ui, t, 1), 4)
+    check_int("item 4 is at visible 1", widgets.Ui_tree_visible_of_item(ui, t, 4), 1)
+    // A hidden item has NO visible position, and saying 0 instead would put a
+    // click on the wrong row.
+    check_int("a hidden item has no position", widgets.Ui_tree_visible_of_item(ui, t, 2), 0 - 1)
+    check_int("out of range visible", widgets.Ui_tree_item_at_visible(ui, t, 99), 0 - 1)
+
+    print("=== toggle is its own inverse ===")
+    var before = widgets.Ui_tree_open(ui, t, 0)
+    ui = widgets.Ui_tree_toggle(ui, t, 0)
+    check_int("toggle flips it", widgets.Ui_tree_open(ui, t, 0), 1 - before)
+    ui = widgets.Ui_tree_toggle(ui, t, 0)
+    check_int("toggle twice restores", widgets.Ui_tree_open(ui, t, 0), before)
+
+    print("=== keyboard moves by VISIBLE row, skipping folds ===")
+    // The reason movement is by visible position and not by item index: stepping
+    // the index would walk into a collapsed subtree, so the selection would vanish
+    // for several keypresses and then reappear.
+    var k = widgets.Ui_new(0 - 1, 0 - 1)
+    k = widgets.Ui_tree(k, sample(), 10, 10, 200, 200, 0, on_pick)
+    var kt = widgets.Ui_last_id(k)
+    k = widgets.Ui_tree_set_open(k, kt, 1, 0)       // fold alpha, hiding alpha-1
+    k = widgets.Ui_set_focus(k, kt)
+    check_int("starts on root", widgets.Ui_sel(k, kt), 0)
+    k = widgets.Ui_key(k, gui.SCANCODE_DOWN)
+    check_int("down -> alpha", widgets.Ui_sel(k, kt), 1)
+    k = widgets.Ui_key(k, gui.SCANCODE_DOWN)
+    // NOT 2: alpha-1 is folded away, so the next visible row is beta at index 3.
+    check_int("down SKIPS the folded child", widgets.Ui_sel(k, kt), 3)
+    k = widgets.Ui_key(k, gui.SCANCODE_UP)
+    check_int("up comes back to alpha", widgets.Ui_sel(k, kt), 1)
+
+    print("=== right unfolds, left folds ===")
+    k = widgets.Ui_key(k, gui.SCANCODE_RIGHT)
+    check_int("right opens alpha", widgets.Ui_tree_open(k, kt, 1), 1)
+    k = widgets.Ui_key(k, gui.SCANCODE_DOWN)
+    check_int("now down reaches alpha-1", widgets.Ui_sel(k, kt), 2)
+    k = widgets.Ui_key(k, gui.SCANCODE_UP)
+    k = widgets.Ui_key(k, gui.SCANCODE_LEFT)
+    check_int("left folds alpha again", widgets.Ui_tree_open(k, kt, 1), 0)
+
+    print("=== movement stops at the ends rather than wrapping ===")
+    k = widgets.Ui_key(k, gui.SCANCODE_UP)
+    k = widgets.Ui_key(k, gui.SCANCODE_UP)
+    k = widgets.Ui_key(k, gui.SCANCODE_UP)
+    check_int("cannot go above the first row", widgets.Ui_sel(k, kt), 0)
+
+    print("=== a CLICK lands on the row that was drawn ===")
+    // Driven at the coordinate the WIDGET computes. A guessed pixel is a second
+    // copy of the row-height formula, and row height depends on the font - so a
+    // hardcoded offset silently tests a different row on another machine.
+    if gui.Win_available() == 1 {
+        var win = gui.Win_window("tree", 400, 400)
+        if win != 0 - 1 {
+            var font = gui.Win_font_default(14)
+            var c = widgets.Ui_new(win, font)
+            c = widgets.Ui_tree(c, sample(), 10, 10, 200, 200, 0, on_pick)
+            var ct = widgets.Ui_last_id(c)
+
+            // Click `beta` (item 3) by its LABEL, to the right of the twisty
+            // column, while everything is expanded.
+            var by = widgets.Ui_tree_item_cy(c, ct, 3)
+            c = widgets.Ui_press(c, 120, by)
+            check_int("clicking beta selects item 3", widgets.Ui_sel(c, ct), 3)
+
+            // Clicking a FOLDER's twisty folds it instead of selecting it - two
+            // meanings in one row, split by x, which is what every tree does.
+            var ay = widgets.Ui_tree_item_cy(c, ct, 1)
+            var ax = widgets.Ui_tree_twisty_cx(c, ct, 1)
+            c = widgets.Ui_press(c, ax, ay)
+            check_int("clicking alpha's twisty folds it", widgets.Ui_tree_open(c, ct, 1), 0)
+            check_int("...and does NOT move the selection", widgets.Ui_sel(c, ct), 3)
+
+            // Clicking the same folder's LABEL selects it.
+            c = widgets.Ui_press(c, 150, ay)
+            check_int("clicking alpha's label selects it", widgets.Ui_sel(c, ct), 1)
+            check_int("...and leaves it folded", widgets.Ui_tree_open(c, ct, 1), 0)
+
+            // AFTER a fold, a click must still land on the drawn row. With alpha
+            // folded, visible order is [root, alpha, beta, second], so the third
+            // visible row is beta - item 3, not item 2.
+            var third = widgets.Ui_tree_item_at_visible(c, ct, 2)
+            check_int("third visible row is beta once folded", third, 3)
+            var ty = widgets.Ui_tree_item_cy(c, ct, third)
+            c = widgets.Ui_press(c, 150, ty)
+            check_int("clicking it selects beta, not alpha-1", widgets.Ui_sel(c, ct), 3)
+
+            if font != 0 - 1 { gui.Win_font_free(font) }
+            gui.Win_close(win)
+        }
+    }
+
+    print("=== the kind round-trips through its name ===")
+    // So a form document can carry a tree.
+    check("kind name", widgets.Ui_kind_name(widgets.Ui_kind_from_name("tree")), "tree")
+
+    print("=== an EMPTY tree is inert, not a crash ===")
+    // `split_lines("")` yields one empty item rather than none - a deliberate
+    // toolkit-wide invariant (every list-like widget always has at least one row),
+    // so an empty tree has ONE blank row, not zero. Asserted as the documented
+    // behaviour rather than the number that felt right: the property that matters
+    // is that nothing crashes and nothing reads out of range.
+    var e = widgets.Ui_new(0 - 1, 0 - 1)
+    e = widgets.Ui_tree(e, "", 0, 0, 100, 100, 0, on_pick)
+    var et = widgets.Ui_last_id(e)
+    check_int("one blank row, per split_lines", widgets.Ui_tree_visible_count(e, et), 1)
+    check_int("that row has depth 0", widgets.Ui_tree_depth(e, et, 0), 0)
+    check("its label is empty", widgets.Ui_tree_label(e, et, 0), "")
+    check_int("it is not a folder", widgets.Ui_tree_has_children(e, et, 0), 0)
+    check_int("reading past the end is -1", widgets.Ui_tree_item_at_visible(e, et, 5), 0 - 1)
+    e = widgets.Ui_tree_move(e, et, 1)
+    check_int("moving in a one-row tree stays put", widgets.Ui_sel(e, et), 0)
+
+    if fails == 0 {
+        print("=== ALL TREE TESTS PASSED ===")
+    } else {
+        print("=== ${fails} TREE TEST(S) FAILED ===")
+    }
+}

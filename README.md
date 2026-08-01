@@ -147,7 +147,7 @@ nothing ever parses generated code back into a form.
 
 | Module | What it is |
 |---|---|
-| `src/widgets.wyn` | The retained toolkit: labels, buttons, checkboxes, entries, panels, and a multi-line **textarea** with a caret, arrow-key movement, insert/backspace/delete and vertical scrolling. Plus 86 public functions, because code outside a module cannot index an array field of an imported struct. |
+| `src/widgets.wyn` | The retained toolkit: labels, buttons, checkboxes, entries, panels, a multi-line **textarea** with a caret, arrow-key movement, insert/backspace/delete and vertical scrolling, and a **tree** with per-row depth, collapsible folders and keyboard folding. Plus 100+ public functions, because code outside a module cannot index an array field of an imported struct. |
 | `src/form.wyn` | `Form_save` / `Form_load` / `Form_diff` - the JSON document, including per-widget **anchors** (`left/right/top/bottom`) and `Ui_relayout` to honour them on resize. |
 | `src/codegen.wyn` | `Form_generate` - the WinForms split: `Form1.designer.wyn` is regenerated freely, `Form1.wyn` holds handler bodies and is **never rewritten**. |
 | `src/views.wyn` | Several named forms in **one** window, switched by name, over one shared state struct. No event bus. |
