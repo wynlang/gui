@@ -1138,11 +1138,83 @@ fn real_event_tests(win: int, font: int) {
     print("")
 }
 
+// ------------------------------------------------------- PARENTING (the model)
+//
+// Needs no window: an owner chain is arithmetic on ints. Deliberately so - the
+// containment MODEL has to be assertable without a display, or the only tests of
+// it are the pixel ones, which is how a cycle bug reaches a user.
+fn parent_model_tests() {
+    print("=== PARENTING: the owner chain, its depth, and the cycle it refuses ===")
+    var ui = widgets.Ui_new(-1, -1)
+    ui = widgets.Ui_panel(ui, 20, 20, 300, 200)
+    var outer = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_panel(ui, 40, 40, 200, 120)
+    var inner = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_button(ui, "Deep", 60, 60, 80, 24, on_fire)
+    var leaf = widgets.Ui_last_id(ui)
+
+    print("-- unparented, everything is top level --")
+    check_int("a fresh widget has no owner", widgets.Ui_owner_of(ui, leaf), 0 - 1)
+    check_int("...and therefore depth 0", widgets.Ui_owner_depth(ui, leaf), 0)
+
+    print("-- a chain three deep --")
+    ui = widgets.Ui_set_owner(ui, inner, outer)
+    ui = widgets.Ui_set_owner(ui, leaf, inner)
+    check_int("the leaf's owner is the inner panel",
+              widgets.Ui_owner_of(ui, leaf), inner)
+    check_int("the inner panel's owner is the outer one",
+              widgets.Ui_owner_of(ui, inner), outer)
+    // Depth, not just the immediate link: this is the number codegen orders by
+    // and the number a cycle would make diverge.
+    check_int("the leaf is 2 deep", widgets.Ui_owner_depth(ui, leaf), 2)
+    check_int("the inner panel is 1 deep", widgets.Ui_owner_depth(ui, inner), 1)
+    check_int("the outer panel is still 0", widgets.Ui_owner_depth(ui, outer), 0)
+
+    print("-- Ui_owner_of is BY ID and Ui_owner_at is BY INDEX --")
+    // The two differ by one level of indirection and both take an int, so a test
+    // that only ever used one of them would not notice them being swapped.
+    check_int("owner_at(index 2) agrees with owner_of(leaf id)",
+              widgets.Ui_owner_at(ui, 2), widgets.Ui_owner_of(ui, leaf))
+
+    print("-- a CYCLE is refused, and the old owner survives the refusal --")
+    // Parenting the outer panel onto its own grandchild. Accepted, this makes
+    // every `while owner != -1` walk in widgets.wyn spin forever, so the
+    // assertion that matters is that the call RETURNS at all.
+    var u2 = widgets.Ui_set_owner(ui, outer, leaf)
+    check_int("the outer panel did NOT become a child of its grandchild",
+              widgets.Ui_owner_of(u2, outer), 0 - 1)
+    check_int("...and the chain below it is untouched",
+              widgets.Ui_owner_depth(u2, leaf), 2)
+    print("-- including the one-step cycle a user makes by hand --")
+    var u3 = widgets.Ui_set_owner(ui, inner, inner)
+    check_int("a widget cannot own itself",
+              widgets.Ui_owner_of(u3, inner), outer)
+    print("-- and detaching to the top level still works --")
+    var u4 = widgets.Ui_set_owner(ui, leaf, 0 - 1)
+    check_int("owner -1 detaches", widgets.Ui_owner_of(u4, leaf), 0 - 1)
+    check_int("...back to depth 0", widgets.Ui_owner_depth(u4, leaf), 0)
+
+    print("-- which kinds accept children --")
+    // The designer asks THIS, rather than keeping its own list, so it is worth
+    // pinning: a kind added to one list and not the other is how you get to
+    // parent a button onto a slider.
+    check_int("a panel is a container",
+              widgets.Ui_is_container(widgets.KIND_PANEL), 1)
+    check_int("a groupbox is a container",
+              widgets.Ui_is_container(widgets.KIND_GROUPBOX), 1)
+    check_int("a tab strip is a container",
+              widgets.Ui_is_container(widgets.KIND_TABS), 1)
+    check_int("a button is NOT", widgets.Ui_is_container(widgets.KIND_BUTTON), 0)
+    check_int("nor is a label", widgets.Ui_is_container(widgets.KIND_LABEL), 0)
+    check_int("nor a slider", widgets.Ui_is_container(widgets.KIND_SLIDER), 0)
+}
+
 fn main() {
     radio_tests()
     slider_tests()
     progress_tests()
     spinner_tests()
+    parent_model_tests()
 
     if gui.Win_available() == 0 {
         print("no display: skipping every test that needs font metrics or pixels")

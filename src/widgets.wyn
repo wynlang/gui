@@ -2083,10 +2083,21 @@ var BTN_W = 16
 
 // ---- containment ----
 
+// Make `owner` the container of `id`. -1 detaches it to the top level.
+//
+// REFUSES to create a cycle, silently, leaving the old owner in place. Silence
+// rather than an error return because every caller is a drag-and-drop gesture
+// and there is nothing for it to do about a refusal except ignore it - whereas
+// the cycle itself turns every owner-chain walk in this file into an infinite
+// loop. A no-op drop reads to the user as "that did not take"; a hang reads as a
+// crash and loses the form.
 pub fn Ui_set_owner(ui: Ui, id: int, owner: int) -> Ui {
     var u = ui
     var i = Ui_index_of(u, id)
     if i == -1 { return u }
+    if owner != -1 {
+        if owner_cycles(u, id, owner) == 1 { return u }
+    }
     u.widgets[i].owner = owner
     return u
 }
@@ -2102,6 +2113,67 @@ pub fn Ui_set_page(ui: Ui, id: int, page: int) -> Ui {
 pub fn Ui_owner_at(ui: Ui, i: int) -> int {
     if in_range(ui, i) == 0 { return -1 }
     return ui.widgets[i].owner
+}
+
+// The owner of a widget BY ID, or -1.
+//
+// Ui_owner_at takes an INDEX, which is what a serialiser walking the list wants.
+// Everything that parents interactively holds an id (a selection, a hit test),
+// and made the Ui_index_of call itself - three times in the designer alone,
+// which is three chances to pass the wrong one of two ints.
+pub fn Ui_owner_of(ui: Ui, id: int) -> int {
+    return Ui_owner_at(ui, Ui_index_of(ui, id))
+}
+
+// How deep is this widget in the owner chain? 0 = top level.
+//
+// The BOUND is the point, not the count. Every walk up an owner chain -
+// hit-testing the deepest child, emitting parents before children, resolving a
+// coordinate against its ancestors - is a `while owner != -1` loop, and a cycle
+// turns each one into a hang rather than a wrong answer. Ui_set_owner below
+// refuses to build a cycle, so this bound should be unreachable; it is here
+// because "should be unreachable" is not the same as "is", and a designer that
+// spins forever cannot be used to fix the form that made it spin.
+pub fn Ui_owner_depth(ui: Ui, id: int) -> int {
+    var dn = 0
+    var dcur = Ui_owner_of(ui, id)
+    while dcur != -1 {
+        if dn >= ui.widgets.len() { return dn }
+        dn = dn + 1
+        dcur = Ui_owner_of(ui, dcur)
+    }
+    return dn
+}
+
+// Would making `owner` the parent of `id` create a cycle?
+//
+// Walks UP from the proposed parent: if `id` is already an ancestor of it, the
+// link would close a loop. Also catches owner == id, which is the one a user
+// produces by hand (drop a panel on itself).
+fn owner_cycles(ui: Ui, id: int, owner: int) -> int {
+    if owner == id { return 1 }
+    var cn = 0
+    var cand = owner
+    while cand != -1 {
+        if cand == id { return 1 }
+        if cn >= ui.widgets.len() { return 1 }
+        cn = cn + 1
+        cand = Ui_owner_of(ui, cand)
+    }
+    return 0
+}
+
+// Can this kind hold children?
+//
+// PUBLIC because it is a question the DESIGNER has to ask and must not answer
+// for itself: "is the thing I am hovering a drop target" has exactly one right
+// answer and it is this one. A designer with its own copy of the list is a
+// designer that lets you parent onto a slider the day a kind is added here.
+pub fn Ui_is_container(kind: int) -> int {
+    if kind == KIND_PANEL { return 1 }
+    if kind == KIND_GROUPBOX { return 1 }
+    if kind == KIND_TABS { return 1 }
+    return 0
 }
 
 pub fn Ui_page_at(ui: Ui, i: int) -> int {
