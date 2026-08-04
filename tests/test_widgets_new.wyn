@@ -1006,6 +1006,116 @@ fn overlay_pixel_tests(win: int, font: int) {
     print("")
 }
 
+// ------------------------------------------------------- PIXELS: the focus ring
+//
+// EVERY FOCUSABLE KIND SHOWS THE FOCUS, IN ONE COLOUR.
+//
+// This is a pixel test because it cannot be anything else: Ui_focus(ui) returning
+// an id proves the toolkit knows what has the focus, and says nothing about
+// whether the USER can see it. Measured before the fix, with exactly this probe:
+// the button and the checkbox drew border 120,120,140 focused and unfocused
+// alike, while the entry beside them moved to the accent. Both are focusable and
+// Tab moves to both, so a keyboard user tabbing through a form went blind on two
+// of the commonest controls on it.
+//
+// Asserted as (a) the ring differs from the idle border, and (b) it is the SAME
+// ring on all eight - a per-widget focus colour is how the toolkit reads as
+// several toolkits pasted together, and it is the state the code was in (radio had
+// privately chosen accent+40 while five others used the bare accent).
+//
+// THE RING TONE IS accent+40, NOT THE ACCENT. The accent is also the fill under
+// white button text; one colour cannot be dark enough for 4.5:1 text on it and
+// light enough for a 3:1 border against the panel - the two constraints do not
+// intersect. accent+40 = 110,150,210 as shipped, which is >= 4.2:1 against every
+// surface the toolkit paints (field 6.2, textarea 6.3, canvas 5.6, panel 5.0,
+// checkbox face 4.5, button face 4.2).
+fn ring_px(win: int, x: int, y: int) -> string {
+    return gui.Win_pixel_at(win, x, y, 0).to_string() + ","
+        + gui.Win_pixel_at(win, x, y, 1).to_string() + ","
+        + gui.Win_pixel_at(win, x, y, 2).to_string()
+}
+
+// The top-left border pixel of one widget, with the focus on `id` (or nowhere when
+// id is -1). Redraws from a cleared frame each time so nothing of the previous
+// state can survive into the reading.
+fn border_with_focus(win: int, ui: Ui, id: int, x: int, y: int) -> string {
+    var u = widgets.Ui_set_focus(ui, id)
+    gui.Win_clear(win, 0, 0, 0)
+    widgets.Ui_draw_into(u)
+    return ring_px(win, x, y)
+}
+
+fn focus_ring_pixel_tests(win: int, font: int) {
+    print("=== PIXELS: every focusable kind DRAWS its focus, in one colour ===")
+    var ui = widgets.Ui_new(win, font)
+    // Two columns, because the test window is 400x300 and eight widgets stacked at
+    // 60px apart do not fit - and a widget drawn outside the window reads back as
+    // nothing, which would make this test vacuous rather than failing.
+    ui = widgets.Ui_button(ui, "Save", 20, 20, 90, 28, on_fire)
+    var w_btn = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_checkbox(ui, "Opt", 20, 70, 0, on_fire)
+    var w_chk = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_entry(ui, "", 20, 110, 120, 26)
+    var w_ent = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_textarea(ui, "hi", 20, 160, 120, 50)
+    var w_txa = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_dropdown(ui, "A\nB", 210, 20, 120, 26, 0, on_fire)
+    var w_drp = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_listbox(ui, "A\nB", 210, 70, 120, 50, 0, on_fire)
+    var w_lst = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_radio(ui, "R", "grp", 210, 140, 0, on_fire)
+    var w_rad = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_spinner(ui, 210, 180, 90, 26, 0, 10, 1, 5, on_fire)
+    var w_spn = widgets.Ui_last_id(ui)
+
+    // The idle border, read from the button. Named rather than hardcoded so the
+    // check below compares two things the TOOLKIT drew.
+    var idle = border_with_focus(win, ui, 0 - 1, 20, 20)
+    check("the idle border is the toolkit's plain grey", idle, "120,120,140")
+
+    // The ring, from the entry - the one kind that always had one.
+    var ring = border_with_focus(win, ui, w_ent, 20, 110)
+    check_int("a focused entry's border is NOT the idle grey",
+              ring == idle ? 0 : 1, 1)
+    check("...it is the accent+40 focus ring", ring, "110,150,210")
+
+    // THE ASSERTION. Same ring, every kind, at each widget's own top-left corner.
+    // The button and the checkbox are the two that regressed; they are checked the
+    // same way as the six that were already right, so no kind is special-cased.
+    check("a focused BUTTON shows the ring",
+          border_with_focus(win, ui, w_btn, 20, 20), ring)
+    check("a focused CHECKBOX shows the ring",
+          border_with_focus(win, ui, w_chk, 20, 70), ring)
+    check("a focused TEXTAREA shows the ring",
+          border_with_focus(win, ui, w_txa, 20, 160), ring)
+    check("a focused DROPDOWN shows the ring",
+          border_with_focus(win, ui, w_drp, 210, 20), ring)
+    check("a focused LISTBOX shows the ring",
+          border_with_focus(win, ui, w_lst, 210, 70), ring)
+    check("a focused RADIO shows the ring",
+          border_with_focus(win, ui, w_rad, 210, 140), ring)
+    check("a focused SPINNER shows the ring",
+          border_with_focus(win, ui, w_spn, 210, 180), ring)
+
+    // And the ring MOVES: focusing one widget must un-ring the others, or every
+    // border would be lit at once and the ring would say nothing.
+    var moved = border_with_focus(win, ui, w_chk, 20, 20)
+    check("focusing the checkbox returns the BUTTON's border to idle",
+          moved, idle)
+
+    // A DISABLED widget takes no focus (Ui_focusable says so) and must not draw a
+    // ring even if asked, or the ring would advertise a control that cannot be
+    // typed into.
+    var du = widgets.Ui_set_enabled(ui, w_btn, 0)
+    check_int("a disabled button is not focusable",
+              widgets.Ui_focusable(du, w_btn), 0)
+    check_int("...and does not draw the ring when focus is forced onto it",
+              border_with_focus(win, du, w_btn, 20, 20) == ring ? 0 : 1, 1)
+
+    check_int("the draw left the clip stack balanced", gui.Win_clip_depth(win), 0)
+    print("")
+}
+
 fn clip_pixel_tests(win: int, font: int) {
     print("=== PIXELS: a child that overhangs its groupbox is CUT OFF ===")
     // The bug this covers was found by looking at a screenshot: every clip
@@ -1235,6 +1345,7 @@ fn main() {
                 groupbox_tests(win, font)
                 tooltip_tests(win, font)
                 focus_tests(win, font)
+                focus_ring_pixel_tests(win, font)
                 overlay_pixel_tests(win, font)
                 clip_pixel_tests(win, font)
                 real_event_tests(win, font)

@@ -3996,7 +3996,32 @@ fn draw_widget(ui: Ui, w: Widget) {
             }
         }
         gui.Win_rect(win, w.x, w.y, w.w, w.h, br, bg, bb)
-        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, 120, 120, 140)
+        // THE FOCUS RING. Ui_focusable says a button is focusable and Tab moves to
+        // it, but this outline was a fixed 120,120,140 whichever widget had the
+        // focus - so a keyboard user tabbing through a form could not see where
+        // they were. Measured before this: button border 120,120,140 focused and
+        // unfocused alike, while the entry beside it moved to the accent.
+        //
+        // FOCUS IS THE BORDER, HOVER IS THE FILL, and they are independent: the
+        // pointer can rest on a button that does not have the focus, and both must
+        // remain readable at once. accent+40 rather than the accent itself, because
+        // the accent is also a text-bearing FILL and cannot be light enough for a
+        // 3:1 border and dark enough for 4.5:1 white text (proved: those two
+        // requirements do not intersect). accent+40 = 110,150,210 against the
+        // shipping accent, which is >= 4.2:1 on every surface the toolkit paints,
+        // and it is the tone KIND_RADIO already used - so this makes one ring
+        // colour out of what was one widget's private choice.
+        var fbr = 120
+        var fbg = 120
+        var fbb = 140
+        if w.enabled == 1 {
+            if w.id == ui.focus {
+                fbr = ui.accent_r + 40
+                fbg = ui.accent_g + 40
+                fbb = ui.accent_b + 40
+            }
+        }
+        gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, fbr, fbg, fbb)
 
         // Centre the caption. This needs the measured width, which is why
         // Win_text_width has to exist in the backend.
@@ -4028,6 +4053,18 @@ fn draw_widget(ui: Ui, w: Widget) {
             bg2 = ui.accent_g
             bb2 = ui.accent_b
         }
+        // FOCUS LAST, so it wins over hover. A checkbox has only one line to draw
+        // state on, and of the two, focus is the one the user cannot otherwise
+        // find: hover is already answered by the pointer being there, whereas a
+        // Tab-driven focus is invisible without this. Same accent+40 ring as every
+        // other kind - see the note on the button.
+        if w.enabled == 1 {
+            if w.id == ui.focus {
+                br2 = ui.accent_r + 40
+                bg2 = ui.accent_g + 40
+                bb2 = ui.accent_b + 40
+            }
+        }
         gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, br2, bg2, bb2)
         if w.checked == 1 {
             gui.Win_rect(win, w.x + 4, w.y + 4, w.w - 8, w.h - 8,
@@ -4045,9 +4082,9 @@ fn draw_widget(ui: Ui, w: Widget) {
         var eg = 120
         var eb = 140
         if w.id == ui.focus {
-            er = ui.accent_r
-            eg = ui.accent_g
-            eb = ui.accent_b
+            er = ui.accent_r + 40
+            eg = ui.accent_g + 40
+            eb = ui.accent_b + 40
         }
         gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, er, eg, eb)
 
@@ -4077,9 +4114,9 @@ fn draw_widget(ui: Ui, w: Widget) {
         var ag = 120
         var ab = 140
         if w.id == ui.focus {
-            ar = ui.accent_r
-            ag = ui.accent_g
-            ab = ui.accent_b
+            ar = ui.accent_r + 40
+            ag = ui.accent_g + 40
+            ab = ui.accent_b + 40
         }
         gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, ar, ag, ab)
 
@@ -4142,11 +4179,20 @@ fn draw_widget(ui: Ui, w: Widget) {
     // ---- the expanded widget set ----
     //
     // All nine share the six above's palette exactly - 18,18,22 for a sunken
-    // field, 45..50 for a raised surface, 120,120,140 for a border, the theme
-    // accent for focus and for a filled indicator, and 110,110,120 for anything
-    // disabled. A new widget that picks its own greys reads as a different
+    // field, 45..50 for a raised surface, 120,120,140 for a border, ACCENT+40 for
+    // a focus ring, the theme accent for a filled indicator, and 110,110,120 for
+    // anything disabled. A new widget that picks its own greys reads as a different
     // toolkit pasted into the form, which is the failure mode of adding kinds one
     // at a time.
+    //
+    // FOCUS IS ALWAYS accent+40 AND ALWAYS THE BORDER. Not the bare accent: the
+    // accent is also the fill under white button text, and one colour cannot be
+    // dark enough for 4.5:1 text and light enough for a 3:1 border - the two
+    // requirements provably do not intersect. accent+40 (110,150,210 as shipped)
+    // measures >= 4.2:1 against every surface here. Every kind reads ui.focus,
+    // including the button and checkbox, which for a long time did not: they were
+    // focusable, Tab moved to them, and they drew an unchanged 120,120,140 border,
+    // so a keyboard user could not see where they were.
     //
     // Nothing in here draws an OVERLAY. A dropdown's list and a menu's body are
     // drawn by draw_overlay, in a later pass, because they must appear above
@@ -4213,9 +4259,9 @@ fn draw_widget(ui: Ui, w: Widget) {
             db2 = 78
         } else {
             if w.id == ui.focus {
-                dr2 = ui.accent_r
-                dg2 = ui.accent_g
-                db2 = ui.accent_b
+                dr2 = ui.accent_r + 40
+                dg2 = ui.accent_g + 40
+                db2 = ui.accent_b + 40
             }
         }
         gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, dr2, dg2, db2)
@@ -4396,9 +4442,9 @@ fn draw_widget(ui: Ui, w: Widget) {
             lbb = 78
         } else {
             if w.id == ui.focus {
-                lbr = ui.accent_r
-                lbg = ui.accent_g
-                lbb = ui.accent_b
+                lbr = ui.accent_r + 40
+                lbg = ui.accent_g + 40
+                lbb = ui.accent_b + 40
             }
         }
         gui.Win_rect_outline(win, w.x, w.y, w.w, w.h, lbr, lbg, lbb)
@@ -4551,9 +4597,9 @@ fn draw_widget(ui: Ui, w: Widget) {
             spb = 78
         } else {
             if w.id == ui.focus {
-                spr = ui.accent_r
-                spg = ui.accent_g
-                spb = ui.accent_b
+                spr = ui.accent_r + 40
+                spg = ui.accent_g + 40
+                spb = ui.accent_b + 40
             }
         }
         gui.Win_rect_outline(win, w.x, w.y, fldw, w.h, spr, spg, spb)
