@@ -86,6 +86,23 @@ fn drive(script: string) -> string {
     return File::read(out)
 }
 
+// The same, with a document PATH on the command line - `wyn design MyForm.json`.
+//
+// A separate helper rather than a parameter on drive() because it must NOT set
+// WYN_DESIGNER_DIR: the whole point is that the directory comes from the PATH, and
+// a test that also set the env var would pass even if the path were ignored, which
+// is the exact defect being asserted.
+fn drive_path(path: string, script: string) -> string {
+    var out = PROJ + "/out.txt"
+    File::delete(out)
+    var cmd = "SDL_VIDEODRIVER=dummy WYN_DESIGNER_SCRIPT='" + script + "' "
+        + "perl -e 'alarm(90); exec @ARGV' -- ./" + BIN + " '" + path + "'"
+        + " > " + out + " 2>&1"
+    System::exec_code(cmd)
+    if File::exists(out) == 0 { return "" }
+    return File::read(out)
+}
+
 // Is `needle` a whole LINE of `hay`? Line-anchored on both ends, because
 // "prop(x)=8" must not be satisfied by "prop(x)=80" - which a substring search
 // accepts, and which is exactly the off-by-a-digit a coordinate check exists for.
@@ -133,6 +150,88 @@ fn build_ok(path: string) -> int {
     var rc = System::exec_code(wyn() + " build " + path + " > /dev/null 2>&1")
     if rc == 0 { return 1 }
     return 0
+}
+
+// ---- 0. `wyn design MyForm.json` OPENS MyForm.json -------------------------
+//
+// This was FIRST-RUN DATA LOSS, not a missing convenience. The compiler passes the
+// path as argv[1] (repos/wyn/src/cmd_other.c:1280) but the designer's arg loop
+// matched only --selftest/--screenshot, so the path was dropped: the user got an
+// empty "Form1", and the first Save wrote ./Form1.json. Their real form was never
+// shown and never opened, and a user who then saved would have an empty form under
+// a name they did not choose.
+//
+// Asserted through argv rather than WYN_DESIGNER_DIR on purpose - see drive_path.
+fn cmdline_tests() {
+    print("=== THE COMMAND LINE: a named document is the one that opens ===")
+
+    // Build a REAL document on disk first, through the designer itself, so what is
+    // opened below is a file the designer wrote rather than a fixture this test
+    // hand-rolled (which could be wrong in the same way twice).
+    var dir = PROJ + "/cmdline"
+    File::create_dir_all(dir)
+    File::delete(dir + "/MyForm.json")
+    var made = drive("dir:" + dir + ";doc:MyForm;tool:button;click:40:40"
+        + ";tool:entry;click:40:100;tool:checkbox;click:40:160;save;count")
+    check_val("a three-control MyForm was saved", made, "count", "3")
+    check_int("...and MyForm.json is on disk",
+        File::exists(dir + "/MyForm.json"), 1)
+
+    // THE DEFECT: with no path, the designer starts empty and named Form1. That is
+    // correct behaviour with no argument, and it is also exactly what the bug
+    // produced WITH one - so it is the negative control for the next two checks.
+    // COMPILER WORKAROUND: this local is `noarg`, not `none`. An identifier spelled
+    // `none` is resolved as the built-in Option constant BEFORE the scope is
+    // consulted (repos/wyn/src/checker.c:1612 returns builtin_int for any token
+    // "none"), so `var none = drive(...)` type-checks as int and every use of it is
+    // a type mismatch. Minimised: `var none = f()` where `fn f() -> string`.
+    var noarg = drive("count;name")
+    check_val("with no argument the designer starts empty", noarg, "count", "0")
+    check_val("...under the default name", noarg, "name", "Form1")
+
+    // THE FIX: the named document is loaded.
+    var op = drive_path(dir + "/MyForm.json", "count;name")
+    check_val("`wyn design MyForm.json` loads its THREE controls",
+              op, "count", "3")
+    check_val("...and adopts the document's name, so Save writes MyForm.json",
+              op, "name", "MyForm")
+
+    // A path with no directory part must resolve to the CURRENT directory, not to
+    // the empty string: "" + "/" + name also builds a usable-looking path, so the
+    // resolved path is asserted rather than just the name. There is no MyForm.json
+    // in the repo root, which is why this reads the path out of the status line -
+    // "./MyForm.json" is the proof that path_dir returned "." and not "".
+    var bare = drive_path("MyForm.json", "count;name;status")
+    check_val("a bare filename resolves against the CWD, not against \"\"",
+              bare, "status", "no such document: ./MyForm.json")
+    check_val("...and still adopts the name it was given", bare, "name", "MyForm")
+
+    // Naming a file that does not exist yet is CREATING it: an empty canvas under
+    // that name, ready to save. An error here would make `wyn design NewForm.json`
+    // unusable for the commonest case of all - starting a new form.
+    File::delete(dir + "/BrandNew.json")
+    var fresh = drive_path(dir + "/BrandNew.json", "count;name")
+    check_val("a not-yet-existing document gives an EMPTY canvas",
+              fresh, "count", "0")
+    check_val("...already named, so the first Save writes the file asked for",
+              fresh, "name", "BrandNew")
+
+    // And the flags must still be flags, not documents. If --selftest were taken
+    // as a path the selftest would try to load "--selftest.json" and the gate's
+    // own example-selftest step would break.
+    var flag = drive_path("--screenshot", "count;name")
+    check_val("a --flag is not mistaken for a document name",
+              flag, "name", "Form1")
+
+    // The round trip that proves no data was lost: open the named document, add a
+    // control, save, and re-open BY PATH. Four controls, not one - a save that
+    // wrote a fresh Form1 would give 1.
+    drive_path(dir + "/MyForm.json", "tool:label;click:40:220;save")
+    var again = drive_path(dir + "/MyForm.json", "count;name")
+    check_val("editing and saving a named document keeps its four controls",
+              again, "count", "4")
+    check_int("...and did NOT write a stray Form1.json beside it",
+        File::exists(dir + "/Form1.json"), 0)
 }
 
 // ---- 1. the palette places every kind -------------------------------------
@@ -887,6 +986,7 @@ fn main() {
         build_ok(PROJ + "/notok.wyn"), 1)
     File::delete(PROJ + "/notok.wyn")
 
+    cmdline_tests()
     palette_tests()
     inspector_tests()
     roundtrip_tests()

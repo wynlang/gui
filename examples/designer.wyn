@@ -170,6 +170,59 @@ var g_hcur = -1                    // index of the CURRENT state; undo walks dow
 // scratch dir without a file dialog, which this designer does not have.
 var g_dir = "."
 var g_doc = "Form1"
+// 1 when a document was NAMED on the command line, so run_designer loads it
+// instead of starting empty. Distinct from "the file exists": a user who names a
+// file that is not there yet is CREATING it, and must get an empty canvas under
+// that name rather than an error.
+var g_open = 0
+
+// ---- the document path on the command line -------------------------------
+//
+// `wyn design MyForm.json` passes the path as argv[1] (the compiler builds it at
+// repos/wyn/src/cmd_other.c:1280). Before this, the arg loop matched only
+// --selftest and --screenshot, so ANY path was silently dropped: the designer
+// opened an empty "Form1", and the first Save wrote ./Form1.json - not the file
+// the user named. Their form was still on disk under its own name but the
+// designer would never show it, and a user who typed the name they wanted would
+// then save an empty form OVER it. That is first-run data loss, so the path is
+// split into the same (g_dir, g_doc) pair the `dir:`/`doc:` script ops set,
+// which is what do_load and do_save already read.
+//
+// Split by hand rather than with split("/"): the last component is wanted, and
+// scanning for the last '/' needs no array. `pi`/`pj` are spelled distinctly
+// because inferred local types leak per-NAME across a module (see
+// src/widgets.wyn:339).
+
+fn path_dir(p: string) -> string {
+    var cut = -1
+    var pi = 0
+    while pi < p.len() {
+        if p.substring(pi, pi + 1) == "/" { cut = pi }
+        pi = pi + 1
+    }
+    // A bare "MyForm.json" means the current directory, which is what g_dir
+    // already defaults to; "/MyForm.json" means the root, and returning "" there
+    // would build the path "/MyForm.json" as "" + "/" + ... by luck rather than
+    // by intent.
+    if cut < 0 { return "." }
+    if cut == 0 { return "/" }
+    return p.substring(0, cut)
+}
+
+// The document NAME, which is also the form name: Ui_set_name drives both the
+// generated Form<name>.wyn and the file do_save writes, so ".json" has to come
+// off or saving MyForm.json would write MyForm.json.json.
+fn path_doc(p: string) -> string {
+    var cut2 = -1
+    var pj = 0
+    while pj < p.len() {
+        if p.substring(pj, pj + 1) == "/" { cut2 = pj }
+        pj = pj + 1
+    }
+    var base = p.substring(cut2 + 1, p.len())
+    if base.ends_with(".json") { base = base.substring(0, base.len() - 5) }
+    return base
+}
 
 fn snap(v: int) -> int {
     if g_snap == 0 { return v }
@@ -2015,8 +2068,24 @@ fn new_form() -> Ui {
     return f
 }
 
-fn run_designer(win: int, font: int) {
+// The form a session STARTS from: empty, or the document named on the command
+// line. One function because both entry points that begin a session need it -
+// run_designer and the script hook - and a `wyn design MyForm.json` that loaded
+// the file interactively but not under the script hook would be a behaviour no
+// test could reach, which is how the silent-ignore defect survived in the first
+// place.
+fn initial_form() -> Ui {
     var fm = new_form()
+    if g_open == 0 { return fm }
+    // do_load leaves the form alone and sets g_status when the file is not there,
+    // which is the right answer for `wyn design NewForm.json`: an empty canvas
+    // already NAMED NewForm, ready to save - not an error.
+    fm = do_load(fm)
+    return widgets.Ui_set_name(fm, g_doc)
+}
+
+fn run_designer(win: int, font: int) {
+    var fm = initial_form()
     insp_rebuild(fm)
     hist_reset(fm)
     g_running = 1
@@ -2227,6 +2296,14 @@ fn script_one(fm: Ui, cmd: string) -> Ui {
         print("count=" + widgets.Ui_count(f).to_string())
         return f
     }
+    // The form's NAME, read from the model. This is what `wyn design MyForm.json`
+    // has to get right: the name decides the file do_save writes and the
+    // Form<name>.wyn the generator emits, so a designer that opened the right
+    // file under the wrong name would still save over the wrong one.
+    if op == "name" {
+        print("name=" + widgets.Ui_name(f))
+        return f
+    }
     if op == "pid" {
         print("pid=" + sel_primary().to_string())
         return f
@@ -2353,7 +2430,10 @@ fn script_one(fm: Ui, cmd: string) -> Ui {
 // still collide, and that is the documented limit of the hook: it is a test
 // harness, not a shell.
 fn run_script(spec: string) {
-    var f = new_form()
+    // initial_form, not new_form: a script run with a document named on the
+    // command line must start from the SAME form the interactive designer would,
+    // which is what makes `wyn design MyForm.json` assertable.
+    var f = initial_form()
     g_tool = widgets.KIND_BUTTON
     insp_rebuild(f)
     hist_reset(f)
@@ -2781,11 +2861,19 @@ fn main() {
     while i < args.len() {
         if args[i] == "--selftest" { want_selftest = 1 }
         if args[i] == "--screenshot" { want_shot = 1 }
+        // Anything that is not a flag is the DOCUMENT to open - `wyn design
+        // MyForm.json` arrives here as argv[1]. Not matching it was silent data
+        // loss; see path_dir/path_doc.
+        if not args[i].starts_with("--") {
+            g_dir = path_dir(args[i])
+            g_doc = path_doc(args[i])
+            g_open = 1
+        }
         i = i + 1
     }
-    // Env fallbacks as well as the flags: `wyn run` does not forward argv to the
-    // program (verified - args.len() is 1 under `wyn run`), so without these the
-    // non-interactive modes would only be reachable from a built binary.
+    // Env fallbacks as well as the flags, so the non-interactive modes are
+    // reachable without building a binary. (argv IS forwarded under `wyn run` -
+    // verified - but a test that sets an env var needs no argv at all.)
     if Env::get("WYN_DESIGNER_SELFTEST") == "1" { want_selftest = 1 }
     var shot_path = Env::get("WYN_DESIGNER_SCREENSHOT")
     if shot_path.len() > 0 { want_shot = 1 }
