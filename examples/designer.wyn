@@ -75,31 +75,77 @@ import codegen
 extern fn Win_event_text() -> string;
 
 // ---- layout ---------------------------------------------------------------
+//
+// A SPACING SCALE, not a pile of pixel offsets.
+//
+// Measured before this: the gaps between the designer's own regions were 8, 10,
+// 12, 12, 12, and 36, and the inset of text from a panel edge was 8, 10, 12 or 14
+// depending on which panel. None of those differences meant anything - they are
+// what happens when each region is positioned by adding a plausible number to the
+// one before it. The visible symptoms were a 36px dead band above the status bar
+// (2.5% of the window doing nothing) and headings that did not line up with the
+// rows beneath them.
+//
+// Two steps do all the work, and every gap below is one of them:
+//   PAD_S = 8   tight: inside a panel, and above the toolbar
+//   PAD_M = 12  loose: between two regions, and a panel's own inner margin
+// Both are multiples of 4 and PAD_S is the design GRID, so chrome spacing and the
+// form's snap lattice are the same rhythm rather than two competing ones.
+var PAD_S = 8
+var PAD_M = 12
 
-var WIN_W = 1180
-var WIN_H = 700
-
-var TOOLBAR_Y = 8
+var TOOLBAR_Y = PAD_S
 var TOOLBAR_H = 26
 
-var PAL_X = 12
-var PAL_Y = 44
+// The band the three panels share. One Y and one height for all of them, so their
+// tops and bottoms line up by construction instead of by three matching literals -
+// which is what let the inspector and the canvas drift apart before.
+var PANEL_Y = TOOLBAR_Y + TOOLBAR_H + PAD_M
+var PANEL_H = 520
+
+var PAL_X = PAD_M
+var PAL_Y = PANEL_Y
 var PAL_W = 148
-var PAL_ITEM_H = 22
+// 24, not 22. A 22px row paints 20px after its 2px gap, which is under every
+// desktop hit-target minimum (24px; Apple's HIG says 44pt for touch). The toolbox
+// is the control a user hits most often in the whole application.
+var PAL_ITEM_H = 24
 
-var CANVAS_X = 172
-var CANVAS_Y = 44
+var CANVAS_X = PAL_X + PAL_W + PAD_M
+var CANVAS_Y = PANEL_Y
+// The canvas IS the form's design size and it is emitted into the generated source,
+// so it stays a round 700x520 that a user can reason about. The chrome moves around
+// it; it does not get squeezed to make a margin come out even.
 var CANVAS_W = 700
-var CANVAS_H = 520
+var CANVAS_H = PANEL_H
 
-var INSP_X = 884
-var INSP_Y = 44
+var INSP_X = CANVAS_X + CANVAS_W + PAD_M
+var INSP_Y = PANEL_Y
 var INSP_W = 284
-var INSP_H = 520
+var INSP_H = PANEL_H
 var INSP_ROW_H = 24
 var INSP_LBL_W = 76
 
-var STATUS_Y = 600
+// The status bar holds three lines, so it is sized FROM them - 3 * 20 plus a
+// PAD_M above and below - rather than set to 100 and hoped over. At 100 the third
+// line sat 48px from the top of an 84px-worth of content, which is the kind of gap
+// that reads as an accident because it is one.
+var STATUS_LINE_H = 20
+var STATUS_H = PAD_M + 3 * STATUS_LINE_H + PAD_M
+var STATUS_Y = PANEL_Y + PANEL_H + PAD_M
+
+// A panel's caption band, and the inset of anything inside a panel from its edge.
+// One value each, used by the toolbox and the inspector alike: the two used to
+// disagree (a 10px inset against a 12px one, both under a 26px band) which is why
+// their headings did not line up with their own rows.
+var PANEL_HDR_H = 26
+var PANEL_PAD = PAD_M
+
+// The window is DERIVED, so no dead space can exist by arithmetic. WIN_W is
+// unchanged at 1180 (the right margin now equals the left, which it did not); WIN_H
+// drops 700 -> 662, all of it the dead band that used to sit above the status bar.
+var WIN_W = INSP_X + INSP_W + PAD_M
+var WIN_H = STATUS_Y + STATUS_H
 
 // Snap placement and dragging to a grid. Not decoration: without it every
 // hand-placed control is off by a pixel or two and the generated source is full
@@ -262,7 +308,7 @@ fn pal_kind(i: int) -> int {
 }
 
 fn pal_y(i: int) -> int {
-    return PAL_Y + 26 + i * PAL_ITEM_H
+    return PAL_Y + PANEL_HDR_H + i * PAL_ITEM_H
 }
 
 // Which toolbox row is at this point, or -1.
@@ -307,14 +353,20 @@ fn tb_label(i: int) -> string {
 }
 
 fn tb_w(i: int) -> int {
-    return tb_label(i).len() * 8 + 16
+    // Caption width plus a PAD_S gutter each side, so a button's padding is the
+    // scale's tight step rather than an unexplained 16.
+    return tb_label(i).len() * 8 + 2 * PAD_S
 }
 
 fn tb_x(i: int) -> int {
-    var x = 172
+    // Aligned with the CANVAS, not with a literal 172 that happened to equal it.
+    // The two have to move together - a toolbar starting left of the canvas edge
+    // reads as a misalignment, and the literal made that a silent trap for anyone
+    // repositioning either one.
+    var x = CANVAS_X
     var k = 0
     while k < i {
-        x = x + tb_w(k) + 4
+        x = x + tb_w(k) + PAD_S / 2
         k = k + 1
     }
     return x
@@ -1237,7 +1289,7 @@ fn model_str(f: Ui, id: int, code: int) -> string {
 }
 
 fn insp_row_y(row: int) -> int {
-    return INSP_Y + 26 + row * INSP_ROW_H
+    return INSP_Y + PANEL_HDR_H + row * INSP_ROW_H
 }
 
 // Build the inspector for the primary selection. One editor widget per field the
@@ -1248,14 +1300,15 @@ fn insp_rebuild(f: Ui) {
     g_fwid = []
     var id = sel_primary()
     if id == -1 {
-        u = widgets.Ui_label(u, "no selection", INSP_X + 12, insp_row_y(0))
+        u = widgets.Ui_label(u, "no selection", INSP_X + PANEL_PAD,
+                             insp_row_y(0))
         g_insp[0] = u
         g_last_focus = -1
         return
     }
     var kind = widgets.Ui_kind_of(f, id)
-    var ex = INSP_X + 12 + INSP_LBL_W
-    var ew = INSP_W - 24 - INSP_LBL_W
+    var ex = INSP_X + PANEL_PAD + INSP_LBL_W
+    var ew = INSP_W - 2 * PANEL_PAD - INSP_LBL_W
     var row = 0
     var r = 0
     while r < frow_count() {
@@ -1266,7 +1319,7 @@ fn insp_rebuild(f: Ui) {
             // An items box needs several lines to be worth having; it is the one
             // row that is taller than the others, so the rows below it shift.
             var rows_used = 1
-            u = widgets.Ui_label(u, fname(code), INSP_X + 12, y + 4)
+            u = widgets.Ui_label(u, fname(code), INSP_X + PANEL_PAD, y + 4)
             if ed == E_STR {
                 u = widgets.Ui_entry(u, model_str(f, id, code), ex, y, ew, 20)
             }
@@ -1530,10 +1583,11 @@ fn draw_toolbar(win: int, font: int) {
 }
 
 fn draw_palette(win: int, font: int) {
-    var h = 26 + pal_count() * PAL_ITEM_H + 6
+    var h = PANEL_HDR_H + pal_count() * PAL_ITEM_H + PAD_S
     gui.Win_rect(win, PAL_X, PAL_Y, PAL_W, h, 38, 38, 46)
     gui.Win_rect_outline(win, PAL_X, PAL_Y, PAL_W, h, 70, 70, 84)
-    gui.Win_text(win, font, "TOOLBOX", PAL_X + 10, PAL_Y + 6, 150, 150, 170)
+    gui.Win_text(win, font, "TOOLBOX", PAL_X + PANEL_PAD, PAL_Y + PAD_S,
+                 150, 150, 170)
 
     var i = 0
     while i < pal_count() {
@@ -1547,9 +1601,14 @@ fn draw_palette(win: int, font: int) {
             g = 110
             b = 170
         }
-        gui.Win_rect(win, PAL_X + 6, y, PAL_W - 12, PAL_ITEM_H - 2, r, g, b)
+        // The row starts at PAD_S so its fill is inset from the panel border, and
+        // its caption at PANEL_PAD so it shares a left edge with the TOOLBOX
+        // heading above it - those two were 6 and 14 against a 10px heading, so
+        // nothing in this panel lined up with anything else in it.
+        gui.Win_rect(win, PAL_X + PAD_S, y, PAL_W - 2 * PAD_S,
+                     PAL_ITEM_H - 2, r, g, b)
         gui.Win_text(win, font, widgets.Ui_kind_name(kind),
-                     PAL_X + 14, y + 2, 235, 235, 240)
+                     PAL_X + PANEL_PAD, y + 3, 235, 235, 240)
         i = i + 1
     }
 }
@@ -1620,10 +1679,11 @@ fn draw_grid(win: int) {
 fn draw_inspector(win: int, font: int) {
     gui.Win_rect(win, INSP_X, INSP_Y, INSP_W, INSP_H, 38, 38, 46)
     gui.Win_rect_outline(win, INSP_X, INSP_Y, INSP_W, INSP_H, 70, 70, 84)
-    gui.Win_text(win, font, "PROPERTIES", INSP_X + 12, INSP_Y + 6,
+    gui.Win_text(win, font, "PROPERTIES", INSP_X + PANEL_PAD, INSP_Y + PAD_S,
                  150, 150, 170)
     // Clip so a long items box cannot paint over the status bar.
-    gui.Win_clip_push(win, INSP_X + 1, INSP_Y + 20, INSP_W - 2, INSP_H - 22)
+    gui.Win_clip_push(win, INSP_X + 1, INSP_Y + PANEL_HDR_H - PAD_S,
+                      INSP_W - 2, INSP_H - PANEL_HDR_H + PAD_S - 1)
     widgets.Ui_draw_into(insp())
     gui.Win_clip_pop(win)
 }
@@ -1649,7 +1709,8 @@ fn status_text(fm: Ui) -> string {
 fn draw_all(win: int, font: int, fm: Ui) {
     gui.Win_clear(win, 24, 24, 30)
 
-    gui.Win_text(win, font, "Wyn Designer", 14, TOOLBAR_Y + 5, 235, 235, 245)
+    gui.Win_text(win, font, "Wyn Designer", PAD_M, TOOLBAR_Y + 5,
+                 235, 235, 245)
     draw_toolbar(win, font)
     draw_palette(win, font)
 
@@ -1672,10 +1733,15 @@ fn draw_all(win: int, font: int, fm: Ui) {
 
     draw_inspector(win, font)
 
-    gui.Win_rect(win, 0, STATUS_Y, WIN_W, WIN_H - STATUS_Y, 34, 34, 42)
-    gui.Win_rect_outline(win, 0, STATUS_Y, WIN_W, WIN_H - STATUS_Y, 60, 60, 74)
-    gui.Win_text(win, font, status_text(fm), 14, STATUS_Y + 6, 210, 210, 225)
-    gui.Win_text(win, font, g_status, 14, STATUS_Y + 26, 150, 190, 150)
+    gui.Win_rect(win, 0, STATUS_Y, WIN_W, STATUS_H, 34, 34, 42)
+    gui.Win_rect_outline(win, 0, STATUS_Y, WIN_W, STATUS_H, 60, 60, 74)
+    // Three lines on ONE pitch, from ONE left edge. They were at +6, +26 and +52 -
+    // a 20px step and then a 26px one - inside a bar sized 100 for 84px of content,
+    // so the block of text sat high in it with a dead strip underneath.
+    gui.Win_text(win, font, status_text(fm), PAD_M, STATUS_Y + PAD_M,
+                 210, 210, 225)
+    gui.Win_text(win, font, g_status, PAD_M, STATUS_Y + PAD_M + STATUS_LINE_H,
+                 150, 190, 150)
     // The key map, INSIDE the status bar - it used to be drawn at WIN_H - 22,
     // which the bar is painted over, so it was invisible. Every command here is
     // also a toolbar button; this line is for the ones that are only keys
@@ -1685,7 +1751,7 @@ fn draw_all(win: int, font: int, fm: Ui) {
         + "D dup   Del delete   Z/Y undo/redo   P/L raise/lower   "
         + "A/T align   V/H distribute   K grid   S save   O load   "
         + "G generate   Esc quit",
-        14, STATUS_Y + 52, 130, 130, 150)
+        PAD_M, STATUS_Y + PAD_M + 2 * STATUS_LINE_H, 130, 130, 150)
 
     gui.Win_present(win)
 }
@@ -2437,6 +2503,61 @@ fn script_one(fm: Ui, cmd: string) -> Ui {
             + gui.Win_pixel_at(g_win, qx, qy, 0).to_string() + ","
             + gui.Win_pixel_at(g_win, qx, qy, 1).to_string() + ","
             + gui.Win_pixel_at(g_win, qx, qy, 2).to_string())
+        return f
+    }
+    // The layout, reported as GAPS rather than as coordinates.
+    //
+    // A test that read back INSP_X could only check a number against a number it
+    // also holds, which proves nothing about whether the result looks deliberate.
+    // The claim worth asserting is relational: every gap between regions is one
+    // step of the scale, the two side margins are equal, and the panels share a
+    // bottom edge. Those are properties an ad-hoc layout fails and a scaled one
+    // passes, whatever the actual pixel values are.
+    if op == "gap" {
+        var g = "" + p[1]
+        if g == "left" { print("gap(left)=" + PAL_X.to_string()) }
+        if g == "right" {
+            print("gap(right)=" + (WIN_W - (INSP_X + INSP_W)).to_string())
+        }
+        if g == "toolbox_canvas" {
+            print("gap(toolbox_canvas)="
+                + (CANVAS_X - (PAL_X + PAL_W)).to_string())
+        }
+        if g == "canvas_insp" {
+            print("gap(canvas_insp)="
+                + (INSP_X - (CANVAS_X + CANVAS_W)).to_string())
+        }
+        if g == "toolbar_panels" {
+            print("gap(toolbar_panels)="
+                + (PANEL_Y - (TOOLBAR_Y + TOOLBAR_H)).to_string())
+        }
+        // The dead band: panels' bottom edge to the status bar. This was 36 and is
+        // the single most visible spacing defect the audit found.
+        if g == "panels_status" {
+            print("gap(panels_status)="
+                + (STATUS_Y - (CANVAS_Y + CANVAS_H)).to_string())
+        }
+        // Do the two panels END together? A single subtraction, so 0 means aligned.
+        if g == "panel_bottoms" {
+            print("gap(panel_bottoms)="
+                + ((CANVAS_Y + CANVAS_H) - (INSP_Y + INSP_H)).to_string())
+        }
+        // Is the status bar tall enough for the three lines it draws, and no taller?
+        if g == "status_slack" {
+            print("gap(status_slack)="
+                + (STATUS_H - (PAD_M + 3 * STATUS_LINE_H + PAD_M)).to_string())
+        }
+        // Does the window END at the status bar, or is there space below it?
+        if g == "below_status" {
+            print("gap(below_status)="
+                + (WIN_H - (STATUS_Y + STATUS_H)).to_string())
+        }
+        // The toolbox row height, which is a HIT TARGET and has a floor of 24.
+        if g == "palrow" { print("gap(palrow)=" + PAL_ITEM_H.to_string()) }
+        // Does the toolbar start on the canvas's left edge?
+        if g == "toolbar_canvas_x" {
+            print("gap(toolbar_canvas_x)=" + (tb_x(0) - CANVAS_X).to_string())
+        }
         return f
     }
     // Where the chrome draws things, so a pixel test asks the DESIGNER for the

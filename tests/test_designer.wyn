@@ -757,6 +757,64 @@ fn px_at(o: string, x: int, y: int) -> string {
     return value_of(o, "px(" + x.to_string() + "," + y.to_string() + ")")
 }
 
+// ---- 5b. THE LAYOUT IS ON A SCALE ------------------------------------------
+//
+// Asserted as GAPS, never as coordinates. "INSP_X == 884" is a number checked
+// against a number this file also holds - it passes for any layout at all, however
+// arbitrary, and would have passed for the one measured before this: gaps of 8, 10,
+// 12, 12, 12 and 36 between regions, and text inset 8, 10, 12 or 14 from a panel
+// edge depending on the panel.
+//
+// What is worth asserting is relational, and an ad-hoc layout fails it:
+//   - every gap between two regions is ONE step of the scale
+//   - the two side margins are EQUAL
+//   - the panels share a bottom edge
+//   - the window ends where the content does, so no dead band exists
+//   - the toolbox row clears the 24px desktop hit-target floor
+//
+// These hold whatever the pixel values are, which is the point: they constrain the
+// SHAPE of the layout rather than pinning a snapshot of it.
+fn layout_tests() {
+    print("=== THE LAYOUT: one spacing scale, no leftover pixels ===")
+    var o = drive("gap:left;gap:right;gap:toolbox_canvas;gap:canvas_insp"
+        + ";gap:toolbar_panels;gap:panels_status;gap:panel_bottoms"
+        + ";gap:status_slack;gap:below_status;gap:palrow;gap:toolbar_canvas_x")
+
+    // PAD_M = 12, the scale's loose step, is the gap BETWEEN regions. One value for
+    // all six, so the eye reads one rhythm instead of six near-misses.
+    check_val("the left margin is the loose step", o, "gap(left)", "12")
+    check_val("...and the right margin EQUALS it", o, "gap(right)", "12")
+    check_val("toolbox to canvas", o, "gap(toolbox_canvas)", "12")
+    check_val("canvas to inspector", o, "gap(canvas_insp)", "12")
+    check_val("toolbar to the panel band", o, "gap(toolbar_panels)", "12")
+    // This one was 36 - three times every other gap, and the most visible spacing
+    // defect in the application: a dead strip across the full width above the
+    // status bar, which reads as an accident because it was one.
+    check_val("panels to the status bar - was 36, three times any other gap",
+              o, "gap(panels_status)", "12")
+
+    // Alignments, as differences that must be ZERO. A non-zero here is two regions
+    // that nearly line up, which looks worse than an obvious offset.
+    check_val("the canvas and the inspector share a bottom edge",
+              o, "gap(panel_bottoms)", "0")
+    check_val("the toolbar starts on the canvas's left edge",
+              o, "gap(toolbar_canvas_x)", "0")
+
+    // The status bar is sized FROM its three lines, and the window FROM the status
+    // bar, so neither can carry slack. Both were wrong: a 100px bar for 84px of
+    // text, inside a window whose height was an independent literal.
+    check_val("the status bar is exactly its three lines plus padding",
+              o, "gap(status_slack)", "0")
+    check_val("...and the window ends there, with no band below it",
+              o, "gap(below_status)", "0")
+
+    // A HIT TARGET, not a spacing choice. 22 painted 20px after its gap, under
+    // every desktop minimum, on the control clicked most often in the whole app.
+    check_val("a toolbox row clears the 24px hit-target floor",
+              o, "gap(palrow)", "24")
+    print("")
+}
+
 fn chrome_tests() {
     print("=== THE CHROME: what the user SEES, read back as pixels ===")
 
@@ -1003,6 +1061,7 @@ fn main() {
     inspector_tests()
     roundtrip_tests()
     ergonomics_tests()
+    layout_tests()
     chrome_tests()
     eventpath_tests()
     generate_tests()
