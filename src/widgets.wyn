@@ -3964,9 +3964,9 @@ fn draw_widget(ui: Ui, w: Widget) {
         var lg = ui.fg_g
         var lb = ui.fg_b
         if w.enabled == 0 {
-            lr = 110
-            lg = 110
-            lb = 120
+            lr = 135
+            lg = 135
+            lb = 148
         }
         gui.Win_text(win, font, w.label, w.x, w.y, lr, lg, lb)
         return
@@ -4031,9 +4031,9 @@ fn draw_widget(ui: Ui, w: Widget) {
         var tg = ui.fg_g
         var tb = ui.fg_b
         if w.enabled == 0 {
-            tr = 110
-            tg = 110
-            tb = 120
+            tr = 135
+            tg = 135
+            tb = 148
         }
         gui.Win_text(win, font, w.label,
                      w.x + (w.w - tw) / 2, w.y + (w.h - th) / 2, tr, tg, tb)
@@ -4180,10 +4180,18 @@ fn draw_widget(ui: Ui, w: Widget) {
     //
     // All nine share the six above's palette exactly - 18,18,22 for a sunken
     // field, 45..50 for a raised surface, 120,120,140 for a border, ACCENT+40 for
-    // a focus ring, the theme accent for a filled indicator, and 110,110,120 for
+    // a focus ring, the theme accent for a filled indicator, and 135,135,148 for
     // anything disabled. A new widget that picks its own greys reads as a different
     // toolkit pasted into the form, which is the failure mode of adding kinds one
     // at a time.
+    //
+    // DISABLED IS 135,135,148, RAISED FROM 110,110,120. The old value measured
+    // 2.98:1 against the panel and 2.51:1 on a button face - below the 3:1 floor for
+    // non-text UI, and simply hard to read. WCAG exempts disabled controls from the
+    // 4.5:1 body-text minimum, which is why this does not go higher: the colour has
+    // a job on both sides, staying legible while still reading as unavailable. At
+    // 135 it is >= 3.5:1 on every surface here and enabled text is still 3.0x
+    // brighter than it, so "greyed out" remains obvious at a glance.
     //
     // FOCUS IS ALWAYS accent+40 AND ALWAYS THE BORDER. Not the bare accent: the
     // accent is also the fill under white button text, and one colour cannot be
@@ -4228,9 +4236,9 @@ fn draw_widget(ui: Ui, w: Widget) {
             var dg = ui.accent_g + 40
             var db = ui.accent_b + 40
             if w.enabled == 0 {
-                dr = 110
-                dg = 110
-                db = 120
+                dr = 135
+                dg = 135
+                db = 148
             }
             gui.Win_rect(win, w.x + 4, w.y + 4, w.w - 8, w.h - 8, dr, dg, db)
         }
@@ -4239,9 +4247,9 @@ fn draw_widget(ui: Ui, w: Widget) {
         var tlg = ui.fg_g
         var tlb = ui.fg_b
         if w.enabled == 0 {
-            tlr = 110
-            tlg = 110
-            tlb = 120
+            tlr = 135
+            tlg = 135
+            tlb = 148
         }
         gui.Win_text(win, font, w.label, w.x + w.w + 8,
                      w.y + (w.h - rh2) / 2, tlr, tlg, tlb)
@@ -4269,9 +4277,9 @@ fn draw_widget(ui: Ui, w: Widget) {
         var fg2 = ui.fg_g
         var fb = ui.fg_b
         if w.enabled == 0 {
-            fr = 110
-            fg2 = 110
-            fb = 120
+            fr = 135
+            fg2 = 135
+            fb = 148
         }
         // The current choice, clipped to the box less the arrow gutter, so a long
         // item stops before the arrow instead of painting through it.
@@ -4457,9 +4465,9 @@ fn draw_widget(ui: Ui, w: Widget) {
         var lfg = ui.fg_g
         var lfb = ui.fg_b
         if w.enabled == 0 {
-            lfr = 110
-            lfg = 110
-            lfb = 120
+            lfr = 135
+            lfg = 135
+            lfb = 148
         }
         var k2 = 0
         while k2 < vis {
@@ -4541,9 +4549,9 @@ fn draw_widget(ui: Ui, w: Widget) {
             var ttg = ui.fg_g
             var ttb = ui.fg_b
             if w.enabled == 0 {
-                ttr = 110
-                ttg = 110
-                ttb = 120
+                ttr = 135
+                ttg = 135
+                ttb = 148
             } else {
                 if sel == 0 {
                     ttr = 170
@@ -4574,9 +4582,9 @@ fn draw_widget(ui: Ui, w: Widget) {
         var glg = ui.fg_g
         var glb = ui.fg_b
         if w.enabled == 0 {
-            glr = 110
-            glg = 110
-            glb = 120
+            glr = 135
+            glg = 135
+            glb = 148
         }
         gui.Win_clip_push(win, w.x + 1, w.y + 1, w.w - 2, ch2 - 2)
         gui.Win_text(win, font, w.label, w.x + 6, w.y + 2, glr, glg, glb)
@@ -4607,9 +4615,9 @@ fn draw_widget(ui: Ui, w: Widget) {
         var sfg = ui.fg_g
         var sfb = ui.fg_b
         if w.enabled == 0 {
-            sfr = 110
-            sfg = 110
-            sfb = 120
+            sfr = 135
+            sfg = 135
+            sfb = 148
         }
         // The TYPED text, not val.to_string(): they differ mid-edit and showing
         // the value would erase the digit the user just pressed.
@@ -4664,9 +4672,9 @@ fn draw_widget(ui: Ui, w: Widget) {
             var mfg = ui.fg_g
             var mfb = ui.fg_b
             if w.enabled == 0 {
-                mfr = 110
-                mfg = 110
-                mfb = 120
+                mfr = 135
+                mfg = 135
+                mfb = 148
             }
             var mth = gui.Win_font_height(font)
             var mtwid = gui.Win_text_width(font, mt)

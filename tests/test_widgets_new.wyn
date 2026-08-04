@@ -1116,6 +1116,78 @@ fn focus_ring_pixel_tests(win: int, font: int) {
     print("")
 }
 
+// ------------------------------------------------------- PIXELS: disabled text
+//
+// A DISABLED CONTROL MUST STILL BE READABLE.
+//
+// Disabled text was 110,110,120, which measures 2.98:1 against the panel and 2.51:1
+// on a button face. WCAG exempts disabled controls from the 4.5:1 body-text
+// minimum - which is why the fix does not go all the way there - but 2.5:1 is not
+// "de-emphasised", it is unreadable, and the label of a control is often the only
+// thing telling you WHY it is unavailable.
+//
+// The colour has a job on both sides, so this asserts both: bright enough to read,
+// and still clearly dimmer than enabled text. 135,135,148 is >= 3.5:1 on every
+// surface the toolkit paints while enabled text stays 3.0x brighter than it.
+//
+// Read as the BRIGHTEST pixel in the text's row, which is the glyph core - an
+// antialiased edge pixel is a blend of ink and background, so sampling one point
+// would measure the blend rather than the colour that was asked for.
+fn brightest_r(win: int, x0: int, y0: int, w: int, h: int) -> int {
+    var best = 0
+    var yy = y0
+    while yy < y0 + h {
+        var xx = x0
+        while xx < x0 + w {
+            var v = gui.Win_pixel_at(win, xx, yy, 0)
+            if v > best { best = v }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    return best
+}
+
+fn disabled_ink_tests(win: int, font: int) {
+    print("=== PIXELS: disabled text is dimmer than enabled, and still legible ===")
+    var ui = widgets.Ui_new(win, font)
+    ui = widgets.Ui_label(ui, "Enabled", 20, 20)
+    ui = widgets.Ui_label(ui, "Disabled", 20, 60)
+    var dis = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_enabled(ui, dis, 0)
+    // Cleared to the PANEL colour, because that is the surface these labels sit on
+    // in a real form and the ratio is a property of the pair.
+    gui.Win_clear(win, 38, 38, 46)
+    widgets.Ui_draw_into(ui)
+
+    var on = brightest_r(win, 20, 20, 90, 18)
+    var off = brightest_r(win, 20, 60, 90, 18)
+    print("   enabled ink R=${on}, disabled ink R=${off}")
+
+    check_int("enabled text is drawn in the theme's foreground", on, 235)
+    // THE ASSERTION, as two bounds rather than one magic number. A future theme may
+    // move the value; it may not make disabled text illegible again, and it may not
+    // make it indistinguishable from enabled text either.
+    check_int("disabled text is bright enough to read (was 110)",
+              off >= 130 ? 1 : 0, 1)
+    check_int("...and still clearly dimmer than enabled text",
+              off < on - 60 ? 1 : 0, 1)
+
+    // The same on a BUTTON, where the surface is lighter (50,50,60) and the old
+    // value was worst of all at 2.51:1. A disabled button's caption is the thing a
+    // user reads to find out what they cannot do.
+    var b = widgets.Ui_new(win, font)
+    b = widgets.Ui_button(b, "Save", 20, 110, 90, 28, on_fire)
+    var bid = widgets.Ui_last_id(b)
+    b = widgets.Ui_set_enabled(b, bid, 0)
+    gui.Win_clear(win, 38, 38, 46)
+    widgets.Ui_draw_into(b)
+    var bink = brightest_r(win, 20, 110, 90, 28)
+    check_int("a disabled BUTTON's caption is legible too",
+              bink >= 130 ? 1 : 0, 1)
+    print("")
+}
+
 fn clip_pixel_tests(win: int, font: int) {
     print("=== PIXELS: a child that overhangs its groupbox is CUT OFF ===")
     // The bug this covers was found by looking at a screenshot: every clip
@@ -1346,6 +1418,7 @@ fn main() {
                 tooltip_tests(win, font)
                 focus_tests(win, font)
                 focus_ring_pixel_tests(win, font)
+                disabled_ink_tests(win, font)
                 overlay_pixel_tests(win, font)
                 clip_pixel_tests(win, font)
                 real_event_tests(win, font)
