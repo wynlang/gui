@@ -47,12 +47,27 @@ for t in tests/test_*.wyn; do
     # hand-rolled harnesses print "=== ALL X TESTS PASSED ===".
     if echo "$out" | grep -q "ALL .* PASSED"; then
         n=$(echo "$out" | grep -c "^  ok " || true)
-        printf '  PASS  %-18s (%s assertions)\n' "$name" "$n"
-        pass=$((pass + 1))
+        # A ZERO assertion count is a FAILURE, not a pass. A test that needs a window
+        # and does not get one skips its own body and still prints its "ALL ... PASSED"
+        # banner, so counting the banner alone reported silent non-coverage as success.
+        # That is how this gate could have gone green while testing nothing.
+        if [ "$n" -eq 0 ]; then
+            printf '  FAIL  %-18s (passed banner but ZERO assertions - skipped itself?)\n' "$name"
+            fail=$((fail + 1))
+        else
+            printf '  PASS  %-18s (%s assertions)\n' "$name" "$n"
+            pass=$((pass + 1))
+        fi
     elif echo "$out" | grep -qE "^.*[0-9]+ tests passed"; then
         n=$(echo "$out" | grep -oE "[0-9]+ tests passed" | head -1)
-        printf '  PASS  %-18s (%s)\n' "$name" "$n"
-        pass=$((pass + 1))
+        ncount=${n%% *}
+        if [ "$ncount" -eq 0 ]; then
+            printf '  FAIL  %-18s (0 tests passed - skipped itself?)\n' "$name"
+            fail=$((fail + 1))
+        else
+            printf '  PASS  %-18s (%s)\n' "$name" "$n"
+            pass=$((pass + 1))
+        fi
     else
         printf '  FAIL  %-18s\n' "$name"
         echo "$out" | grep -E "FAIL|panic|Error|error:" | head -5 | sed 's/^/          /'
@@ -69,12 +84,23 @@ for ex in designer wizard; do
             printf '  FAIL  %-18s (does not build)\n' "$ex"
             fail=$((fail + 1)); continue; }
         out=$(perl -e 'alarm(shift @ARGV); exec @ARGV' 120 "./examples/$ex" --selftest 2>&1 || true)
+        # Count CHECKED STEPS. The two selftests report differently - wizard prints
+        # "  ok   ..." lines, designer narrates each step and marks its assertions
+        # "(expect N)" - so the shared evidence is the "-- section --" markers plus
+        # either form of assertion. Any of them proves the body ran.
+        ok_n=$(echo "$out" | grep -cE "^  ok |\(expect |^-- " || true)
         if echo "$out" | grep -q "FAIL"; then
             printf '  FAIL  %-18s (selftest)\n' "$ex"
             echo "$out" | grep "FAIL" | head -3 | sed 's/^/          /'
             fail=$((fail + 1))
+        elif [ "$ok_n" -eq 0 ]; then
+            # Absence of "FAIL" used to be the WHOLE pass condition, so a selftest that
+            # printed NOTHING - no window, an early return, a silent crash under the
+            # alarm - was recorded as a pass. Require positive evidence instead.
+            printf '  FAIL  %-18s (selftest produced no checked steps)\n' "$ex"
+            fail=$((fail + 1))
         else
-            printf '  PASS  %-18s (example selftest)\n' "$ex"
+            printf '  PASS  %-18s (example selftest, %s checked steps)\n' "$ex" "$ok_n"
             pass=$((pass + 1))
         fi
     fi

@@ -28,3 +28,9 @@ examples/form
 examples/wizard
 libgui/
 *.bmp
+
+# Agent worktrees and session scratch - never part of the repo.
+.claude/
+
+# Built app bundles (wyn build --app output).
+*.app/
