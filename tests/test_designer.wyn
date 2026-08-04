@@ -815,6 +815,88 @@ fn layout_tests() {
     print("")
 }
 
+// ---- 5c. THE CHROME'S TEXT IS LEGIBLE --------------------------------------
+//
+// WCAG 2.1 contrast, COMPUTED - not a list of approved colours.
+//
+// Asserting "the key line is 152,152,172" would pin a snapshot and prove nothing: it
+// passes for any colour at all as long as someone updated the test to match, which
+// is exactly how 130,130,150 survived at 4.20:1 on the line that lists every
+// keyboard command the designer has. So the ratio is calculated here from the two
+// colours the designer reports, against the published 4.5:1 minimum for body text.
+//
+// The formula is WCAG's: linearise each channel, weight 0.2126/0.7152/0.0722 for
+// relative luminance, then (lighter + 0.05) / (darker + 0.05).
+fn chan_lin(v: int) -> float {
+    var c = v.to_float() / 255.0
+    if c <= 0.03928 { return c / 12.92 }
+    return Math::pow((c + 0.055) / 1.055, 2.4)
+}
+
+// "r,g,b" -> relative luminance.
+fn luminance(rgb: string) -> float {
+    var ps = rgb.split(",")
+    if ps.len() < 3 { return 0.0 - 1.0 }
+    var lr = chan_lin(("" + ps[0]).to_int())
+    var lg = chan_lin(("" + ps[1]).to_int())
+    var lb = chan_lin(("" + ps[2]).to_int())
+    return 0.2126 * lr + 0.7152 * lg + 0.0722 * lb
+}
+
+// The contrast ratio between two "r,g,b" strings, x100 so it can be compared as an
+// int - check_int gives a diagnosable "got 420 want >=450" where a float compare
+// would need an epsilon and would hide which side it failed on.
+fn contrast_x100(fg: string, bg: string) -> int {
+    var la = luminance(fg)
+    var lb = luminance(bg)
+    var hi = la
+    var lo = lb
+    if lb > la { hi = lb lo = la }
+    return (((hi + 0.05) / (lo + 0.05)) * 100.0).to_int()
+}
+
+fn contrast_tests() {
+    print("=== CONTRAST: every line of chrome text clears WCAG AA (4.5:1) ===")
+    var o = drive("ink:status_state;ink:status_action;ink:status_keys"
+        + ";ink:status_bg;ink:panel_hdr;ink:panel_bg")
+    var bar = value_of(o, "ink(status_bg)")
+    var pnl = value_of(o, "ink(panel_bg)")
+
+    // Prove the helper can FAIL before trusting the four checks below it, or a
+    // luminance function that always returned a large number would make this whole
+    // group vacuous. Grey on grey is the degenerate case: exactly 1.00:1.
+    check_int("contrast of a colour with ITSELF is 1.00",
+              contrast_x100(bar, bar), 100)
+    // And a known pair, computed independently: white on black is 21:1, the maximum.
+    check_int("white on black is the 21:1 maximum",
+              contrast_x100("255,255,255", "0,0,0"), 2100)
+
+    var state = contrast_x100(value_of(o, "ink(status_state)"), bar)
+    var action = contrast_x100(value_of(o, "ink(status_action)"), bar)
+    var keys = contrast_x100(value_of(o, "ink(status_keys)"), bar)
+    var hdr = contrast_x100(value_of(o, "ink(panel_hdr)"), pnl)
+    print("   measured x100: state=${state} action=${action} keys=${keys}"
+        + " hdr=${hdr}")
+
+    check_int("the status line clears 4.5:1", state >= 450 ? 1 : 0, 1)
+    check_int("the last-action line clears 4.5:1", action >= 450 ? 1 : 0, 1)
+    // THE ONE THAT WAS BROKEN: 130,130,150 on 34,34,42 is 4.20:1.
+    check_int("the KEY MAP line clears 4.5:1 - it was 4.20:1",
+              keys >= 450 ? 1 : 0, 1)
+    check_int("a panel heading clears 4.5:1", hdr >= 450 ? 1 : 0, 1)
+
+    // HIERARCHY, as an ordering rather than four absolute numbers. The three status
+    // lines must get dimmer in the order a user needs them: what state you are in,
+    // then what just happened, then the always-true key map. All three being legible
+    // is necessary but not sufficient - three equally bright lines would pass every
+    // check above and give the eye nowhere to land first.
+    check_int("state reads brighter than the last-action line",
+              state > action ? 1 : 0, 1)
+    check_int("...which reads brighter than the key map",
+              action > keys ? 1 : 0, 1)
+    print("")
+}
+
 fn chrome_tests() {
     print("=== THE CHROME: what the user SEES, read back as pixels ===")
 
@@ -1062,6 +1144,7 @@ fn main() {
     roundtrip_tests()
     ergonomics_tests()
     layout_tests()
+    contrast_tests()
     chrome_tests()
     eventpath_tests()
     generate_tests()

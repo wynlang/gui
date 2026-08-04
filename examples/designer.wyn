@@ -141,6 +141,42 @@ var STATUS_Y = PANEL_Y + PANEL_H + PAD_M
 var PANEL_HDR_H = 26
 var PANEL_PAD = PAD_M
 
+// ---- the chrome palette ---------------------------------------------------
+//
+// Named, because a colour with a NAME can be checked against its background and a
+// literal buried in a Win_text call cannot. Each is stored as one packed 0xRRGGBB
+// int rather than three vars: three vars per colour is nine names for the status
+// bar alone, and the per-NAME type leak in this compiler makes many similar names
+// actively hazardous (see src/widgets.wyn:339).
+//
+// CONTRAST IS THE CONSTRAINT, measured as WCAG 2.1 relative luminance and asserted
+// in tests/test_designer.wyn rather than eyeballed. Body text needs 4.5:1.
+//
+// The status bar carries THREE TIERS, and they are dimmed in the order a user needs
+// them - state first, then what just happened, then the always-true key map:
+//     state  210,210,225  10.6:1
+//     action 150,190,150   7.6:1   (green: it reports the last command's result)
+//     keys   152,152,172   5.6:1
+// The key line was 130,130,150 = 4.20:1, i.e. under the minimum, on the one line
+// that tells a new user every keyboard command that exists. Dimming for hierarchy
+// is right; dimming below legibility is not.
+var BG_STATUS = 0x22222A
+var BG_PANEL = 0x26262E
+var INK_STATE = 0xD2D2E1
+var INK_ACTION = 0x96BE96
+var INK_KEYS = 0x9898AC
+var INK_HDR = 0x9696AA
+
+fn rgb_r(c: int) -> int { return (c / 65536) % 256 }
+fn rgb_g(c: int) -> int { return (c / 256) % 256 }
+fn rgb_b(c: int) -> int { return c % 256 }
+
+// "r,g,b", the shape every other reporting op prints.
+fn rgb_txt(c: int) -> string {
+    return rgb_r(c).to_string() + "," + rgb_g(c).to_string() + ","
+        + rgb_b(c).to_string()
+}
+
 // The window is DERIVED, so no dead space can exist by arithmetic. WIN_W is
 // unchanged at 1180 (the right margin now equals the left, which it did not); WIN_H
 // drops 700 -> 662, all of it the dead band that used to sit above the status bar.
@@ -1587,7 +1623,7 @@ fn draw_palette(win: int, font: int) {
     gui.Win_rect(win, PAL_X, PAL_Y, PAL_W, h, 38, 38, 46)
     gui.Win_rect_outline(win, PAL_X, PAL_Y, PAL_W, h, 70, 70, 84)
     gui.Win_text(win, font, "TOOLBOX", PAL_X + PANEL_PAD, PAL_Y + PAD_S,
-                 150, 150, 170)
+                 rgb_r(INK_HDR), rgb_g(INK_HDR), rgb_b(INK_HDR))
 
     var i = 0
     while i < pal_count() {
@@ -1680,7 +1716,7 @@ fn draw_inspector(win: int, font: int) {
     gui.Win_rect(win, INSP_X, INSP_Y, INSP_W, INSP_H, 38, 38, 46)
     gui.Win_rect_outline(win, INSP_X, INSP_Y, INSP_W, INSP_H, 70, 70, 84)
     gui.Win_text(win, font, "PROPERTIES", INSP_X + PANEL_PAD, INSP_Y + PAD_S,
-                 150, 150, 170)
+                 rgb_r(INK_HDR), rgb_g(INK_HDR), rgb_b(INK_HDR))
     // Clip so a long items box cannot paint over the status bar.
     gui.Win_clip_push(win, INSP_X + 1, INSP_Y + PANEL_HDR_H - PAD_S,
                       INSP_W - 2, INSP_H - PANEL_HDR_H + PAD_S - 1)
@@ -1733,25 +1769,35 @@ fn draw_all(win: int, font: int, fm: Ui) {
 
     draw_inspector(win, font)
 
-    gui.Win_rect(win, 0, STATUS_Y, WIN_W, STATUS_H, 34, 34, 42)
+    gui.Win_rect(win, 0, STATUS_Y, WIN_W, STATUS_H,
+                 rgb_r(BG_STATUS), rgb_g(BG_STATUS), rgb_b(BG_STATUS))
     gui.Win_rect_outline(win, 0, STATUS_Y, WIN_W, STATUS_H, 60, 60, 74)
     // Three lines on ONE pitch, from ONE left edge. They were at +6, +26 and +52 -
     // a 20px step and then a 26px one - inside a bar sized 100 for 84px of content,
     // so the block of text sat high in it with a dead strip underneath.
     gui.Win_text(win, font, status_text(fm), PAD_M, STATUS_Y + PAD_M,
-                 210, 210, 225)
+                 rgb_r(INK_STATE), rgb_g(INK_STATE), rgb_b(INK_STATE))
     gui.Win_text(win, font, g_status, PAD_M, STATUS_Y + PAD_M + STATUS_LINE_H,
-                 150, 190, 150)
+                 rgb_r(INK_ACTION), rgb_g(INK_ACTION), rgb_b(INK_ACTION))
     // The key map, INSIDE the status bar - it used to be drawn at WIN_H - 22,
     // which the bar is painted over, so it was invisible. Every command here is
     // also a toolbar button; this line is for the ones that are only keys
     // (arrows, and the shift modifier).
+    //
+    // 152,152,172, up from 130,130,150. The old value measured 4.20:1 against the
+    // bar - under the 4.5:1 AA minimum for body text, on the line that tells a new
+    // user every keyboard command the designer has. A discoverability aid nobody
+    // can read is not one. At 152 it is 5.6:1 and still the DIMMEST of the bar's
+    // three lines, which is the hierarchy that matters here: state (210) reads
+    // first, the last action (the green 150,190,150) second, the always-true key
+    // map last. Dimming for hierarchy is right; dimming below legibility is not.
     gui.Win_text(win, font,
         "shift-click = multi-select   arrows = nudge (+shift = grid step)   "
         + "D dup   Del delete   Z/Y undo/redo   P/L raise/lower   "
         + "A/T align   V/H distribute   K grid   S save   O load   "
         + "G generate   Esc quit",
-        PAD_M, STATUS_Y + PAD_M + 2 * STATUS_LINE_H, 130, 130, 150)
+        PAD_M, STATUS_Y + PAD_M + 2 * STATUS_LINE_H,
+        rgb_r(INK_KEYS), rgb_g(INK_KEYS), rgb_b(INK_KEYS))
 
     gui.Win_present(win)
 }
@@ -2513,6 +2559,24 @@ fn script_one(fm: Ui, cmd: string) -> Ui {
     // step of the scale, the two side margins are equal, and the panels share a
     // bottom edge. Those are properties an ad-hoc layout fails and a scaled one
     // passes, whatever the actual pixel values are.
+    // The colours the chrome DRAWS TEXT IN, named by role.
+    //
+    // Reported rather than read back with pxat: because a glyph is antialiased - the
+    // pixel at a letter's edge is a blend of the text colour and the background, so
+    // a pixel probe over text measures the blend and not the colour that was asked
+    // for. A test that wants to check a CONTRAST RATIO needs the actual value.
+    if op == "ink" {
+        var k = "" + p[1]
+        // Read from the SAME vars draw_all paints with, so this cannot report a
+        // colour the designer does not actually use.
+        if k == "status_state" { print("ink(status_state)=" + rgb_txt(INK_STATE)) }
+        if k == "status_action" { print("ink(status_action)=" + rgb_txt(INK_ACTION)) }
+        if k == "status_keys" { print("ink(status_keys)=" + rgb_txt(INK_KEYS)) }
+        if k == "status_bg" { print("ink(status_bg)=" + rgb_txt(BG_STATUS)) }
+        if k == "panel_hdr" { print("ink(panel_hdr)=" + rgb_txt(INK_HDR)) }
+        if k == "panel_bg" { print("ink(panel_bg)=" + rgb_txt(BG_PANEL)) }
+        return f
+    }
     if op == "gap" {
         var g = "" + p[1]
         if g == "left" { print("gap(left)=" + PAL_X.to_string()) }
