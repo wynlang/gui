@@ -33,8 +33,32 @@ export WYN_ROOT
 # No `timeout` binary on macOS, so use perl's alarm. A hung test has to fail the
 # run rather than hang it: these drive an event loop, and a scroll or caret bug
 # is as likely to spin forever as it is to give a wrong answer.
+#
+# HOST EXHAUSTION IS RETRIED; A REAL FAILURE NEVER IS.
+#
+# Several suites here shell out to `wyn build` (test_codegen and test_pipeline
+# generate .wyn files and compile them; test_designer builds the designer itself).
+# Under load - a parallel agent, a `make -j`, another suite - those child builds can
+# fail to fork rather than fail to compile, and this gate reported that as a test
+# failure. Measured at load average 12: roughly one suite in four, and a DIFFERENT
+# suite each time, which is the signature of contention rather than a defect.
+#
+# So retry ONLY the transient shapes, matching the list tests/run_bdd.sh already uses
+# in the compiler repo. A genuine assertion failure or compiler diagnostic is
+# returned on the first attempt, unretried - masking one of those would be far worse
+# than a flaky gate.
 run_one() {
-    perl -e 'alarm(shift @ARGV); exec @ARGV' 300 "$WYN" run "$1" 2>&1
+    local attempt=0 out
+    while [ "$attempt" -lt 3 ]; do
+        out=$(perl -e 'alarm(shift @ARGV); exec @ARGV' 300 "$WYN" run "$1" 2>&1)
+        if echo "$out" | grep -qiE 'Resource temporarily unavailable|posix_spawn|unable to fork|Cannot allocate memory|too many open files'; then
+            attempt=$((attempt + 1))
+            sleep "0.$((attempt * 3))"
+            continue
+        fi
+        break
+    done
+    printf '%s' "$out"
 }
 
 pass=0
