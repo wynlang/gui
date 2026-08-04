@@ -684,6 +684,92 @@ fn place(fm: Ui, kind: int, x: int, y: int) -> Ui {
     return f
 }
 
+// Width of a container's border band - the margin that SELECTS rather than
+// takes a drop. See canvas_press for why the band exists.
+//
+// 6px, not 1: it has to be aimable with a mouse. A 1px band is the container's
+// own outline and cannot be hit reliably, which would make a panel effectively
+// unselectable on the canvas.
+var EDGE = 6
+
+// Is (fx,fy) in the part of `host` that accepts a dropped child?
+//
+// The interior, inset by EDGE on all four sides. A TABS is inset from its
+// CONTENT box rather than its own rect, because a tab strip's x/y/w/h is the
+// STRIP and its children live below it - dropping onto the strip would put a
+// control on top of the tab titles.
+fn in_drop_zone(fm: Ui, host: int, fx: int, fy: int) -> int {
+    var zx = widgets.Ui_content_x_of(fm, host) + EDGE
+    var zy = widgets.Ui_content_y_of(fm, host) + EDGE
+    var zw = widgets.Ui_content_w_of(fm, host) - EDGE - EDGE
+    var zh = widgets.Ui_content_h_of(fm, host) - EDGE - EDGE
+    // A container too small to have an interior accepts nothing, so every press
+    // on it selects. That is the old behaviour, which is the right thing to
+    // degrade to.
+    if zw <= 0 { return 0 }
+    if zh <= 0 { return 0 }
+    if fx < zx { return 0 }
+    if fy < zy { return 0 }
+    if fx >= zx + zw { return 0 }
+    if fy >= zy + zh { return 0 }
+    return 1
+}
+
+// Place a widget of `kind` at (x,y) AND parent it onto `host`.
+//
+// ---------------------------------------------------------------------------
+// THE COORDINATE DECISION: A CHILD'S x/y IS ABSOLUTE, NOT PARENT-RELATIVE.
+//
+// This is a model decision that outlives the code, so it is written down rather
+// than left to be inferred from the arithmetic. A child at 60,90 inside a panel
+// at 20,20 stores 60,90 - not 40,70.
+//
+// Parent-relative is the more conventional choice (it is what WinForms and the
+// web do) and it was rejected here for reasons specific to this toolkit:
+//
+//  1. THE TOOLKIT ALREADY DEFINES IT THIS WAY. Ui_draw_at adds only the CANVAS
+//     offset and then draws each widget at its own x/y; hit_clipped compares the
+//     pointer against the widget's own rect and INTERSECTS it with the parent's
+//     content box. Both read absolute coordinates. Relative would mean resolving
+//     a chain in the painter, the hit test, the anchor pass and the designer's
+//     `pick` - four places, of which three are already correct.
+//
+//  2. IT KEEPS PARENTING FREE OF COORDINATE REWRITES. Re-parenting a control -
+//     the drag from one panel to another that this feature will grow next -
+//     changes ONE int under absolute coordinates and would have to translate x/y
+//     by the difference of two ancestor chains under relative ones. That
+//     translation is where a rounding or ordering bug moves a control the user
+//     did not touch.
+//
+//  3. IT MAKES AN ORPHAN HARMLESS. Delete a container and Ui_visible already
+//     promotes its children to top level. Under absolute coordinates they stay
+//     exactly where they were drawn; under relative ones every one of them would
+//     jump to the top-left of the form, which is data loss the user has to undo.
+//
+// The COST is honest and worth stating: moving a container does NOT move its
+// children. That is a real limitation of this design, not an oversight - it is
+// the next thing to build (a container drag walks its children by the same
+// delta), and it is a change to the DRAG path only, because the coordinate model
+// above does not have to change for it to work. Ui_relayout is likewise
+// unaffected: it anchors every widget against the FORM, which is correct under
+// absolute coordinates and is why anchors already work inside a groupbox.
+// ---------------------------------------------------------------------------
+fn place_on(fm: Ui, kind: int, x: int, y: int, host: int) -> Ui {
+    var f = place(fm, kind, x, y)
+    var kid = widgets.Ui_last_id(f)
+    f = widgets.Ui_set_owner(f, kid, host)
+    // A child of a TABS belongs to the page that is currently showing, or it
+    // would be placed onto a page the user cannot see. Only TABS pages children;
+    // a panel or groupbox child is always visible, which is `page = -1`.
+    if widgets.Ui_kind_of(f, host) == widgets.KIND_TABS {
+        f = widgets.Ui_set_page(f, kid, widgets.Ui_sel(f, host))
+    }
+    g_status = "placed " + widgets.Ui_kind_name(kind) + " #" + kid.to_string()
+        + " on " + widgets.Ui_kind_name(widgets.Ui_kind_of(f, host))
+        + " #" + host.to_string()
+    return f
+}
+
 // Delete every selected widget.
 fn do_delete(fm: Ui) -> Ui {
     if sel_count() == 0 {
@@ -1864,6 +1950,45 @@ fn canvas_press(fm: Ui, mx: int, my: int) -> Ui {
         hist_push(f)
         return f
     }
+    // A press in a CONTAINER'S INTERIOR places a child ON it. A press on its
+    // BORDER BAND selects it, as any other widget.
+    //
+    // This is the gesture the whole containment model exists for, and it is the
+    // one thing a form designer has to get right: dropping a button on a panel
+    // must make the button a child of the panel, not select the panel. Before
+    // this, a panel was just a widget that happened to be big.
+    //
+    // WHY THE BORDER BAND, rather than a modifier or a second click:
+    //
+    // A container that took a drop on EVERY press would be unmovable and
+    // undeletable the moment it existed - the only way to select it would be its
+    // one-pixel outline. The obvious fixes are all worse. Gating on "is it
+    // already selected" sounds right and is circular: `place` selects what it
+    // just placed, so a freshly dropped panel is selected and the very next
+    // press drags it instead of filling it - you cannot put anything in a panel
+    // you just made without first clearing the selection. A modifier fails
+    // differently: shift already means "extend the selection" everywhere in this
+    // file, and a modifier that means something else over a panel is one the
+    // user has to be told about.
+    //
+    // The band needs no telling. It is the same affordance a window has - the
+    // frame moves it, the inside is content - and it is where a user already
+    // aims to grab a container. It also degrades safely: on a container too
+    // small to have an interior, the drop zone is empty and every press selects,
+    // which is exactly the old behaviour.
+    if shift_held() == 0 {
+        if widgets.Ui_is_container(widgets.Ui_kind_of(f, hitid)) == 1 {
+            if in_drop_zone(f, hitid, fx, fy) == 1 {
+                // Coordinates stay ABSOLUTE - see the coordinate decision
+                // written out in full above place_on(). The child is placed where
+                // the pointer is, which is inside the parent by construction.
+                f = place_on(f, g_tool, snap(fx), snap(fy), hitid)
+                insp_rebuild(f)
+                hist_push(f)
+                return f
+            }
+        }
+    }
     if shift_held() == 1 { sel_toggle(hitid) } else {
         if sel_has(hitid) == 0 { sel_set(hitid) }
     }
@@ -2286,16 +2411,38 @@ fn ev_selftest(win: int, font: int) {
     gui.Win_push_mouse_up(win, PAL_X + 40, pal_y(1) + 6, gui.MOUSE_LEFT)
     fm = pump(fm)
     print("   tool = " + widgets.Ui_kind_name(g_tool))
-    // A click on the panel SELECTS the panel - it does not place a button on it.
-    // That is the honest behaviour of this MVP and worth showing rather than
-    // hiding: parenting is not implemented, so the panel is just a widget that
-    // happens to be big, and clicking it selects it like any other.
+    // A click inside the panel PARENTS a button onto it. This used to select the
+    // panel instead, and the comment here used to explain that parenting was not
+    // implemented - the panel was just a widget that happened to be big. It is
+    // implemented now, so the expectation below is inverted on purpose: the count
+    // GOES UP and the new widget's owner is the panel.
     gui.Win_push_mouse_down(win, CANVAS_X + 100, CANVAS_Y + 100, gui.MOUSE_LEFT)
     gui.Win_push_mouse_up(win, CANVAS_X + 100, CANVAS_Y + 100, gui.MOUSE_LEFT)
     fm = pump(fm)
-    print("   " + g_status + "   (selects the panel: this MVP has no parenting,"
-        + " so a click inside a panel hits the panel)")
-    print("   count = " + widgets.Ui_count(fm).to_string() + " (unchanged)")
+    var onpanel = sel_primary()
+    print("   " + g_status)
+    print("   count = " + widgets.Ui_count(fm).to_string()
+        + " (expect 2: the click placed a child rather than selecting the panel)")
+    print("   owner of the new widget = "
+        + widgets.Ui_owner_of(fm, onpanel).to_string()
+        + ", the panel is #" + panel.to_string()
+        + "   (expect equal: the button is ON the panel)")
+    print("   depth = " + widgets.Ui_owner_depth(fm, onpanel).to_string()
+        + " (expect 1)")
+
+    print("-- the panel's BORDER selects it, so it stays movable --")
+    // The other half of the gesture, and the reason a container is not made
+    // unselectable by taking drops: its edge band still selects. The panel is at
+    // 56,56, so 58,58 is 2px in - inside the rect, inside the EDGE band.
+    gui.Win_push_mouse_down(win, CANVAS_X + 58, CANVAS_Y + 58, gui.MOUSE_LEFT)
+    gui.Win_push_mouse_up(win, CANVAS_X + 58, CANVAS_Y + 58, gui.MOUSE_LEFT)
+    fm = pump(fm)
+    print("   " + g_status)
+    print("   count = " + widgets.Ui_count(fm).to_string()
+        + " (expect 2 - a press on the border must NOT place a third widget)")
+    print("   selected = #" + sel_primary().to_string()
+        + ", the panel is #" + panel.to_string()
+        + "   (expect equal: the border selected the panel itself)")
 
     print("-- click EMPTY canvas below the panel (places the button) --")
     gui.Win_push_mouse_down(win, CANVAS_X + 60, CANVAS_Y + 260, gui.MOUSE_LEFT)
@@ -2400,9 +2547,16 @@ fn ev_selftest(win: int, font: int) {
     var before_count = widgets.Ui_count(fm)
     gui.Win_push_key_down(win, gui.SCANCODE_D)
     fm = pump(fm)
+    // Printed as a DELTA as well as the two counts. The absolute numbers depend
+    // on how many controls the steps above happened to place - which changed the
+    // day a click inside a panel started placing a child - and an assertion on
+    // "3 (was 3)" then fails for a reason that has nothing to do with the claim.
+    // The claim is "D added nothing", so the delta is what a test should read.
     print("   count after pressing D with the field focused = "
         + widgets.Ui_count(fm).to_string() + " (was " + before_count.to_string()
         + "; the focused editor owns the keyboard, so D must not duplicate)")
+    print("   D-with-focus added = "
+        + (widgets.Ui_count(fm) - before_count).to_string() + " (expect 0)")
     // Escape leaves the field. Then the same key IS a command again.
     gui.Win_push_key_down(win, gui.SCANCODE_ESCAPE)
     fm = pump(fm)
@@ -2410,10 +2564,13 @@ fn ev_selftest(win: int, font: int) {
         + ", g_running = " + g_running.to_string()
         + " (Escape leaves the FIELD, it does not quit - losing a form because"
         + " you finished typing is not recoverable)")
+    var unfocused_before = widgets.Ui_count(fm)
     gui.Win_push_key_down(win, gui.SCANCODE_D)
     fm = pump(fm)
     print("   count after D with nothing focused = "
         + widgets.Ui_count(fm).to_string() + " (now it duplicates)")
+    print("   D-with-nothing-focused added = "
+        + (widgets.Ui_count(fm) - unfocused_before).to_string() + " (expect 1)")
 
     print("-- clip stack is balanced after a full frame --")
     print("   depth before draw = " + gui.Win_clip_depth(win).to_string())

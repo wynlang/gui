@@ -771,6 +771,34 @@ fn eventpath_tests() {
     check_int("a motion with no press held moves nothing",
         o.index_of("x still 376 (was 376)") >= 0 ? 1 : 0, 1)
 
+    print("-- PARENTING: a click inside a panel drops a child ON it --")
+    // THIS EXPECTATION IS INVERTED FROM WHAT IT USED TO BE, and the inversion is
+    // the deliverable. The selftest used to print that a click inside a panel
+    // SELECTED the panel, with a comment saying parenting was not implemented -
+    // the panel was just a widget that happened to be big. It now places a child.
+    //
+    // Asserted through the synthetic-event path rather than by calling
+    // Ui_set_owner directly, because the model-level version of this claim is
+    // already covered in test_widgets_new: what is unproven, and what a user
+    // actually does, is that a PRESS at a coordinate inside a panel reaches
+    // canvas_press, finds the container, and parents onto it.
+    check_int("the click placed a child instead of selecting the panel",
+        o.index_of("count = 2 (expect 2: the click placed a child") >= 0 ? 1 : 0, 1)
+    // The owner, not just the count: a second widget at the same coordinate with
+    // owner -1 would satisfy a count-only check and be exactly the old behaviour
+    // plus a stray control.
+    check_int("...and its owner IS the panel",
+        o.index_of("owner of the new widget = 1, the panel is #1") >= 0 ? 1 : 0, 1)
+    check_int("...which makes it one level deep",
+        o.index_of("depth = 1 (expect 1)") >= 0 ? 1 : 0, 1)
+    // The other half of the gesture. Without it a container becomes unmovable and
+    // undeletable the moment it exists, which would be a worse designer than the
+    // one that had no parenting at all.
+    check_int("a press on the panel's BORDER selects it rather than filling it",
+        o.index_of("count = 2 (expect 2 - a press on the border") >= 0 ? 1 : 0, 1)
+    check_int("...and what it selected is the panel itself",
+        o.index_of("selected = #1, the panel is #1") >= 0 ? 1 : 0, 1)
+
     print("-- typing into the inspector through a REAL press + EV_TEXT --")
     // The press lands inside the inspector's rectangle, so pump routes it there;
     // Ui_press focuses the entry; the EV_TEXT reaches insp_type; insp_sync writes
@@ -779,14 +807,18 @@ fn eventpath_tests() {
         o.index_of("model label = 'Ok'") >= 0 ? 1 : 0, 1)
     // The reason a caption can contain "d" at all: while a field has focus the
     // editor owns the keyboard, so D types rather than duplicating.
+    // Asserted as a DELTA, not as "= 2 (was 2)". The absolute count depends on how
+    // many controls the earlier steps placed, so the old form of this check broke
+    // the day a click inside a panel started placing a child - for a reason
+    // unrelated to whether D duplicated anything.
     check_int("D does not duplicate while a field has focus",
-        o.index_of("with the field focused = 2 (was 2") >= 0 ? 1 : 0, 1)
+        o.index_of("D-with-focus added = 0 (expect 0)") >= 0 ? 1 : 0, 1)
     // And Escape leaves the FIELD. Quitting because the user finished typing is
     // not a recoverable mistake.
     check_int("Escape leaves the field and does NOT quit",
         o.index_of("focus after Escape = -1, g_running = 1") >= 0 ? 1 : 0, 1)
     check_int("...after which D is a command again",
-        o.index_of("with nothing focused = 3") >= 0 ? 1 : 0, 1)
+        o.index_of("D-with-nothing-focused added = 1 (expect 1)") >= 0 ? 1 : 0, 1)
 
     print("-- keys reach the same commands the toolbar does --")
     check_int("an arrow key nudges by 1",
