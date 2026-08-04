@@ -240,6 +240,92 @@ fn ctor_line(ui: Ui, i: int) -> string {
     return "    // unsupported kind " + kind.to_string() + "\n"
 }
 
+// ---- containment ----------------------------------------------------------
+//
+// WHY OWNERSHIP IS A SECOND PASS, AND WHY EVERY WIDGET GETS A NAMED LOCAL
+//
+// The model's ids and the GENERATED program's ids are different numbers. The
+// document stores `owner: 4`, but the generated file never says 4 - it calls
+// Ui_panel and the toolkit hands back whatever id it is up to. So the owner
+// link cannot be emitted as a literal; it has to be emitted as a reference to
+// the id the generated program actually got.
+//
+// Hence `var w3 = widgets.Ui_last_id(ui)` after every constructor, and a second
+// pass of Ui_set_owner(ui, w5, w3) once every name is in scope.
+//
+// A SECOND PASS rather than parents-before-children in ONE pass, which is the
+// obvious alternative and is wrong here. Emitting in dependency order means
+// emitting in an order that is not the document's order - and the document's
+// order IS the paint order (Ui_draw_at walks the list; later widgets paint over
+// earlier ones, and Ui_hit_test's "last match wins" depends on it). Reordering
+// the constructors to satisfy the owner graph would therefore silently restack
+// the form: a child declared before its parent would be painted UNDER it and
+// become invisible. The two orders are independent constraints, so they get one
+// pass each - constructors in document order, ownership after all of them.
+//
+// This is also why the local is named for the widget's INDEX and not its id:
+// the index is the position in the emitted file, so `w0` is always the first
+// constructor, which makes the generated source readable in a diff.
+fn local_name(i: int) -> string {
+    return "w" + i.to_string()
+}
+
+// Does this form parent anything at all?
+//
+// A flat form - which is most of them, and every form this generator produced
+// before today - emits no ownership section and no id locals. Worth the check:
+// a 40-control flat form would otherwise carry 40 `var wN = Ui_last_id(ui)`
+// lines that nothing reads, and the point of the two-file split is that the
+// generated file stays legible.
+fn has_parenting(ui: Ui) -> int {
+    var n = widgets.Ui_count(ui)
+    var i = 0
+    while i < n {
+        if widgets.Ui_owner_at(ui, i) != -1 {
+            // An ORPHAN link (owner names a widget no longer in the form) is not
+            // parenting. Ui_visible already treats an orphan as top level, so
+            // emitting a reference to a local that was never declared would turn
+            // a degraded-but-working form into one that does not compile.
+            if widgets.Ui_index_of(ui, widgets.Ui_owner_at(ui, i)) != -1 { return 1 }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// The ownership pass: every Ui_set_owner / Ui_set_page the form needs.
+fn owner_lines(ui: Ui) -> string {
+    if has_parenting(ui) == 0 { return "" }
+    var n = widgets.Ui_count(ui)
+    var s = "\n    // ---- containment: which control sits on which ----\n"
+    s = s + "    // Emitted after every constructor, because a parent's id is\n"
+    s = s + "    // only known once it has been built. The declaration order\n"
+    s = s + "    // above is the PAINT order and is deliberately not touched.\n"
+    var i = 0
+    while i < n {
+        var ow = widgets.Ui_owner_at(ui, i)
+        if ow != -1 {
+            var oi = widgets.Ui_index_of(ui, ow)
+            // Orphans are dropped rather than emitted: see has_parenting.
+            if oi != -1 {
+                s = s + "    ui = widgets.Ui_set_owner(ui, " + local_name(i)
+                    + ", " + local_name(oi) + ")\n"
+                // The PAGE only means anything under an owner - it is which tab
+                // page of that owner the child is on. Emitted here rather than
+                // beside the anchor for that reason: a page with no owner is
+                // meaningless and Ui_visible ignores it.
+                var pg = widgets.Ui_page_at(ui, i)
+                if pg != -1 {
+                    s = s + "    ui = widgets.Ui_set_page(ui, " + local_name(i)
+                        + ", " + pg.to_string() + ")\n"
+                }
+            }
+        }
+        i = i + 1
+    }
+    return s
+}
+
 // Emit the ANCHOR call, but only when the widget is not on the default.
 //
 // Anchors are only interesting when they differ from left+top, and a form of 40
@@ -324,9 +410,18 @@ pub fn gen_designer(ui: Ui) -> string {
     s = s + "    ui = widgets.Ui_set_design_size(ui, "
         + widgets.Ui_design_w(ui).to_string() + ", "
         + widgets.Ui_design_h(ui).to_string() + ")\n"
+    // Only a form that parents anything needs the id locals; see owner_lines.
+    var nests = has_parenting(ui)
     var j = 0
     while j < n {
         s = s + ctor_line(ui, j)
+        // Captured immediately after the constructor, before the enabled/anchor
+        // follow-ups: those call Ui_last_id themselves today, and a later
+        // constructor would move it. The local is stable, so the ownership pass
+        // below can refer to any widget from anywhere.
+        if nests == 1 {
+            s = s + "    var " + local_name(j) + " = widgets.Ui_last_id(ui)\n"
+        }
         // enabled is not a constructor argument, so a disabled control needs a
         // follow-up call or the generated form comes up clickable.
         if widgets.Ui_enabled_at(ui, j) == 0 {
@@ -335,6 +430,8 @@ pub fn gen_designer(ui: Ui) -> string {
         s = s + anchor_line(ui, j)
         j = j + 1
     }
+
+    s = s + owner_lines(ui)
 
     s = s + "\n    // ---- run ----\n"
     s = s + "    while widgets.Ui_running(ui) == 1 {\n"

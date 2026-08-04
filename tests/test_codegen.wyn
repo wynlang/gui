@@ -264,12 +264,136 @@ fn main() {
     // The other ten are re-added (11 handler widgets minus on_remember, present).
     check_int("the other ten were", n4, 10)
 
+    nesting_tests()
+
     print("")
     if fails == 0 {
         print("=== ALL CODEGEN TESTS PASSED ===")
     } else {
         print("=== ${fails} CODEGEN TEST(S) FAILED ===")
     }
+}
+
+// ---- NESTED CONTAINERS ----------------------------------------------------
+//
+// A form whose controls sit ON one another, which is the case the generator
+// silently dropped until today: the model held `owner`, gen_designer emitted no
+// Ui_set_owner, so a nested form generated a FLAT one. It compiled, which is why
+// nothing caught it - the failure was a missing line, not a bad one.
+//
+// A second project dir rather than reusing PROJ: the assertions above count
+// handler stubs exactly ("all handlers re-stubbed = 11"), and adding controls to
+// build_form would move those numbers for reasons that have nothing to do with
+// nesting.
+var NPROJ = "scratch/gen_nested"
+
+// panel > groupbox > button, plus a tab strip with a control on page 1.
+// Two levels deep on purpose: a generator that emitted only the immediate link
+// would pass a one-level test.
+fn build_nested() -> Ui {
+    var ui = widgets.Ui_new(-1, -1)
+    ui = widgets.Ui_set_name(ui, "Nested")
+    ui = widgets.Ui_set_design_size(ui, 480, 360)
+
+    ui = widgets.Ui_panel(ui, 10, 10, 440, 200)
+    var outer = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_groupbox(ui, "Inner", 20, 20, 300, 150)
+    var box = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_owner(ui, box, outer)
+    ui = widgets.Ui_button(ui, "Deep", 40, 70, 90, 26, noop)
+    var deep = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_owner(ui, deep, box)
+
+    // A TABS child carries a PAGE as well as an owner - the one field that is
+    // only meaningful in combination with the owner.
+    ui = widgets.Ui_tabs(ui, "One\nTwo", 10, 230, 300, 24, 0, noop)
+    var tabs = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_entry(ui, "", 20, 270, 200, 26)
+    var onpage = widgets.Ui_last_id(ui)
+    ui = widgets.Ui_set_owner(ui, onpage, tabs)
+    ui = widgets.Ui_set_page(ui, onpage, 1)
+    return ui
+}
+
+fn nesting_tests() {
+    print("=== NESTED CONTAINERS: the owner graph reaches the generated file ===")
+    File::create_dir_all(NPROJ)
+    var ndpath = NPROJ + "/Nested.designer.wyn"
+    File::delete(ndpath)
+    File::delete(NPROJ + "/Nested.wyn")
+
+    var ui = build_nested()
+    codegen.Form_generate(ui, NPROJ)
+    var d = File::read(ndpath)
+
+    print("-- the ownership pass is emitted at all --")
+    // Three owned widgets: the groupbox, the deep button, the entry on page 1.
+    check_int("one Ui_set_owner per owned control",
+        count_of(d, "widgets.Ui_set_owner(ui, "), 3)
+    check_int("the page of the tab child is emitted too",
+        count_of(d, "widgets.Ui_set_page(ui, "), 1)
+
+    print("-- and it names the LOCALS, not the model's ids --")
+    // The model's ids and the generated program's ids are different numbers, so
+    // a literal here would parent onto whatever the toolkit happened to number
+    // that widget. This is the assertion that a literal would fail.
+    check_int("the deep button is parented onto the groupbox's local",
+        d.index_of("Ui_set_owner(ui, w2, w1)") >= 0 ? 1 : 0, 1)
+    check_int("the groupbox onto the panel's",
+        d.index_of("Ui_set_owner(ui, w1, w0)") >= 0 ? 1 : 0, 1)
+    // All five: panel, groupbox, button, tab strip, entry. Every one, not just
+    // the owned ones - a parent needs a name too, and which widgets are parents
+    // is not knowable from the child's side without a second pass over the list.
+    check_int("every control captured its id",
+        count_of(d, " = widgets.Ui_last_id(ui)"), 5)
+
+    print("-- PAINT order is untouched: parents are NOT hoisted --")
+    // The document order is the paint order (Ui_draw_at walks the list, later
+    // widgets paint over earlier ones). Emitting in dependency order instead
+    // would restack the form and hide a child under its parent - so the
+    // constructors must still appear in the document's order.
+    var pi = d.index_of("Ui_panel(ui, 10, 10")
+    var bi = d.index_of("Ui_groupbox(ui, \"Inner\"")
+    var di = d.index_of("Ui_button(ui, \"Deep\"")
+    check_int("panel before groupbox", pi < bi ? 1 : 0, 1)
+    check_int("groupbox before its child", bi < di ? 1 : 0, 1)
+    check_int("...and ownership comes after every constructor",
+        di < d.index_of("---- containment") ? 1 : 0, 1)
+
+    print("-- THE assertion: the nested form COMPILES --")
+    // The one that would have caught the whole class. Everything above is a
+    // string search and would pass on output the compiler rejects.
+    check_int("the generated nested form builds", build_ok(ndpath), 1)
+
+    print("-- a FLAT form emits no ownership section and no id locals --")
+    // The other half of the rule: a form that parents nothing must generate
+    // exactly what it generated before this feature existed, or every existing
+    // project's designer file grows 40 lines nothing reads.
+    var flat = build_form()
+    var fs = codegen.gen_designer(flat)
+    check_int("no Ui_set_owner", count_of(fs, "Ui_set_owner"), 0)
+    check_int("no id locals", count_of(fs, " = widgets.Ui_last_id(ui)"), 0)
+    check_int("and no containment header", count_of(fs, "---- containment"), 0)
+
+    print("-- an ORPHAN link is dropped, not emitted --")
+    // Deleting a container leaves its children pointing at an id that is gone.
+    // Ui_visible already treats that as top level; emitting a reference to a
+    // local that was never declared would turn a degraded-but-working form into
+    // one that does not compile.
+    var orph = build_nested()
+    orph = widgets.Ui_delete(orph, widgets.Ui_id_at(orph, 0))
+    var os = codegen.gen_designer(orph)
+    // The groupbox's owner is now dangling; the button and the entry still have
+    // live owners, so two links survive.
+    check_int("the dangling link is gone, the live ones remain",
+        count_of(os, "widgets.Ui_set_owner(ui, "), 2)
+    // And it still compiles, which is the assertion the count is a proxy for:
+    // an emitted reference to an undeclared local is a compile error, and the
+    // count above would not distinguish "dropped" from "renumbered".
+    orph = widgets.Ui_set_name(orph, "Orphan")
+    codegen.Form_generate(orph, NPROJ)
+    check_int("a form with a DELETED container still compiles",
+        build_ok(NPROJ + "/Orphan.designer.wyn"), 1)
 }
 
 // How many times `needle` occurs in `hay`. Used for the "exactly one" claims,
