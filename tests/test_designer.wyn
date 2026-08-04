@@ -770,45 +770,57 @@ fn chrome_tests() {
     var panel_row = value_of(a, "at(palrow)")
     check_int("the designer reports a toolbox row coordinate",
         panel_row.len() > 0 ? 1 : 0, 1)
-    var o = drive("tool:panel;draw;px:32:318;px:32:98"
-        + ";tool:button;draw;px:32:318;px:32:98")
+    // pxat:, not px: - the row's pixel is asked of the DESIGNER (pal_y) rather than
+    // counted out here. A hardcoded 318 silently reads a different row the moment
+    // the toolbox moves or a row's height changes, and then passes or fails for a
+    // reason unrelated to what it claims.
+    var o = drive("tool:panel;draw;pxat:palrow:11;pxat:palrow:1"
+        + ";tool:button;draw;pxat:palrow:11;pxat:palrow:1")
     // Two draws, so value_of's last-match rule gives the SECOND frame. Asserted
     // as a swap: after picking button, row 1 is accented and row 11 is not.
     check_val("with button armed, the button row is accented",
-              o, "px(32,98)", "70,110,170")
+              o, "pxat(palrow,1)", "70,110,170")
     check_val("...and the panel row has gone back to idle",
-              o, "px(32,318)", "50,50,62")
+              o, "pxat(palrow,11)", "50,50,62")
 
     print("-- the grid is drawn at the pitch the snap USES --")
     // A grid drawn at 32 while snapping to 8 is a lie that makes every correct
-    // placement look off-grid. So: a dot at canvas (8,8) and NO dot 3px later.
-    o = drive("draw;px:180:52;px:183:52")
-    check_val("a grid dot sits on the 8px lattice", o, "px(180,52)", "44,44,52")
+    // placement look off-grid. So: a dot at FORM (8,8) and NO dot 3px later. Form
+    // coordinates via pxat:canvas, so this does not encode where the canvas is.
+    o = drive("draw;pxat:canvas:8:8;pxat:canvas:11:8")
+    check_val("a grid dot sits on the 8px lattice",
+              o, "pxat(canvas,8,8)", "44,44,52")
     check_val("...and the pixel 3px along is bare canvas",
-              o, "px(183,52)", "28,28,34")
+              o, "pxat(canvas,11,8)", "28,28,34")
     // And turning snapping off removes the grid, so the two cannot disagree.
-    o = drive("grid;draw;px:180:52")
-    check_val("with snap off the grid is gone", o, "px(180,52)", "28,28,34")
+    o = drive("grid;draw;pxat:canvas:8:8")
+    check_val("with snap off the grid is gone", o, "pxat(canvas,8,8)", "28,28,34")
 
     print("-- the PRIMARY has solid handles, a secondary hollow ones --")
-    // Both widgets are selected and both get a highlight box; only the primary
-    // gets FILLED corner blocks. (249,121) is inside a corner block and outside
-    // its outline, so it is exactly the pixel that separates the two.
-    // Hard-coded rather than asked for, because it is a point INSIDE a 6x6 mark -
-    // there is no designer function whose job is to name it.
+    // Both widgets are selected and both get a highlight box; only the primary gets
+    // FILLED corner blocks. The clicks land buttons at form (80,80) and (80,200),
+    // and the top-left mark spans form (x-4 .. x+2, y-4 .. y+2) - so (77,77) is
+    // INSIDE widget 1's mark and (78,78) is on its outline. Widget 2, clicked last,
+    // is the primary.
+    //
+    // FORM coordinates via pxat:canvas rather than screen ones, so this no longer
+    // encodes where on screen the canvas sits. That mattered immediately: these
+    // three were hardcoded screen pixels, and moving the canvas by 2px to put the
+    // chrome on a spacing scale would have made them read bare canvas and "fail"
+    // for a reason that has nothing to do with selection handles.
     o = drive("tool:button;click:80:80;click:80:200;sel:1;add:2"
-        + ";draw;px:249:121;px:250:122;px:249:241")
+        + ";draw;pxat:canvas:77:77;pxat:canvas:78:78;pxat:canvas:77:197")
     check_val("the secondary's corner is HOLLOW (bare canvas inside the mark)",
-              o, "px(249,121)", "28,28,34")
+              o, "pxat(canvas,77,77)", "28,28,34")
     check_val("...though its outline is drawn, in the dimmer colour",
-              o, "px(250,122)", "120,160,200")
+              o, "pxat(canvas,78,78)", "120,160,200")
     check_val("the primary's corner is FILLED, in the bright colour",
-              o, "px(249,241)", "90,200,255")
+              o, "pxat(canvas,77,197)", "90,200,255")
     // Reversing which one is primary must move the solid marks, or the panel is
     // showing a fixed decoration rather than the state.
     o = drive("tool:button;click:80:80;click:80:200;sel:2;add:1"
-        + ";draw;px:249:121")
-    check_val("making it primary FILLS its corner", o, "px(249,121)",
+        + ";draw;pxat:canvas:77:77")
+    check_val("making it primary FILLS its corner", o, "pxat(canvas,77,77)",
               "90,200,255")
 
     print("-- a full frame leaves the clip stack balanced --")

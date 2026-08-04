@@ -2401,6 +2401,44 @@ fn script_one(fm: Ui, cmd: string) -> Ui {
             + gui.Win_pixel_at(g_win, px, py, 2).to_string())
         return f
     }
+    // Read a pixel at a point the DESIGNER names, not one the script counted out.
+    //
+    // `px:32:318` hardcodes the toolbox's eleventh row, so moving the toolbox - or
+    // changing a row's height - silently reads a different row and the assertion
+    // passes or fails for reasons unrelated to what it claims. This is the same
+    // argument `at:` already makes for click coordinates; `px:` was the hole in it.
+    //
+    // Named points, resolved by the layout constants themselves:
+    //   pxat:palrow:<i>   the fill of toolbox row i
+    //   pxat:canvas:<x>:<y>  a canvas pixel at FORM coordinates
+    if op == "pxat" {
+        var pwhat = "" + p[1]
+        var qx = 0
+        var qy = 0
+        if pwhat == "palrow" {
+            qx = PAL_X + 20
+            qy = pal_y(("" + p[2]).to_int()) + 6
+        }
+        if pwhat == "canvas" {
+            qx = CANVAS_X + ("" + p[2]).to_int()
+            qy = CANVAS_Y + ("" + p[3]).to_int()
+        }
+        if g_win < 0 {
+            print("pxat(" + pwhat + ")=nodisplay")
+            return f
+        }
+        // Keyed by the NAME and every argument, so two reads in one script are
+        // distinguishable and value_of's last-match rule still picks the right one.
+        // The Y is part of the key for canvas reads: keying on X alone made two
+        // probes at the same column collide, which is a silently-wrong assertion.
+        var pkey = pwhat + "," + ("" + p[2])
+        if pwhat == "canvas" { pkey = pkey + "," + ("" + p[3]) }
+        print("pxat(" + pkey + ")="
+            + gui.Win_pixel_at(g_win, qx, qy, 0).to_string() + ","
+            + gui.Win_pixel_at(g_win, qx, qy, 1).to_string() + ","
+            + gui.Win_pixel_at(g_win, qx, qy, 2).to_string())
+        return f
+    }
     // Where the chrome draws things, so a pixel test asks the DESIGNER for the
     // coordinate rather than holding a second copy of the layout - a test with
     // its own copy of the formula passes whether or not the two agree.
